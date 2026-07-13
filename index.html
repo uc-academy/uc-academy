@@ -157,6 +157,7 @@
   .nav-title{ font-size:12.5px; font-weight:600; color:#F1ECFB; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
   .nav-sub{ font-size:10px; color:#9E93BB; }
   .nav-check{ font-size:12.5px; color:var(--success); }
+  .nav-badge{ display:inline-flex; align-items:center; justify-content:center; min-width:17px; height:17px; padding:0 4px; border-radius:9px; background:var(--danger); color:#fff; font-size:10px; font-weight:700; font-family:'Poppins',sans-serif; vertical-align:middle; }
   .nav-lock{ font-size:12.5px; color:#8C7FAD; }
   .sidebar-foot{ margin-top:auto; padding-top:12px; border-top:1px solid #3D2F58; font-size:10px; color:#8C7FAD; line-height:1.5; }
 
@@ -487,6 +488,10 @@ function ratingFromPct(pct){
   return {label:'Poor', pass:false};
 }
 function ratingLabel(r){ return r.display || r.label; }
+function ratingOutOf5(score, total){
+  if(!total) return '—';
+  return (score/total*5).toFixed(1);
+}
 
 function showToast(msg, type){
   let wrap = document.getElementById('toast-wrap');
@@ -783,42 +788,64 @@ async function submitRecoveryRequest(){
   renderGate();
 }
 
+const SESSION_KEY = 'uca_session_v1';
+const SESSION_MAX_AGE = 12 * 60 * 60 * 1000; // 12 hours
+function saveSession(obj){
+  try{ localStorage.setItem(SESSION_KEY, JSON.stringify({ ...obj, savedAt: Date.now() })); }catch(e){}
+}
+function loadSession(){
+  try{
+    const raw = localStorage.getItem(SESSION_KEY);
+    if(!raw) return null;
+    const parsed = JSON.parse(raw);
+    if(!parsed.savedAt || (Date.now() - parsed.savedAt) > SESSION_MAX_AGE) { clearSession(); return null; }
+    return parsed;
+  }catch(e){ return null; }
+}
+function clearSession(){
+  try{ localStorage.removeItem(SESSION_KEY); }catch(e){}
+}
+
+async function loginAsPartner(id, opts){
+  opts = opts || {};
+  const r = await getRosterEntry(id);
+  if(!r) return { ok:false, reason:"That ID wasn't recognised. Double check with your trainer." };
+  const allSessions = await listSessions();
+  const result = findSessionForRoster(r, allSessions);
+  if(result.status!=='active'){
+    if(result.status==='scheduled_today_closed'){
+      const s = result.session;
+      return { ok:false, reason:`Your class is scheduled today between ${s.open} and ${s.close}. Please come back then.` };
+    } else if(result.status==='no_session_today'){
+      return { ok:false, reason:`No class is open for you right now in ${esc(r.city)}. Ask ${esc(r.trainer)} to open today's session.` };
+    }
+    return { ok:false, reason:`No class has been scheduled yet for you. Please check with your trainer.` };
+  }
+  const s = result.session;
+  currentUser = { id, name:r.name, officeId:r.officeId||'', city:r.city, trainer:r.trainer, day:s.day, open:s.open, close:s.close };
+  currentUserUnlockedDays = await getUnlock(r.city, r.trainer);
+  currentUserProgress = await getProgress(id);
+  for(const d of DAYS) ensureDay(d.id);
+  videosCache = {}; audiosCache = {};
+  await Promise.all(DAYS.map(async d=>{ videosCache[d.id]=await getVideoUrl(d.id); audiosCache[d.id]=await getAudioUrl(d.id); }));
+  await logCheckin(s);
+  if(!opts.silent) await logHistory('partner_login', `${r.name} (${id}) checked in for Day ${s.day}`, {partnerId:id, city:r.city, trainer:r.trainer, day:s.day});
+  saveSession({ role:'partner', partnerId:id });
+  return { ok:true };
+}
+
 async function submitPartnerId(){
   if(gateBusy) return;
   const raw = document.getElementById('partner-id-input').value.trim();
   const id = raw.toUpperCase();
   if(!id){ gateError='Enter your Partner ID to continue.'; renderGate(); return; }
   gateBusy=true; gateError=''; renderGate();
-  const r = await getRosterEntry(id);
-  if(!r){ gateBusy=false; gateError="That ID wasn't recognised. Double check with your trainer."; renderGate(); return; }
-  const allSessions = await listSessions();
-  const result = findSessionForRoster(r, allSessions);
-  if(result.status==='active'){
-    const s = result.session;
-    currentUser = { id, name:r.name, officeId:r.officeId||'', city:r.city, trainer:r.trainer, day:s.day, open:s.open, close:s.close };
-    currentUserUnlockedDays = await getUnlock(r.city, r.trainer);
-    currentUserProgress = await getProgress(id);
-    for(const d of DAYS) ensureDay(d.id);
-    videosCache = {}; audiosCache = {};
-    await Promise.all(DAYS.map(async d=>{ videosCache[d.id]=await getVideoUrl(d.id); audiosCache[d.id]=await getAudioUrl(d.id); }));
-    await logCheckin(s);
-    await logHistory('partner_login', `${r.name} (${id}) checked in for Day ${s.day}`, {partnerId:id, city:r.city, trainer:r.trainer, day:s.day});
-    gateBusy=false;
-    currentDay = currentUserUnlockedDays.length ? Math.max(...currentUserUnlockedDays) : 0;
-    currentTab='theory';
-    renderApp();
-    return;
-  }
+  const result = await loginAsPartner(id);
   gateBusy=false;
-  if(result.status==='scheduled_today_closed'){
-    const s = result.session;
-    gateError = `Your class is scheduled today between ${s.open} and ${s.close}. Please come back then.`;
-  } else if(result.status==='no_session_today'){
-    gateError = `No class is open for you right now in ${esc(r.city)}. Ask ${esc(r.trainer)} to open today's session.`;
-  } else {
-    gateError = `No class has been scheduled yet for you. Please check with your trainer.`;
-  }
-  renderGate();
+  if(!result.ok){ gateError = result.reason; renderGate(); return; }
+  currentDay = currentUserUnlockedDays.length ? Math.max(...currentUserUnlockedDays) : 0;
+  currentTab='theory';
+  renderApp();
 }
 async function logCheckin(session){
   const today = todayStr();
@@ -839,6 +866,16 @@ async function checkOutNow(){
   switchId();
 }
 
+async function loginAsTrainer(trainerId, opts){
+  opts = opts || {};
+  const t = await kvGet('trainer:'+trainerId);
+  if(!t) return { ok:false };
+  trainerIdentity = { isAdmin:false, trainerId, name:t.name, phone:t.phone, category:t.category, city:t.city };
+  if(!opts.silent) await logHistory('trainer_login', `${t.name} logged in (${t.category} · ${t.city})`, {trainerId, category:t.category, city:t.city});
+  saveSession({ role:'trainer', trainerId });
+  return { ok:true };
+}
+
 async function submitTrainerLogin(){
   if(gateBusy) return;
   const category = document.getElementById('trainer-cat-input').value;
@@ -855,9 +892,8 @@ async function submitTrainerLogin(){
     renderGate();
     return;
   }
-  const [trainerId, t] = match;
-  trainerIdentity = { isAdmin:false, trainerId, name:t.name, phone:t.phone, category:t.category, city:t.city };
-  await logHistory('trainer_login', `${t.name} logged in (${t.category} · ${t.city})`, {trainerId, category:t.category, city:t.city});
+  const [trainerId] = match;
+  await loginAsTrainer(trainerId);
   adminTab='sessions';
   renderAdmin();
 }
@@ -868,6 +904,7 @@ async function submitAdminLogin(){
   if(pass !== ADMIN_PASSWORD){ gateError='Incorrect admin password.'; renderGate(); return; }
   trainerIdentity = { isAdmin:true, name:'Admin' };
   await logHistory('admin_login', 'Admin logged in', {});
+  saveSession({ role:'admin' });
   adminTab='overview';
   renderAdmin();
 }
@@ -876,8 +913,37 @@ function switchId(){
   if(ytPollTimer) clearInterval(ytPollTimer);
   currentUser = null; currentUserProgress={}; currentUserUnlockedDays=[]; trainerIdentity = null;
   gateError=''; gateMode='partner'; showRecovery=false;
+  clearSession();
   closeSidebar();
   renderGate();
+}
+async function tryRestoreSession(){
+  const saved = loadSession();
+  if(!saved) return false;
+  try{
+    if(saved.role==='admin'){
+      trainerIdentity = { isAdmin:true, name:'Admin' };
+      adminTab='overview';
+      renderAdmin();
+      return true;
+    }
+    if(saved.role==='trainer'){
+      const result = await loginAsTrainer(saved.trainerId, { silent:true });
+      if(!result.ok){ clearSession(); return false; }
+      adminTab='sessions';
+      renderAdmin();
+      return true;
+    }
+    if(saved.role==='partner'){
+      const result = await loginAsPartner(saved.partnerId, { silent:true });
+      if(!result.ok){ clearSession(); return false; }
+      currentDay = currentUserUnlockedDays.length ? Math.max(...currentUserUnlockedDays) : 0;
+      currentTab='theory';
+      renderApp();
+      return true;
+    }
+  }catch(e){ clearSession(); return false; }
+  return false;
 }
 function overallStats(){
   const total = DAYS.length;
@@ -1190,7 +1256,7 @@ function renderQuiz(day){
   if(dp.quizSubmitted){
     const r = ratingFromPct(dp.quizPct);
     return `
-      <div class="locked-note">This ${day.id===7?'final assessment':'assessment'} was submitted on ${dp.quizDate||'a previous session'} and is locked. Score: <b class="mono">${dp.quizScore}/${dp.quizTotal}</b> (${dp.quizPct}%) &middot; <span class="rating-pill ${r.label}">${ratingLabel(r)}</span></div>
+      <div class="locked-note">This ${day.id===7?'final assessment':'assessment'} was submitted on ${dp.quizDate||'a previous session'} and is locked. Score: <b class="mono">${dp.quizScore}/${dp.quizTotal}</b> (${dp.quizPct}%) &middot; <b class="mono">${ratingOutOf5(dp.quizScore,dp.quizTotal)}/5</b> &middot; <span class="rating-pill ${r.label}">${ratingLabel(r)}</span></div>
       <div class="card"><h3>Your answers</h3>
         ${day.quiz.map((q,qi)=>`<div class="q-block"><div class="q-text">${qi+1}. ${q.q}</div>${q.opts.map((o,oi)=>{
           let cls='opt locked';
@@ -1247,14 +1313,14 @@ function renderResult(){
   const rows = DAYS.map(d=>{
     const dp = currentUserProgress[d.id]||defaultDayProgress();
     const r = dayRating(d.id);
-    return `<tr><td>Day ${d.id}</td><td>${d.title}</td><td class="mono">${dp.quizSubmitted?dp.quizScore+'/'+dp.quizTotal+' ('+dp.quizPct+'%)':'—'}</td><td><span class="rating-pill ${r.label==='pending'?'pending':r.label}">${ratingLabel(r)}</span></td><td>${r.pass===null?'—':(r.pass?'<b style="color:var(--success);">Pass</b>':'<b style="color:var(--danger);">Fail</b>')}</td></tr>`;
+    return `<tr><td>Day ${d.id}</td><td>${d.title}</td><td class="mono">${dp.quizSubmitted?dp.quizScore+'/'+dp.quizTotal+' ('+dp.quizPct+'%)':'—'}</td><td class="mono">${dp.quizSubmitted?ratingOutOf5(dp.quizScore,dp.quizTotal)+'/5':'—'}</td><td><span class="rating-pill ${r.label==='pending'?'pending':r.label}">${ratingLabel(r)}</span></td><td>${r.pass===null?'—':(r.pass?'<b style="color:var(--success);">Pass</b>':'<b style="color:var(--danger);">Fail</b>')}</td></tr>`;
   }).join('');
   return `
     <div class="crumb">Result</div>
     <h1 class="page-title">Day-wise performance</h1>
     <p class="page-sub">Your assessment result for every day, with a rating and pass/fail status.</p>
     <div class="card" style="overflow-x:auto;">
-      <table class="value-table"><tr><th>Day</th><th>Topic</th><th>Score</th><th>Rating</th><th>Status</th></tr>${rows}</table>
+      <table class="value-table"><tr><th>Day</th><th>Topic</th><th>Score</th><th>Rating /5</th><th>Level</th><th>Status</th></tr>${rows}</table>
     </div>
     ${s.overall ? `
     <div class="card">
@@ -1276,6 +1342,7 @@ function renderResult(){
 let adminRoster = {}; let adminSessions = []; let adminUnlocks = {}; let adminTrainers = {};
 let adminProgressCache = {}; let adminCheckinsCache = {}; let adminHistoryCache = [];
 let lastPartnerCredential = null;
+let lastTrainerCredential = null;
 let adminIssuesCache = [];
 
 function isAdminRole(){ return trainerIdentity && trainerIdentity.isAdmin; }
@@ -1307,10 +1374,19 @@ function adminTabDefs(){
   ];
 }
 
+let openIssueCount = 0;
+async function refreshOpenIssueCount(){
+  try{
+    const all = await listIssues();
+    if(isAdminRole()) openIssueCount = all.filter(i=>i.status==='Open').length;
+    else openIssueCount = all.filter(i=>i.reporterId===trainerIdentity.trainerId && i.status!=='Resolved' && i.status!=='Rejected' && (i.comments||[]).some(c=>c.role==='Admin')).length;
+  }catch(e){ openIssueCount = 0; }
+}
 function renderAdmin(){
   const root = document.getElementById('root');
   document.getElementById('hamburger').style.display='';
   root.innerHTML = `<div class="app"><div class="sidebar" id="sidebar"></div><div class="main" id="main"></div></div>`;
+  refreshOpenIssueCount().then(renderAdminSidebar);
   renderAdminSidebar();
   renderAdminMain();
 }
@@ -1328,14 +1404,16 @@ function renderAdminSidebar(){
     ${storageAvailable===false ? `<div class="gate-msg error" style="margin-bottom:10px;font-size:11px;"><b>Can't reach the database.</b> Check your connection and reload.</div>` : ''}
   `;
   tabs.forEach(([key,title,sub])=>{
-    html += `<div class="knob-row ${adminTab===key?'active':''}" onclick="setAdminTab('${key}')"><div class="knob"></div><div class="nav-text"><div class="nav-title">${title}</div><div class="nav-sub">${sub}</div></div></div>`;
+    const badgeKey = isAdminRole() ? 'support' : 'report';
+    const showBadge = key===badgeKey && openIssueCount>0;
+    html += `<div class="knob-row ${adminTab===key?'active':''}" onclick="setAdminTab('${key}')"><div class="knob"></div><div class="nav-text"><div class="nav-title">${title}${showBadge?` <span class="nav-badge">${openIssueCount}</span>`:''}</div><div class="nav-sub">${sub}</div></div></div>`;
   });
   html += `<div class="sidebar-foot">${isAdminRole()?'You can see every trainer, partner, and session on the platform.':'Your dashboard is scoped to your own city and partners.'}</div>`;
   document.getElementById('sidebar').innerHTML = html;
 }
 function toggleSidebar(){ const sb=document.getElementById('sidebar'); if(sb) sb.classList.toggle('open'); }
 function closeSidebar(){ const sb=document.getElementById('sidebar'); if(sb) sb.classList.remove('open'); }
-function setAdminTab(t){ if(t!=='partners') lastPartnerCredential=null; adminTab=t; closeSidebar(); renderAdminMain(); }
+function setAdminTab(t){ if(t!=='partners') lastPartnerCredential=null; if(t!=='trainers') lastTrainerCredential=null; adminTab=t; closeSidebar(); renderAdminMain(); if(t==='support'||t==='report') refreshOpenIssueCount().then(renderAdminSidebar); }
 
 async function renderAdminMain(){
   const el = document.getElementById('main');
@@ -1347,7 +1425,7 @@ async function renderAdminMain(){
   else if(adminTab==='access'){ const allR = await listRoster(); adminRoster = isAdminRole()?allR:Object.fromEntries(Object.entries(allR).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name)); adminUnlocks = await listUnlocks(); el.innerHTML = renderAccessTab(); }
   else if(adminTab==='partners'){ const allR2 = await listRoster(); adminRoster = isAdminRole()?allR2:Object.fromEntries(Object.entries(allR2).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name)); adminTrainers = await listTrainers(); el.innerHTML = renderPartnersTab(); }
   else if(adminTab==='support'){ adminIssuesCache = await listIssues(); adminTrainers = await listTrainers(); el.innerHTML = renderSupportTab(); }
-  else if(adminTab==='report'){ el.innerHTML = renderReportIssueTab(); }
+  else if(adminTab==='report'){ adminIssuesCache = await listIssues(); el.innerHTML = renderReportIssueTab(); }
   else if(adminTab==='tracking'){ await loadTrackingData(); el.innerHTML = renderTrackingTab(); }
   else if(adminTab==='videos'){ videosCache={}; audiosCache={}; await Promise.all(DAYS.map(async d=>{ videosCache[d.id]=await getVideoUrl(d.id); audiosCache[d.id]=await getAudioUrl(d.id); })); el.innerHTML = renderVideosTab(); }
 }
@@ -1398,10 +1476,17 @@ async function renderOverviewTabAsync(){
 /* ---- TRAINERS (admin only) ---- */
 function renderTrainersTab(){
   const entries = Object.entries(adminTrainers);
+  const passMsg = lastTrainerCredential ? encodeURIComponent(`Hi ${lastTrainerCredential.name}, your Urban Company Academy trainer password is: ${lastTrainerCredential.password}`) : '';
   return `
     <div class="crumb">Admin dashboard</div>
     <h1 class="page-title">Trainers</h1>
     <p class="page-sub">Create login credentials for a trainer. A unique password is generated automatically and only works for that trainer.</p>
+    ${lastTrainerCredential ? `<div class="credential-banner">
+      <div class="cb-label">Trainer password generated</div>
+      <div class="cb-value">${esc(lastTrainerCredential.password)}</div>
+      <div class="cb-note">Share this with ${esc(lastTrainerCredential.name)} — use the button below to open a pre-filled message with the password already included. <a onclick="lastTrainerCredential=null;renderAdminMain();" style="cursor:pointer;">Dismiss</a></div>
+      <div style="margin-top:10px;"><a class="btn small secondary" href="sms:${esc(lastTrainerCredential.phone)}?body=${passMsg}">Text password to ${esc(lastTrainerCredential.name)}</a></div>
+    </div>` : ''}
     <div class="card">
       <h3>Create a trainer</h3>
       <div class="form-grid">
@@ -1436,6 +1521,7 @@ async function createTrainer(){
   const ok = await kvSet('trainer:'+trainerId, { name, phone, category, city, password, createdAt:new Date().toISOString() });
   if(!ok){ showToast("Couldn't save — saving isn't working on this copy of the page.", 'error'); return; }
   await logHistory('trainer_created', `Trainer ${name} created (${category} · ${city})`, {trainerId, name, category, city});
+  lastTrainerCredential = { name, phone, password };
   showToast(`Trainer created. Password: ${password} — share this with them.`, 'success');
   renderAdminMain();
 }
@@ -1505,6 +1591,8 @@ function renderIssueListInner(statusFilter){
 function renderIssueCard(i){
   const mailBody = encodeURIComponent(`Issue: ${i.type}\nReported by: ${i.reporterName||''} (${i.reporterPhone||''})\nDescription: ${i.description}\nStatus: ${i.status}`);
   const smsBody = encodeURIComponent(`UCA issue [${i.type}] from ${i.reporterName||'trainer'}: ${i.description}`);
+  const passwordMsg = i.generatedPassword ? `Hi ${i.reporterName}, your new Urban Company Academy password is: ${i.generatedPassword}` : '';
+  const passwordMsgEncoded = encodeURIComponent(passwordMsg);
   return `
     <div class="card">
       <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
@@ -1513,9 +1601,17 @@ function renderIssueCard(i){
       </div>
       <p style="margin:0 0 6px;"><b>${esc(i.reporterName||'Unknown')}</b>${i.reporterPhone?` &middot; ${esc(i.reporterPhone)}`:''} ${i.reporterRole?`<span style="color:var(--ink-soft);">(${esc(i.reporterRole)})</span>`:''}</p>
       <p style="margin:0 0 10px;color:var(--ink-soft);">${esc(i.description)}</p>
-      ${i.generatedPassword?`<div class="credential-banner"><div class="cb-label">New password generated</div><div class="cb-value">${esc(i.generatedPassword)}</div><div class="cb-note">Share this with ${esc(i.reporterName)} directly — it wasn't sent automatically.</div></div>`:''}
-      ${i.resolutionNotes?`<p style="font-size:12.5px;color:var(--ink-soft);"><b>Notes:</b> ${esc(i.resolutionNotes)}</p>`:''}
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px;">
+      ${i.generatedPassword?`<div class="credential-banner">
+        <div class="cb-label">New password generated</div>
+        <div class="cb-value">${esc(i.generatedPassword)}</div>
+        <div class="cb-note">This app can't send it automatically — use the buttons below to open a pre-filled message with the password already included, ready to send from your own phone/email.</div>
+        <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap;">
+          ${i.reporterPhone?`<a class="btn small secondary" href="sms:${esc(i.reporterPhone)}?body=${passwordMsgEncoded}">Text password to ${esc(i.reporterName)}</a>`:''}
+          <a class="btn small secondary" href="mailto:?subject=${encodeURIComponent('Your Urban Company Academy password')}&body=${passwordMsgEncoded}">Email password to ${esc(i.reporterName)}</a>
+        </div>
+      </div>`:''}
+      ${renderCommentThread(i)}
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px;">
         ${i.type==='Forgot Password' && i.status!=='Resolved' ? `<button class="btn amber small" onclick="approveForgotPassword('${i.id}')">Approve &amp; generate password</button>` : ''}
         <select class="field-input" style="width:auto;margin-bottom:0;padding:7px 10px;font-size:11.5px;" onchange="setIssueStatus('${i.id}', this.value)">
           ${ISSUE_STATUSES.map(s=>`<option ${s===i.status?'selected':''}>${s}</option>`).join('')}
@@ -1525,6 +1621,35 @@ function renderIssueCard(i){
       </div>
     </div>
   `;
+}
+function renderCommentThread(i){
+  const comments = i.comments || [];
+  return `
+    <div style="border-top:1px solid var(--line);padding-top:10px;margin-top:10px;">
+      <div style="font-size:11.5px;font-weight:700;color:var(--ink-soft);text-transform:uppercase;letter-spacing:0.03em;margin-bottom:8px;">Comments${comments.length?` (${comments.length})`:''}</div>
+      ${comments.length===0?`<p style="font-size:12.5px;color:var(--ink-soft);margin:0 0 8px;">No comments yet.</p>`:
+        comments.map(c=>`<div style="margin-bottom:8px;padding:8px 10px;background:var(--porcelain);border-radius:8px;">
+          <div style="font-size:11.5px;"><b>${esc(c.author)}</b> <span style="color:var(--ink-soft);">(${esc(c.role)})</span> &middot; <span class="mono" style="color:var(--ink-soft);">${fmtDateTime(c.at)}</span></div>
+          <div style="font-size:13px;margin-top:3px;">${esc(c.text)}</div>
+        </div>`).join('')}
+      <div style="display:flex;gap:8px;margin-top:8px;">
+        <input class="field-input" style="margin-bottom:0;" id="comment-input-${i.id}" placeholder="Add a comment...">
+        <button class="btn secondary small" onclick="postComment('${i.id}', trainerIdentity.isAdmin?'Admin':trainerIdentity.name, trainerIdentity.isAdmin?'Admin':'Trainer')">Post</button>
+      </div>
+    </div>
+  `;
+}
+async function postComment(issueId, author, role){
+  const input = document.getElementById('comment-input-'+issueId);
+  const text = input.value.trim();
+  if(!text) return;
+  const cur = await kvGet('issue:'+issueId);
+  if(!cur) return;
+  const comments = cur.comments || [];
+  comments.push({ author, role, text, at: new Date().toISOString() });
+  await kvSet('issue:'+issueId, { ...cur, comments, updatedAt: new Date().toISOString() });
+  showToast('Comment added.', 'success');
+  renderAdminMain();
 }
 async function setIssueStatus(id, status){
   await updateIssue(id, {status});
@@ -1548,7 +1673,10 @@ async function approveForgotPassword(id){
     existingPasswords.add(t.password);
     const newPassword = genTrainerPassword(t.name, t.phone, existingPasswords);
     await kvSet('trainer:'+trainerId, { ...t, password:newPassword });
-    await updateIssue(id, { status:'Resolved', resolvedBy: trainerIdentity.name, resolvedAt:new Date().toISOString(), generatedPassword:newPassword, resolutionNotes:`Password reset and approved by ${trainerIdentity.name}.` });
+    const freshIssue = await kvGet('issue:'+id);
+    const comments = (freshIssue && freshIssue.comments) || [];
+    comments.push({ author:trainerIdentity.name, role:'Admin', text:`Password reset and approved. New password generated.`, at:new Date().toISOString() });
+    await updateIssue(id, { status:'Resolved', resolvedBy: trainerIdentity.name, resolvedAt:new Date().toISOString(), generatedPassword:newPassword, comments });
     await logHistory('password_reset_approved', `Password reset approved for ${t.name} by ${trainerIdentity.name}`, {trainerId, name:t.name});
     showToast(`New password generated: ${newPassword}`, 'success');
     renderAdminMain();
@@ -1557,6 +1685,7 @@ async function approveForgotPassword(id){
 
 /* ---- REPORT AN ISSUE (trainer only) ---- */
 function renderReportIssueTab(){
+  const mine = (adminIssuesCache||[]).filter(i=>i.reporterId===trainerIdentity.trainerId);
   return `
     <div class="crumb">Trainer dashboard</div>
     <h1 class="page-title">Report an issue</h1>
@@ -1568,16 +1697,31 @@ function renderReportIssueTab(){
       <textarea class="reflect field-input" id="ri-desc" style="min-height:100px;"></textarea>
       <button class="btn amber" onclick="submitReportedIssue()">Submit to Admin</button>
     </div>
+    <h2 class="page-title" style="font-size:19px;margin-top:22px;">Your requests</h2>
+    ${mine.length===0?`<div class="card"><div class="empty-state">You haven't reported anything yet.</div></div>`:mine.map(i=>renderIssueCardTrainerView(i)).join('')}
+  `;
+}
+function renderIssueCardTrainerView(i){
+  return `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
+        <div><span class="pill type">${esc(i.type)}</span> <span class="pill ${i.status==='Open'?'closed':i.status==='Resolved'?'open':'scheduled'}">${esc(i.status)}</span></div>
+        <div class="mono" style="font-size:11px;color:var(--ink-soft);">${fmtDateTime(i.createdAt)}</div>
+      </div>
+      <p style="margin:0 0 10px;color:var(--ink-soft);">${esc(i.description)}</p>
+      ${renderCommentThread(i)}
+    </div>
   `;
 }
 async function submitReportedIssue(){
   const type = document.getElementById('ri-type').value;
   const description = document.getElementById('ri-desc').value.trim();
   if(!description){ showToast('Describe the issue before submitting.', 'error'); return; }
-  await createIssue({ type, description, reporterName:trainerIdentity.name, reporterPhone:trainerIdentity.phone, reporterRole:'Trainer' });
+  await createIssue({ type, description, reporterId:trainerIdentity.trainerId, reporterName:trainerIdentity.name, reporterPhone:trainerIdentity.phone, reporterRole:'Trainer' });
   await logHistory('issue_reported', `${trainerIdentity.name} reported a ${type} issue`, {type});
   document.getElementById('ri-desc').value='';
   showToast('Issue submitted to Admin.', 'success');
+  renderAdminMain();
 }
 
 /* ---- SESSIONS ---- */
@@ -1791,7 +1935,7 @@ function renderTrackingTableInner(cityFilter, trainerFilter){
     const dayCells = DAYS.map(d=>{
       const dp = prog[d.id];
       if(!dp || !dp.quizSubmitted) return '<span class="mono" style="color:var(--ink-soft);">D'+d.id+':—</span>';
-      return `<span class="mono" style="color:${dp.quizPct>=PASS_THRESHOLD?'var(--success)':'var(--danger)'};">D${d.id}:${dp.quizScore}/${dp.quizTotal}</span>`;
+      return `<span class="mono" style="color:${dp.quizPct>=PASS_THRESHOLD?'var(--success)':'var(--danger)'};">D${d.id}:${dp.quizScore}/${dp.quizTotal} (${ratingOutOf5(dp.quizScore,dp.quizTotal)}/5)</span>`;
     }).join(' &nbsp; ');
     return `<tr>
       <td>${esc(r.name)}</td><td>${esc(r.officeId||'—')}</td><td class="mono">${esc(id)}</td><td>${esc(r.city)}</td><td>${esc(r.trainer)}</td>
@@ -1812,7 +1956,7 @@ async function exportExcel(){
   if(typeof XLSX==='undefined'){ showToast('Excel library did not load (no internet access?). Please try again when online.', 'error'); return; }
   const entries = Object.entries(adminRoster);
   const summary = [['Name','Office ID','Partner ID','City','Trainer','Days Complete','Overall %','Overall Rating','Overall Pass/Fail','Last Check-in','Last Check-out']];
-  const dayScores = [['Name','Partner ID', ...DAYS.flatMap(d=>['Day'+d.id+' Score','Day'+d.id+' %','Day'+d.id+' Rating','Day'+d.id+' Pass/Fail'])]];
+  const dayScores = [['Name','Partner ID', ...DAYS.flatMap(d=>['Day'+d.id+' Score','Day'+d.id+' %','Day'+d.id+' Rating /5','Day'+d.id+' Level','Day'+d.id+' Pass/Fail'])]];
   const attendance = [['Name','Partner ID','City','Trainer','Date','Day','Check-in','Check-out']];
   for(const [id,r] of entries){
     const prog = adminProgressCache[id] || await getProgress(id);
@@ -1833,8 +1977,8 @@ async function exportExcel(){
       const dp = prog[d.id];
       if(dp && dp.quizSubmitted){
         const rr = ratingFromPct(dp.quizPct);
-        dayRow.push(dp.quizScore+'/'+dp.quizTotal, dp.quizPct, ratingLabel(rr), rr.pass?'Pass':'Fail');
-      } else { dayRow.push('','','',''); }
+        dayRow.push(dp.quizScore+'/'+dp.quizTotal, dp.quizPct, ratingOutOf5(dp.quizScore,dp.quizTotal), ratingLabel(rr), rr.pass?'Pass':'Fail');
+      } else { dayRow.push('','','','',''); }
     });
     dayScores.push(dayRow);
     myCheckins.forEach(c=>{ attendance.push([r.name, id, r.city, r.trainer, c.date, 'Day '+c.day, c.checkinTime||'', c.checkoutTime||'']); });
@@ -1941,7 +2085,8 @@ function maybeShowIOSInstallHint(){
   registerServiceWorker();
   maybeShowIOSInstallHint();
   await checkStorageAvailability();
-  renderGate();
+  const restored = await tryRestoreSession();
+  if(!restored) renderGate();
 })();
 </script>
 </body>
