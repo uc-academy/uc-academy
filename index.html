@@ -474,6 +474,27 @@ const DAYS = [
 const HOME_SAFETY = ["Always unplug the machine before opening any panel.","Drain all water out completely before dismantling.","Never test a live plugged-in machine with bare hands.","Keep all screws in one tray per group.","Take a photo before removing a part you're unsure about."];
 const HOME_SCHEDULE = [["9:00 AM – 11:00 AM","Learning Block 1","120 min"],["11:00 – 11:15 AM","Tea Break","15 min"],["11:15 AM – 1:15 PM","Learning Block 2","120 min"],["1:15 – 1:45 PM","Lunch Break","30 min"],["1:45 – 4:00 PM","Learning Block 3","135 min"],["4:00 – 4:15 PM","Tea Break","15 min"],["4:15 – 6:00 PM","Learning Block 4","105 min"]];
 
+function defaultToBlocks(day){
+  const blocks = day.theory.map(sec=>{
+    let body = '';
+    if(sec.body) body += sec.body.join('\n\n');
+    if(sec.list) body += (body?'\n\n':'') + sec.list.map(x=>'• '+x).join('\n');
+    if(sec.table) body += (body?'\n\n':'') + sec.table.rows.map(r=>r.join(' — ')).join('\n');
+    if(sec.callout) body += (body?'\n\n':'') + sec.callout.title+':\n'+sec.callout.lines.join('\n');
+    return { heading: sec.h, body };
+  });
+  return {
+    title: day.title,
+    sub: day.sub,
+    blocks,
+    videos: [{ title: day.video.title, url: videosCache[day.id]||'' }],
+    audios: audiosCache[day.id] ? [{ title:'Audio narration', url:audiosCache[day.id] }] : [],
+    assignmentIntro: day.assignment.intro,
+    tasks: [...day.assignment.tasks],
+    quiz: day.quiz.map(q=>({ question:q.q, options:[...q.opts], correct:q.correct }))
+  };
+}
+
 function uid(){ return Math.random().toString(36).slice(2,9); }
 function todayStr(){ const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
 function nowHM(){ const d=new Date(); return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); }
@@ -629,6 +650,10 @@ async function setVideoUrl(dayId, url){ return await kvSet('video:'+dayId, {url}
 async function getAudioUrl(dayId){ const v = await kvGet('audio:'+dayId); return v ? v.url : ''; }
 async function setAudioUrl(dayId, url){ return await kvSet('audio:'+dayId, {url}); }
 
+async function getContentOverride(dayId){ return await kvGet('content:'+dayId); }
+async function setContentOverride(dayId, data){ return await kvSet('content:'+dayId, data); }
+async function deleteContentOverride(dayId){ await kvDelete('content:'+dayId); }
+
 let currentUser = null;
 let currentUserProgress = {};
 let currentUserUnlockedDays = [];
@@ -642,6 +667,7 @@ let currentTab = 'theory';
 let adminTab = 'sessions';
 let videosCache = {};
 let audiosCache = {};
+let contentOverrides = {};
 let ytPlayer = null;
 let ytPollTimer = null;
 window.onYouTubeIframeAPIReady = function(){};
@@ -826,8 +852,13 @@ async function loginAsPartner(id, opts){
   currentUserUnlockedDays = await getUnlock(r.city, r.trainer);
   currentUserProgress = await getProgress(id);
   for(const d of DAYS) ensureDay(d.id);
-  videosCache = {}; audiosCache = {};
-  await Promise.all(DAYS.map(async d=>{ videosCache[d.id]=await getVideoUrl(d.id); audiosCache[d.id]=await getAudioUrl(d.id); }));
+  videosCache = {}; audiosCache = {}; contentOverrides = {};
+  await Promise.all(DAYS.map(async d=>{
+    videosCache[d.id]=await getVideoUrl(d.id);
+    audiosCache[d.id]=await getAudioUrl(d.id);
+    const ov = await getContentOverride(d.id);
+    if(ov) contentOverrides[d.id] = ov;
+  }));
   await logCheckin(s);
   if(!opts.silent) await logHistory('partner_login', `${r.name} (${id}) checked in for Day ${s.day}`, {partnerId:id, city:r.city, trainer:r.trainer, day:s.day});
   saveSession({ role:'partner', partnerId:id });
@@ -902,11 +933,23 @@ async function submitAdminLogin(){
   if(gateBusy) return;
   const pass = document.getElementById('admin-pass-input').value.trim();
   if(pass !== ADMIN_PASSWORD){ gateError='Incorrect admin password.'; renderGate(); return; }
-  trainerIdentity = { isAdmin:true, name:'Admin' };
+  trainerIdentity = { isAdmin:true, name: getSavedAdminName() };
   await logHistory('admin_login', 'Admin logged in', {});
   saveSession({ role:'admin' });
   adminTab='overview';
   renderAdmin();
+}
+function getSavedAdminName(){
+  try{ return localStorage.getItem('uca_admin_name') || 'Admin'; }catch(e){ return 'Admin'; }
+}
+function startEditAdminName(){ editingAdminName=true; renderAdminSidebar(); const el=document.getElementById('admin-name-input'); if(el) el.focus(); }
+function saveAdminName(){
+  const el = document.getElementById('admin-name-input');
+  const val = (el ? el.value.trim() : '') || 'Admin';
+  try{ localStorage.setItem('uca_admin_name', val); }catch(e){}
+  trainerIdentity.name = val;
+  editingAdminName = false;
+  renderAdminSidebar();
 }
 
 function switchId(){
@@ -922,7 +965,7 @@ async function tryRestoreSession(){
   if(!saved) return false;
   try{
     if(saved.role==='admin'){
-      trainerIdentity = { isAdmin:true, name:'Admin' };
+      trainerIdentity = { isAdmin:true, name: getSavedAdminName() };
       adminTab='overview';
       renderAdmin();
       return true;
@@ -1035,8 +1078,8 @@ function setTab(tab){
   cleanupPlayer();
   currentTab = tab; renderMainOnly();
 }
-function renderMainOnly(){ document.getElementById('main').innerHTML = renderCurrentPage(); if(currentDay>0 && currentDay<99 && currentTab==='video') initVideoTab(DAYS.find(d=>d.id===currentDay)); }
-function renderMain(){ document.getElementById('main').innerHTML = renderCurrentPage(); if(currentDay>0 && currentDay<99 && currentTab==='video') initVideoTab(DAYS.find(d=>d.id===currentDay)); }
+function renderMainOnly(){ document.getElementById('main').innerHTML = renderCurrentPage(); if(currentDay>0 && currentDay<99 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay)); }
+function renderMain(){ document.getElementById('main').innerHTML = renderCurrentPage(); if(currentDay>0 && currentDay<99 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay)); }
 function renderCurrentPage(){
   if(currentDay===0) return renderHome();
   if(currentDay===99) return renderResult();
@@ -1069,14 +1112,17 @@ function renderHome(){
 function renderDayShell(day){
   ensureDay(day.id);
   const dp = currentUserProgress[day.id];
+  const ov = contentOverrides[day.id];
+  const displayTitle = ov ? ov.title : day.title;
+  const displaySub = ov ? ov.sub : day.sub;
+  const totalTasks = getEffectiveTasks(day.id).length;
   const doneTasks = dp.tasksChecked.filter(Boolean).length;
-  const totalTasks = day.assignment.tasks.length;
   const videoLocked = !dp.theoryDone;
   const laterLocked = !dp.videoDone;
   return `
     <div class="crumb">Day ${day.id} &middot; ${day.machine==='SA'?'Semi-Automatic':day.machine==='TL'?'Top-Load':'Semi-Automatic & Top-Load'}</div>
-    <h1 class="page-title">${day.title}</h1>
-    <p class="page-sub">${day.sub}</p>
+    <h1 class="page-title">${esc(displayTitle)}</h1>
+    <p class="page-sub">${esc(displaySub)}</p>
     <div class="tabs">
       <button class="tab-btn ${currentTab==='theory'?'active':''}" onclick="setTab('theory')">Theory${dp.theoryDone?'<span class="dot"></span>':''}</button>
       <button class="tab-btn ${currentTab==='video'?'active':''} ${videoLocked?'locked':''}" onclick="setTab('video')">Video${dp.videoDone?'<span class="dot"></span>':(videoLocked?'<span class="lk">&#128274;</span>':'')}</button>
@@ -1095,8 +1141,24 @@ function renderTab(day){
 }
 function renderTheory(day){
   const dp = currentUserProgress[day.id];
-  const audioUrl = audiosCache[day.id];
+  const ov = contentOverrides[day.id];
   let html='';
+  if(ov){
+    ov.blocks.forEach(b=>{
+      html += `<div class="card"><h3>${esc(b.heading)}</h3><p style="white-space:pre-wrap;">${esc(b.body)}</p></div>`;
+    });
+    (ov.audios||[]).forEach((a,i)=>{
+      html += `<div class="card"><h3>${esc(a.title||'Audio')}</h3><audio controls onplay="markAudioPlayed(${day.id})"><source src="${esc(a.url)}"></audio></div>`;
+    });
+    const hasAudio = (ov.audios||[]).length>0;
+    html += `<div class="card">
+      ${dp.theoryDone ? `<p style="color:var(--success);font-weight:500;">Theory marked complete. The video tab is unlocked below.</p>` :
+      `<p>${hasAudio?'Listen to the audio above, then mark this section complete to unlock the video.':'Read through the theory above, then mark it complete to unlock the video.'}</p>
+      <button class="btn amber" id="theory-complete-btn" ${hasAudio && !dp.audioPlayed?'disabled':''} onclick="markTheoryDone(${day.id})">Mark theory complete</button>`}
+    </div>`;
+    return html;
+  }
+  const audioUrl = audiosCache[day.id];
   day.theory.forEach(sec=>{
     html+=`<div class="card"><h3>${sec.h}</h3>`;
     if(sec.body) sec.body.forEach(b=>html+=`<p>${b}</p>`);
@@ -1128,6 +1190,27 @@ async function markTheoryDone(dayId){
 
 function renderVideo(day){
   const dp = currentUserProgress[day.id];
+  const ov = contentOverrides[day.id];
+  if(ov){
+    const videos = ov.videos||[];
+    const frames = videos.map(v=>{
+      const yt = (v.url||'').match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([\w-]+)/);
+      const vm = (v.url||'').match(/vimeo\.com\/(\d+)/);
+      let inner = `<div class="video-placeholder">${esc(v.title||'Video')}<br><span style="font-size:11.5px;">No video linked yet.</span></div>`;
+      if(yt) inner = `<iframe src="https://www.youtube.com/embed/${yt[1]}" allowfullscreen></iframe>`;
+      else if(vm) inner = `<iframe src="https://player.vimeo.com/video/${vm[1]}" allowfullscreen></iframe>`;
+      else if(v.url) inner = `<div class="video-placeholder">Video link not recognised.</div>`;
+      return `<div class="card"><h3>${esc(v.title||'Video')}</h3><div class="video-frame">${inner}</div></div>`;
+    }).join('');
+    return `
+      ${frames || `<div class="video-frame"><div class="video-placeholder">No videos added yet — ask your trainer.</div></div>`}
+      <div class="video-progress-wrap">
+        <div class="video-progress-track"><div class="video-progress-fill" style="width:${dp.videoDone?100:0}%"></div></div>
+        <div class="video-progress-label">${dp.videoDone?'All videos confirmed watched &middot; <span style="color:var(--success);">Unlocked next steps</span>':'Watch the video(s) above, then confirm below'}</div>
+      </div>
+      ${!dp.videoDone && videos.length>0 ? `<button class="btn amber" onclick="manualVideoComplete(${day.id})">I've watched ${videos.length>1?'all the videos':'this video'}</button>` : ''}
+    `;
+  }
   const url = videosCache[day.id]||'';
   const yt = url.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([\w-]+)/);
   const pct = Math.round(dp.videoPct||0);
@@ -1227,13 +1310,30 @@ async function pollYT(dayId){
   }catch(e){}
 }
 
+function getEffectiveQuiz(dayId){
+  const ov = contentOverrides[dayId];
+  if(ov && ov.quiz) return ov.quiz.map(q=>({q:q.question, opts:q.options, correct:q.correct}));
+  return DAYS.find(d=>d.id===dayId).quiz;
+}
+function getEffectiveTasks(dayId){
+  const ov = contentOverrides[dayId];
+  if(ov && ov.tasks) return ov.tasks;
+  return DAYS.find(d=>d.id===dayId).assignment.tasks;
+}
+function getEffectiveAssignmentIntro(dayId){
+  const ov = contentOverrides[dayId];
+  if(ov && ov.assignmentIntro) return ov.assignmentIntro;
+  return DAYS.find(d=>d.id===dayId).assignment.intro;
+}
+
 function renderAssignment(day){
   const dp = currentUserProgress[day.id];
-  const tasks = day.assignment.tasks;
+  const tasks = getEffectiveTasks(day.id);
+  const intro = getEffectiveAssignmentIntro(day.id);
   while(dp.tasksChecked.length < tasks.length) dp.tasksChecked.push(false);
   return `
-    <div class="card"><h3>Hands-on assignment</h3><p>${day.assignment.intro}</p>
-      ${tasks.map((t,i)=>`<div class="task-row"><input type="checkbox" id="task-${i}" ${dp.tasksChecked[i]?'checked':''} onchange="toggleTask(${day.id},${i})"><label for="task-${i}">${t}</label></div>`).join('')}
+    <div class="card"><h3>Hands-on assignment</h3><p>${esc(intro)}</p>
+      ${tasks.map((t,i)=>`<div class="task-row"><input type="checkbox" id="task-${i}" ${dp.tasksChecked[i]?'checked':''} onchange="toggleTask(${day.id},${i})"><label for="task-${i}">${esc(t)}</label></div>`).join('')}
       <div class="save-note">${dp.tasksChecked.filter(Boolean).length} of ${tasks.length} tasks checked off &middot; saved automatically</div>
     </div>
     <div class="card"><h3>Notes</h3><p style="margin-bottom:8px;">Optional — jot down anything worth remembering from today's practical.</p>
@@ -1252,54 +1352,55 @@ async function saveReflection(dayId){ currentUserProgress[dayId].reflection = do
 
 function renderQuiz(day){
   const dp = currentUserProgress[day.id];
-  const total = day.quiz.length;
+  const quiz = getEffectiveQuiz(day.id);
+  const total = quiz.length;
   if(dp.quizSubmitted){
     const r = ratingFromPct(dp.quizPct);
     return `
       <div class="locked-note">This ${day.id===7?'final assessment':'assessment'} was submitted on ${dp.quizDate||'a previous session'} and is locked. Score: <b class="mono">${dp.quizScore}/${dp.quizTotal}</b> (${dp.quizPct}%) &middot; <b class="mono">${ratingOutOf5(dp.quizScore,dp.quizTotal)}/5</b> &middot; <span class="rating-pill ${r.label}">${ratingLabel(r)}</span></div>
       <div class="card"><h3>Your answers</h3>
-        ${day.quiz.map((q,qi)=>`<div class="q-block"><div class="q-text">${qi+1}. ${q.q}</div>${q.opts.map((o,oi)=>{
+        ${quiz.map((q,qi)=>`<div class="q-block"><div class="q-text">${qi+1}. ${esc(q.q)}</div>${q.opts.map((o,oi)=>{
           let cls='opt locked';
           if(oi===q.correct) cls+=' correct'; else if(oi===dp.quizAnswers[qi]) cls+=' wrong';
-          return `<div class="${cls}">${o}</div>`;
+          return `<div class="${cls}">${esc(o)}</div>`;
         }).join('')}</div>`).join('')}
       </div>
-      ${renderImprovementTips(day, dp)}
+      ${renderImprovementTips(quiz, dp)}
     `;
   }
   return `
     <div class="card"><h3>${day.id===7?'Final Assessment':'Assessment'} &middot; ${total} questions</h3>
       <p>Answer every question, then submit. <b>You can only submit once</b> — review carefully before submitting. You need 70% or higher to pass this day.</p>
       <form id="quiz-form">
-        ${day.quiz.map((q,qi)=>`<div class="q-block"><div class="q-text">${qi+1}. ${q.q}</div>${q.opts.map((o,oi)=>`<label class="opt" id="opt-${qi}-${oi}"><input type="radio" name="q${qi}" value="${oi}"> ${o}</label>`).join('')}</div>`).join('')}
+        ${quiz.map((q,qi)=>`<div class="q-block"><div class="q-text">${qi+1}. ${esc(q.q)}</div>${q.opts.map((o,oi)=>`<label class="opt" id="opt-${qi}-${oi}"><input type="radio" name="q${qi}" value="${oi}"> ${esc(o)}</label>`).join('')}</div>`).join('')}
       </form>
       <button class="btn amber" onclick="confirmSubmitQuiz(${day.id})">Submit ${day.id===7?'Final Assessment':'Assessment'} (final)</button>
       <div id="quiz-result-box"></div>
     </div>
   `;
 }
-function renderImprovementTips(day, dp){
+function renderImprovementTips(quiz, dp){
   const tips = [];
-  day.quiz.forEach((q,qi)=>{
+  quiz.forEach((q,qi)=>{
     if(dp.quizAnswers[qi] !== q.correct) tips.push(`Revise: "${q.q}" — correct answer is "${q.opts[q.correct]}".`);
   });
   if(!tips.length) return `<div class="card"><h3>Improvement points</h3><p style="color:var(--success);">Perfect score — no improvement points for this day.</p></div>`;
-  return `<div class="card"><h3>Improvement points</h3><ul class="list">${tips.map(t=>`<li>${t}</li>`).join('')}</ul></div>`;
+  return `<div class="card"><h3>Improvement points</h3><ul class="list">${tips.map(t=>`<li>${esc(t)}</li>`).join('')}</ul></div>`;
 }
 function confirmSubmitQuiz(dayId){
   showConfirmModal('Submit your final answers? You will not be able to change them after this.', ()=>submitQuiz(dayId));
 }
 async function submitQuiz(dayId){
-  const day = DAYS.find(d=>d.id===dayId);
+  const quiz = getEffectiveQuiz(dayId);
   let score=0;
   const answers=[];
-  day.quiz.forEach((q,qi)=>{
+  quiz.forEach((q,qi)=>{
     const sel = document.querySelector(`input[name="q${qi}"]:checked`);
     const chosen = sel?parseInt(sel.value):-1;
     answers.push(chosen);
     if(chosen===q.correct) score++;
   });
-  const total=day.quiz.length, pct=Math.round((score/total)*100);
+  const total=quiz.length, pct=Math.round((score/total)*100);
   const dp = currentUserProgress[dayId];
   dp.quizSubmitted = true; dp.quizScore=score; dp.quizTotal=total; dp.quizPct=pct; dp.quizAnswers=answers; dp.quizDate = new Date().toLocaleString('en-IN');
   await setProgress(currentUser.id, currentUserProgress);
@@ -1358,6 +1459,7 @@ function adminTabDefs(){
       ['trainers','Trainers','Create & manage'],
       ['support','Support','Requests & issues'],
       ['history','History','Audit log'],
+      ['modules','Modules','Edit course content'],
       ['sessions','Sessions','Check-in windows'],
       ['access','Day Access','Unlock days'],
       ['partners','Partners','All partners'],
@@ -1390,14 +1492,18 @@ function renderAdmin(){
   renderAdminSidebar();
   renderAdminMain();
 }
+let editingAdminName = false;
 function renderAdminSidebar(){
   const tabs = adminTabDefs();
   const roleLabel = isAdminRole() ? 'Platform Administrator' : `${esc(trainerIdentity.category)} &middot; ${esc(trainerIdentity.city)}`;
+  const nameBlock = (isAdminRole() && editingAdminName)
+    ? `<input class="field-input" id="admin-name-input" style="margin-bottom:6px;padding:7px 10px;font-size:13px;" value="${esc(trainerIdentity.name)}" onkeydown="if(event.key==='Enter') saveAdminName();"><button class="btn small amber" onclick="saveAdminName()">Save name</button>`
+    : `<div class="who-name">${esc(trainerIdentity.name)}${isAdminRole()?` <span onclick="startEditAdminName()" style="cursor:pointer;font-size:11px;color:var(--brand-mid);font-family:'Inter',sans-serif;font-weight:400;">Edit</span>`:''}</div>`;
   let html = `
     <div class="brand"><div class="brand-mark">UC</div><div class="brand-text"><div class="t1">${esc(COURSE_NAME)}</div><div class="t2">${esc(COURSE_SUB)}</div></div></div>
     <div class="who-card">
-      <div class="who-role">${isAdminRole()?'Admin':'Trainer'}</div>
-      <div class="who-name">${esc(trainerIdentity.name)}</div>
+      <div class="who-role">${isAdminRole()?'Welcome':'Trainer'}</div>
+      ${nameBlock}
       <div class="who-meta">${roleLabel}</div>
       <div class="who-actions"><span onclick="switchId()">Exit &rarr;</span></div>
     </div>
@@ -1426,6 +1532,14 @@ async function renderAdminMain(){
   else if(adminTab==='partners'){ const allR2 = await listRoster(); adminRoster = isAdminRole()?allR2:Object.fromEntries(Object.entries(allR2).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name)); adminTrainers = await listTrainers(); el.innerHTML = renderPartnersTab(); }
   else if(adminTab==='support'){ adminIssuesCache = await listIssues(); adminTrainers = await listTrainers(); el.innerHTML = renderSupportTab(); }
   else if(adminTab==='report'){ adminIssuesCache = await listIssues(); el.innerHTML = renderReportIssueTab(); }
+  else if(adminTab==='modules'){
+    if(editingDayId){ el.innerHTML = renderModuleEditorTab(); }
+    else{
+      adminModuleStatus = {};
+      await Promise.all(DAYS.map(async d=>{ adminModuleStatus[d.id] = !!(await getContentOverride(d.id)); }));
+      el.innerHTML = renderModulesListTab();
+    }
+  }
   else if(adminTab==='tracking'){ await loadTrackingData(); el.innerHTML = renderTrackingTab(); }
   else if(adminTab==='videos'){ videosCache={}; audiosCache={}; await Promise.all(DAYS.map(async d=>{ videosCache[d.id]=await getVideoUrl(d.id); audiosCache[d.id]=await getAudioUrl(d.id); })); el.innerHTML = renderVideosTab(); }
 }
@@ -1998,6 +2112,218 @@ async function exportExcel(){
 }
 
 /* ---- VIDEOS & AUDIO (admin only in nav, function shared) ---- */
+/* ---- MODULES (CMS) — admin only ---- */
+let editingDayId = null;
+let moduleDraft = null;
+let adminModuleStatus = {};
+
+function renderModulesListTab(){
+  return `
+    <div class="crumb">Admin dashboard</div>
+    <h1 class="page-title">Modules</h1>
+    <p class="page-sub">Edit the theory, videos, audio, assignment, and assessment for each day. Nothing changes for partners until you click Save &amp; Publish.</p>
+    ${DAYS.map(d=>`
+      <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+        <div>
+          <h3 style="margin-bottom:2px;">Day ${d.id} &middot; ${esc(d.id===7?'Final Assessment':d.title)}</h3>
+          <span class="pill ${adminModuleStatus[d.id]?'open':'scheduled'}">${adminModuleStatus[d.id]?'Customized':'Default content'}</span>
+        </div>
+        <button class="btn amber small" onclick="openModuleEditor(${d.id})">Edit &rarr;</button>
+      </div>
+    `).join('')}
+  `;
+}
+async function openModuleEditor(dayId){
+  editingDayId = dayId;
+  if(videosCache[dayId]===undefined) videosCache[dayId] = await getVideoUrl(dayId);
+  if(audiosCache[dayId]===undefined) audiosCache[dayId] = await getAudioUrl(dayId);
+  const ov = await getContentOverride(dayId);
+  const day = DAYS.find(d=>d.id===dayId);
+  moduleDraft = ov ? JSON.parse(JSON.stringify(ov)) : defaultToBlocks(day);
+  renderAdminMain();
+}
+function closeModuleEditor(){
+  editingDayId = null;
+  moduleDraft = null;
+  renderAdminMain();
+}
+function refreshModuleEditor(){
+  document.getElementById('main').innerHTML = renderModuleEditorTab();
+}
+function syncModuleDraftFromDOM(){
+  if(!moduleDraft) return;
+  const g = id => document.getElementById(id);
+  if(g('draft-title')) moduleDraft.title = g('draft-title').value;
+  if(g('draft-sub')) moduleDraft.sub = g('draft-sub').value;
+  if(g('draft-assignment-intro')) moduleDraft.assignmentIntro = g('draft-assignment-intro').value;
+  moduleDraft.blocks.forEach((b,i)=>{
+    if(g('block-heading-'+i)) b.heading = g('block-heading-'+i).value;
+    if(g('block-body-'+i)) b.body = g('block-body-'+i).value;
+  });
+  moduleDraft.videos.forEach((v,i)=>{
+    if(g('video-title-'+i)) v.title = g('video-title-'+i).value;
+    if(g('video-url-'+i)) v.url = g('video-url-'+i).value;
+  });
+  moduleDraft.audios.forEach((a,i)=>{
+    if(g('audio-title-'+i)) a.title = g('audio-title-'+i).value;
+    if(g('audio-url-'+i)) a.url = g('audio-url-'+i).value;
+  });
+  moduleDraft.tasks.forEach((t,i)=>{
+    if(g('task-text-'+i)) moduleDraft.tasks[i] = g('task-text-'+i).value;
+  });
+  moduleDraft.quiz.forEach((q,i)=>{
+    if(g('quiz-q-'+i)) q.question = g('quiz-q-'+i).value;
+    q.options.forEach((o,j)=>{ if(g('quiz-opt-'+i+'-'+j)) q.options[j] = g('quiz-opt-'+i+'-'+j).value; });
+    const checked = document.querySelector(`input[name="quiz-correct-${i}"]:checked`);
+    if(checked) q.correct = parseInt(checked.value);
+  });
+}
+function addBlock(){ syncModuleDraftFromDOM(); moduleDraft.blocks.push({heading:'New section', body:''}); refreshModuleEditor(); }
+function removeBlock(i){ syncModuleDraftFromDOM(); moduleDraft.blocks.splice(i,1); refreshModuleEditor(); }
+function moveBlock(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.blocks.length) return; [moduleDraft.blocks[i],moduleDraft.blocks[j]]=[moduleDraft.blocks[j],moduleDraft.blocks[i]]; refreshModuleEditor(); }
+function addVideo(){ syncModuleDraftFromDOM(); moduleDraft.videos.push({title:'New video', url:''}); refreshModuleEditor(); }
+function removeVideo(i){ syncModuleDraftFromDOM(); moduleDraft.videos.splice(i,1); refreshModuleEditor(); }
+function moveVideo(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.videos.length) return; [moduleDraft.videos[i],moduleDraft.videos[j]]=[moduleDraft.videos[j],moduleDraft.videos[i]]; refreshModuleEditor(); }
+function addAudio(){ syncModuleDraftFromDOM(); moduleDraft.audios.push({title:'New audio', url:''}); refreshModuleEditor(); }
+function removeAudio(i){ syncModuleDraftFromDOM(); moduleDraft.audios.splice(i,1); refreshModuleEditor(); }
+function moveAudio(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.audios.length) return; [moduleDraft.audios[i],moduleDraft.audios[j]]=[moduleDraft.audios[j],moduleDraft.audios[i]]; refreshModuleEditor(); }
+function addTask(){ syncModuleDraftFromDOM(); moduleDraft.tasks.push('New task'); refreshModuleEditor(); }
+function removeTask(i){ syncModuleDraftFromDOM(); moduleDraft.tasks.splice(i,1); refreshModuleEditor(); }
+function moveTask(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.tasks.length) return; [moduleDraft.tasks[i],moduleDraft.tasks[j]]=[moduleDraft.tasks[j],moduleDraft.tasks[i]]; refreshModuleEditor(); }
+function addQuizQuestion(){ syncModuleDraftFromDOM(); moduleDraft.quiz.push({question:'New question', options:['Option A','Option B','Option C','Option D'], correct:0}); refreshModuleEditor(); }
+function removeQuizQuestion(i){ syncModuleDraftFromDOM(); moduleDraft.quiz.splice(i,1); refreshModuleEditor(); }
+function moveQuizQuestion(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.quiz.length) return; [moduleDraft.quiz[i],moduleDraft.quiz[j]]=[moduleDraft.quiz[j],moduleDraft.quiz[i]]; refreshModuleEditor(); }
+
+async function saveModuleDraft(){
+  syncModuleDraftFromDOM();
+  if(!moduleDraft.title.trim()){ showToast('Give the day a title.', 'error'); return; }
+  if(moduleDraft.quiz.length===0){ showToast('Add at least one assessment question.', 'error'); return; }
+  const ok = await setContentOverride(editingDayId, moduleDraft);
+  if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
+  await logHistory('module_edited', `Day ${editingDayId} content edited and published by ${trainerIdentity.name}`, {dayId:editingDayId});
+  showToast('Saved and published.', 'success');
+  closeModuleEditor();
+}
+async function resetModuleToDefault(){
+  showConfirmModal('Revert Day '+editingDayId+' to the original default content? Your customizations will be deleted.', async ()=>{
+    await deleteContentOverride(editingDayId);
+    await logHistory('module_reset', `Day ${editingDayId} reverted to default content by ${trainerIdentity.name}`, {dayId:editingDayId});
+    showToast('Reverted to default content.', 'success');
+    closeModuleEditor();
+  });
+}
+function renderModuleEditorTab(){
+  const d = moduleDraft;
+  return `
+    <div class="crumb">Admin dashboard &middot; Modules</div>
+    <div class="back-link" onclick="closeModuleEditor()">&larr; Back to Modules</div>
+    <h1 class="page-title">Edit Day ${editingDayId}</h1>
+    <p class="page-sub">Changes here don't affect partners until you click Save &amp; Publish.</p>
+
+    <div class="card">
+      <span class="field-label">Day title</span>
+      <input class="field-input" id="draft-title" value="${esc(d.title)}">
+      <span class="field-label">Subtitle</span>
+      <input class="field-input" id="draft-sub" value="${esc(d.sub)}">
+    </div>
+
+    <h2 class="page-title" style="font-size:18px;margin-top:20px;">Theory</h2>
+    ${d.blocks.map((b,i)=>`
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <span class="field-label" style="margin:0;">Section ${i+1}</span>
+          <div style="display:flex;gap:6px;">
+            <button class="btn small secondary" onclick="moveBlock(${i},-1)" ${i===0?'disabled':''}>&uarr;</button>
+            <button class="btn small secondary" onclick="moveBlock(${i},1)" ${i===d.blocks.length-1?'disabled':''}>&darr;</button>
+            <button class="btn small danger" onclick="removeBlock(${i})">Delete</button>
+          </div>
+        </div>
+        <input class="field-input" id="block-heading-${i}" value="${esc(b.heading)}" placeholder="Heading">
+        <textarea class="field-input reflect" id="block-body-${i}" style="min-height:100px;" placeholder="Edit every single word here">${esc(b.body)}</textarea>
+      </div>
+    `).join('')}
+    <button class="btn secondary" onclick="addBlock()">+ Add theory section</button>
+
+    <h2 class="page-title" style="font-size:18px;margin-top:20px;">Videos</h2>
+    ${d.videos.map((v,i)=>`
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <span class="field-label" style="margin:0;">Video ${i+1}</span>
+          <div style="display:flex;gap:6px;">
+            <button class="btn small secondary" onclick="moveVideo(${i},-1)" ${i===0?'disabled':''}>&uarr;</button>
+            <button class="btn small secondary" onclick="moveVideo(${i},1)" ${i===d.videos.length-1?'disabled':''}>&darr;</button>
+            <button class="btn small danger" onclick="removeVideo(${i})">Delete</button>
+          </div>
+        </div>
+        <input class="field-input" id="video-title-${i}" value="${esc(v.title)}" placeholder="Video title">
+        <input class="field-input" id="video-url-${i}" value="${esc(v.url)}" placeholder="YouTube or Vimeo link">
+      </div>
+    `).join('')}
+    <button class="btn secondary" onclick="addVideo()">+ Add video</button>
+
+    <h2 class="page-title" style="font-size:18px;margin-top:20px;">Audio</h2>
+    ${d.audios.map((a,i)=>`
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <span class="field-label" style="margin:0;">Audio ${i+1}</span>
+          <div style="display:flex;gap:6px;">
+            <button class="btn small secondary" onclick="moveAudio(${i},-1)" ${i===0?'disabled':''}>&uarr;</button>
+            <button class="btn small secondary" onclick="moveAudio(${i},1)" ${i===d.audios.length-1?'disabled':''}>&darr;</button>
+            <button class="btn small danger" onclick="removeAudio(${i})">Delete</button>
+          </div>
+        </div>
+        <input class="field-input" id="audio-title-${i}" value="${esc(a.title)}" placeholder="Audio title">
+        <input class="field-input" id="audio-url-${i}" value="${esc(a.url)}" placeholder="Audio file URL (mp3)">
+      </div>
+    `).join('')}
+    <button class="btn secondary" onclick="addAudio()">+ Add audio</button>
+
+    <h2 class="page-title" style="font-size:18px;margin-top:20px;">Assignment</h2>
+    <div class="card">
+      <span class="field-label">Intro text</span>
+      <textarea class="field-input reflect" id="draft-assignment-intro" style="min-height:70px;">${esc(d.assignmentIntro)}</textarea>
+    </div>
+    ${d.tasks.map((t,i)=>`
+      <div class="card" style="display:flex;gap:10px;align-items:center;">
+        <input class="field-input" style="margin-bottom:0;flex:1;" id="task-text-${i}" value="${esc(t)}">
+        <button class="btn small secondary" onclick="moveTask(${i},-1)" ${i===0?'disabled':''}>&uarr;</button>
+        <button class="btn small secondary" onclick="moveTask(${i},1)" ${i===d.tasks.length-1?'disabled':''}>&darr;</button>
+        <button class="btn small danger" onclick="removeTask(${i})">Delete</button>
+      </div>
+    `).join('')}
+    <button class="btn secondary" onclick="addTask()">+ Add task</button>
+
+    <h2 class="page-title" style="font-size:18px;margin-top:20px;">Assessment questions</h2>
+    ${d.quiz.map((q,i)=>`
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <span class="field-label" style="margin:0;">Question ${i+1}</span>
+          <div style="display:flex;gap:6px;">
+            <button class="btn small secondary" onclick="moveQuizQuestion(${i},-1)" ${i===0?'disabled':''}>&uarr;</button>
+            <button class="btn small secondary" onclick="moveQuizQuestion(${i},1)" ${i===d.quiz.length-1?'disabled':''}>&darr;</button>
+            <button class="btn small danger" onclick="removeQuizQuestion(${i})">Delete</button>
+          </div>
+        </div>
+        <textarea class="field-input reflect" id="quiz-q-${i}" style="min-height:50px;" placeholder="Question text">${esc(q.question)}</textarea>
+        ${q.options.map((o,j)=>`
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+            <input type="radio" name="quiz-correct-${i}" value="${j}" ${q.correct===j?'checked':''} style="accent-color:var(--brand);width:18px;height:18px;flex-shrink:0;">
+            <input class="field-input" style="margin-bottom:0;flex:1;" id="quiz-opt-${i}-${j}" value="${esc(o)}" placeholder="Option ${j+1}">
+          </div>
+        `).join('')}
+        <div class="save-note">Select the radio button next to the correct answer.</div>
+      </div>
+    `).join('')}
+    <button class="btn secondary" onclick="addQuizQuestion()">+ Add question</button>
+
+    <div class="card" style="margin-top:20px;display:flex;gap:10px;flex-wrap:wrap;">
+      <button class="btn amber" onclick="saveModuleDraft()">Save &amp; Publish</button>
+      <button class="btn danger" onclick="resetModuleToDefault()">Reset to default</button>
+      <button class="btn secondary" onclick="closeModuleEditor()">Cancel</button>
+    </div>
+  `;
+}
+
 function renderVideosTab(){
   return `
     <div class="crumb">Admin dashboard</div>
