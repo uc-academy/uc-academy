@@ -837,6 +837,36 @@ const DEFAULT_THEME = {
 let currentTheme = { ...DEFAULT_THEME };
 async function getTheme(){ const v = await kvGet('theme:settings'); return v ? { ...DEFAULT_THEME, ...v, navLabels: {...(v.navLabels||{})} } : { ...DEFAULT_THEME }; }
 async function setTheme(theme){ return await kvSet('theme:settings', theme); }
+
+/* ---- DASHBOARD LAYOUT (nav order, stat cards, tracking columns) ---- */
+const OVERVIEW_CARD_KEYS = [
+  ['trainers','Trainers'], ['partners','Partners'], ['sessionsOpen','Sessions open now'],
+  ['checkinsToday','Partner check-ins today'], ['trainerLogins','Trainer logins today'], ['openSupport','Open support requests']
+];
+const TRACKING_COLUMN_KEYS = [
+  ['name','Name'], ['officeId','Office ID'], ['id','ID'], ['city','City'], ['trainer','Trainer'], ['batch','Batch'],
+  ['lastCheckin','Last check-in'], ['lastCheckout','Last check-out'], ['daysDone','Days done'],
+  ['dayScores','Day scores'], ['overall','Overall'], ['feedback','Feedback']
+];
+const DEFAULT_LAYOUT = {
+  navOrderAdmin: [], navOrderTrainer: [],
+  overviewCards: {}, trackingColumns: {}
+};
+let currentLayout = { ...DEFAULT_LAYOUT };
+async function getLayout(){
+  const v = await kvGet('layout:settings');
+  return v ? { ...DEFAULT_LAYOUT, ...v, overviewCards:{...(v.overviewCards||{})}, trackingColumns:{...(v.trackingColumns||{})} } : { ...DEFAULT_LAYOUT };
+}
+async function setLayout(layout){ return await kvSet('layout:settings', layout); }
+function isCardVisible(key){ return currentLayout.overviewCards[key] !== false; }
+function isColumnVisible(key){ return currentLayout.trackingColumns[key] !== false; }
+function applyNavOrder(tabs, order){
+  if(!order || !order.length) return tabs;
+  const byKey = Object.fromEntries(tabs.map(t=>[t[0],t]));
+  const ordered = order.filter(k=>byKey[k]).map(k=>byKey[k]);
+  const remaining = tabs.filter(t=>!order.includes(t[0]));
+  return [...ordered, ...remaining];
+}
 function hexToRgb(hex){ hex=(hex||'#5B3FA3').replace('#',''); if(hex.length===3) hex=hex.split('').map(c=>c+c).join(''); const num=parseInt(hex,16)||0; return {r:(num>>16)&255, g:(num>>8)&255, b:num&255}; }
 function rgbToHex(r,g,b){ return '#'+[r,g,b].map(x=>Math.max(0,Math.min(255,Math.round(x))).toString(16).padStart(2,'0')).join(''); }
 function mixColor(hex, target, amt){ const c=hexToRgb(hex), t=hexToRgb(target); return rgbToHex(c.r+(t.r-c.r)*amt, c.g+(t.g-c.g)*amt, c.b+(t.b-c.b)*amt); }
@@ -2028,6 +2058,8 @@ let adminIssuesCache = [];
 let adminMediaCache = [];
 let adminBatchesCache = [];
 let themeDraft = null;
+let layoutDraft = null;
+let navDragFromKey = null;
 let selectedBatchId = null;
 let mediaFilterStatus = '';
 
@@ -2037,34 +2069,32 @@ function myScopeFilter(list, cityKey, trainerKey){
   return list.filter(x => x[cityKey]===trainerIdentity.city && x[trainerKey]===trainerIdentity.name);
 }
 
+const ADMIN_TAB_KEYS_DEFAULT = [
+  ['overview','Overview','Platform activity'],
+  ['trainers','Trainers','Create & manage'],
+  ['support','Support','Requests & issues'],
+  ['history','History','Audit log'],
+  ['modules','Modules','Edit course content'],
+  ['media','Media Review','Photo & video review'],
+  ['batches','Batches','Track by batch'],
+  ['theme','Theme & Branding','Colors, logo, fonts'],
+  ['sessions','Sessions','Check-in windows'],
+  ['access','Day Access','Unlock days'],
+  ['partners','Partners','All partners'],
+  ['tracking','Tracking','Scores & attendance'],
+];
+const TRAINER_TAB_KEYS_DEFAULT = [
+  ['sessions','Sessions','Your check-in windows'],
+  ['access','Day Access','Unlock days for your batch'],
+  ['partners','Partners','Your partners'],
+  ['tracking','Tracking','Your partners\' scores'],
+  ['media','Media Review','Photo & video review'],
+  ['batches','Batches','Your batch history'],
+  ['report','Report an Issue','Get help from Admin'],
+];
 function adminTabDefs(){
-  let tabs;
-  if(isAdminRole()){
-    tabs = [
-      ['overview','Overview','Platform activity'],
-      ['trainers','Trainers','Create & manage'],
-      ['support','Support','Requests & issues'],
-      ['history','History','Audit log'],
-      ['modules','Modules','Edit course content'],
-      ['media','Media Review','Photo & video review'],
-      ['batches','Batches','Track by batch'],
-      ['theme','Theme & Branding','Colors, logo, fonts'],
-      ['sessions','Sessions','Check-in windows'],
-      ['access','Day Access','Unlock days'],
-      ['partners','Partners','All partners'],
-      ['tracking','Tracking','Scores & attendance'],
-    ];
-  } else {
-    tabs = [
-      ['sessions','Sessions','Your check-in windows'],
-      ['access','Day Access','Unlock days for your batch'],
-      ['partners','Partners','Your partners'],
-      ['tracking','Tracking','Your partners\' scores'],
-      ['media','Media Review','Photo & video review'],
-      ['batches','Batches','Your batch history'],
-      ['report','Report an Issue','Get help from Admin'],
-    ];
-  }
+  let tabs = isAdminRole() ? [...ADMIN_TAB_KEYS_DEFAULT] : [...TRAINER_TAB_KEYS_DEFAULT];
+  tabs = applyNavOrder(tabs, isAdminRole() ? currentLayout.navOrderAdmin : currentLayout.navOrderTrainer);
   return tabs.map(([key,title,sub])=>[key, navLabel(key,title), sub]);
 }
 
@@ -2168,7 +2198,7 @@ async function renderAdminMain(){
       el.innerHTML = renderBatchesListTab();
     }
   }
-  else if(adminTab==='theme'){ themeDraft = JSON.parse(JSON.stringify(currentTheme)); el.innerHTML = renderThemeTab(); }
+  else if(adminTab==='theme'){ themeDraft = JSON.parse(JSON.stringify(currentTheme)); layoutDraft = JSON.parse(JSON.stringify(currentLayout)); el.innerHTML = renderThemeTab(); }
 }
 
 /* ---- OVERVIEW (admin only) ---- */
@@ -2191,12 +2221,12 @@ async function renderOverviewTabAsync(){
     <p class="page-sub">A live snapshot of everyone using the Academy right now.</p>
     ${openIssues>0?`<div class="today-banner"><b>${openIssues} open support request${openIssues===1?'':'s'}</b> — <a onclick="setAdminTab('support')" style="cursor:pointer;">review in Support &rarr;</a></div>`:''}
     <div class="stat-mini-grid">
-      <div class="stat-card"><div class="n">${Object.keys(trainers).length}</div><div class="l">Trainers</div></div>
-      <div class="stat-card"><div class="n">${Object.keys(roster).length}</div><div class="l">Partners</div></div>
-      <div class="stat-card"><div class="n">${activeSessions.length}</div><div class="l">Sessions open now</div></div>
-      <div class="stat-card"><div class="n">${allCheckins.length}</div><div class="l">Partner check-ins today</div></div>
-      <div class="stat-card"><div class="n">${trainerLoginsToday}</div><div class="l">Trainer logins today</div></div>
-      <div class="stat-card"><div class="n">${openIssues}</div><div class="l">Open support requests</div></div>
+      ${isCardVisible('trainers')?`<div class="stat-card"><div class="n">${Object.keys(trainers).length}</div><div class="l">Trainers</div></div>`:''}
+      ${isCardVisible('partners')?`<div class="stat-card"><div class="n">${Object.keys(roster).length}</div><div class="l">Partners</div></div>`:''}
+      ${isCardVisible('sessionsOpen')?`<div class="stat-card"><div class="n">${activeSessions.length}</div><div class="l">Sessions open now</div></div>`:''}
+      ${isCardVisible('checkinsToday')?`<div class="stat-card"><div class="n">${allCheckins.length}</div><div class="l">Partner check-ins today</div></div>`:''}
+      ${isCardVisible('trainerLogins')?`<div class="stat-card"><div class="n">${trainerLoginsToday}</div><div class="l">Trainer logins today</div></div>`:''}
+      ${isCardVisible('openSupport')?`<div class="stat-card"><div class="n">${openIssues}</div><div class="l">Open support requests</div></div>`:''}
     </div>
     <div class="card">
       <h3>Cities with active trainers</h3>
@@ -2430,11 +2460,70 @@ function renderThemeTab(){
       `).join('')}
     </div>
 
+    <div class="card">
+      <h3>Sidebar order</h3>
+      <p style="margin-bottom:10px;">Drag any row to reorder it. Applies to everyone once published.</p>
+      <span class="field-label">Admin sidebar</span>
+      <div id="nav-order-admin">${renderNavOrderList('admin', layoutDraft.navOrderAdmin.length ? layoutDraft.navOrderAdmin : ADMIN_TAB_KEYS_DEFAULT.map(t=>t[0]), ADMIN_TAB_KEYS_DEFAULT)}</div>
+      <span class="field-label" style="margin-top:16px;">Trainer sidebar</span>
+      <div id="nav-order-trainer">${renderNavOrderList('trainer', layoutDraft.navOrderTrainer.length ? layoutDraft.navOrderTrainer : TRAINER_TAB_KEYS_DEFAULT.map(t=>t[0]), TRAINER_TAB_KEYS_DEFAULT)}</div>
+    </div>
+
+    <div class="card">
+      <h3>Overview stat cards</h3>
+      <p style="margin-bottom:10px;">Turn off any card you don't need on the Admin Overview page.</p>
+      ${OVERVIEW_CARD_KEYS.map(([key,label])=>`
+        <label style="display:flex;gap:10px;align-items:center;margin-bottom:8px;cursor:pointer;">
+          <input type="checkbox" ${layoutDraft.overviewCards[key]!==false?'checked':''} onchange="toggleLayoutVisibility('overviewCards','${key}',this.checked)" style="width:18px;height:18px;accent-color:var(--brand);">
+          <span>${esc(label)}</span>
+        </label>
+      `).join('')}
+    </div>
+
+    <div class="card">
+      <h3>Tracking columns</h3>
+      <p style="margin-bottom:10px;">Turn off any column you don't need on the Tracking page. "Name" always shows.</p>
+      ${TRACKING_COLUMN_KEYS.filter(([k])=>k!=='name').map(([key,label])=>`
+        <label style="display:flex;gap:10px;align-items:center;margin-bottom:8px;cursor:pointer;">
+          <input type="checkbox" ${layoutDraft.trackingColumns[key]!==false?'checked':''} onchange="toggleLayoutVisibility('trackingColumns','${key}',this.checked)" style="width:18px;height:18px;accent-color:var(--brand);">
+          <span>${esc(label)}</span>
+        </label>
+      `).join('')}
+    </div>
+
     <div class="card" style="display:flex;gap:10px;flex-wrap:wrap;">
       <button class="btn amber" onclick="saveThemeDraft()">Save &amp; Publish</button>
       <button class="btn danger" onclick="resetThemeToDefault()">Reset to default</button>
     </div>
   `;
+}
+function renderNavOrderList(role, orderKeys, defaultDefs){
+  const byKey = Object.fromEntries(defaultDefs.map(t=>[t[0],t]));
+  const items = orderKeys.filter(k=>byKey[k]);
+  defaultDefs.forEach(t=>{ if(!items.includes(t[0])) items.push(t[0]); });
+  return items.map((key,i)=>`
+    <div class="card" draggable="true" ondragstart="navDragFromKey='${key}'" ondragover="event.preventDefault()" ondrop="onNavDrop('${role}','${key}')" style="cursor:grab;padding:10px 14px;margin-bottom:6px;display:flex;align-items:center;justify-content:space-between;">
+      <span>${esc(byKey[key][1])}</span>
+      <span style="color:var(--ink-soft);font-size:11px;">&#8942;&#8942; drag</span>
+    </div>
+  `).join('');
+}
+function onNavDrop(role, targetKey){
+  if(!navDragFromKey || navDragFromKey===targetKey) return;
+  const field = role==='admin' ? 'navOrderAdmin' : 'navOrderTrainer';
+  const defaultDefs = role==='admin' ? ADMIN_TAB_KEYS_DEFAULT : TRAINER_TAB_KEYS_DEFAULT;
+  let order = layoutDraft[field].length ? [...layoutDraft[field]] : defaultDefs.map(t=>t[0]);
+  const fromIdx = order.indexOf(navDragFromKey);
+  const toIdx = order.indexOf(targetKey);
+  if(fromIdx===-1 || toIdx===-1) return;
+  order.splice(fromIdx,1);
+  order.splice(toIdx,0,navDragFromKey);
+  layoutDraft[field] = order;
+  navDragFromKey = null;
+  document.getElementById('nav-order-'+role).innerHTML = renderNavOrderList(role, order, defaultDefs);
+}
+function toggleLayoutVisibility(section, key, checked){
+  layoutDraft[section][key] = checked;
 }
 function syncBrandColorHex(){
   const hex = document.getElementById('theme-brand-color-hex').value.trim();
@@ -2470,15 +2559,19 @@ function syncThemeDraftFromDOM(){
 async function saveThemeDraft(){
   syncThemeDraftFromDOM();
   const ok = await setTheme(themeDraft);
-  if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
-  await logHistory('theme_updated', `Theme & branding updated by ${trainerIdentity.name}`, {});
+  const layoutOk = await setLayout(layoutDraft);
+  if(!ok || !layoutOk){ showToast("Couldn't save — check your connection.", 'error'); return; }
+  await logHistory('theme_updated', `Theme, branding, and dashboard layout updated by ${trainerIdentity.name}`, {});
   await applyTheme();
+  currentLayout = layoutDraft;
   showToast('Saved and published.', 'success');
   renderAdmin();
 }
 async function resetThemeToDefault(){
-  showConfirmModal('Reset all branding to default? Your customizations will be removed for everyone.', async ()=>{
+  showConfirmModal('Reset all branding and dashboard layout to default? Your customizations will be removed for everyone.', async ()=>{
     await setTheme({ ...DEFAULT_THEME });
+    await setLayout({ ...DEFAULT_LAYOUT });
+    currentLayout = { ...DEFAULT_LAYOUT };
     await logHistory('theme_reset', `Theme & branding reset to default by ${trainerIdentity.name}`, {});
     await applyTheme();
     showToast('Reset to default.', 'success');
@@ -3005,18 +3098,32 @@ function renderTrackingTableInner(cityFilter, trainerFilter){
       ? `Batch ${batch.batchNumber}${batch.status==='Active' ? `<br><button class="btn small secondary" style="margin-top:4px;" onclick="markBatchCompleteNow('${batch.id}')">Mark Batch Complete</button>` : ` <span class="pill scheduled" style="font-size:10px;">Completed</span>`}`
       : '<span style="color:var(--ink-soft);">—</span>';
     return `<tr>
-      <td>${esc(r.name)}</td><td>${esc(r.officeId||'—')}</td><td class="mono">${esc(id)}</td><td>${esc(r.city)}</td><td>${esc(r.trainer)}</td>
-      <td style="white-space:normal;">${batchCell}</td>
-      <td>${last?fmtDate(last.date)+' '+last.checkinTime:'<span style="color:var(--ink-soft);">Never</span>'}</td>
-      <td>${last&&last.checkoutTime?fmtDate(last.date)+' '+last.checkoutTime:'<span style="color:var(--ink-soft);">—</span>'}</td>
-      <td><b class="mono">${done}/${DAYS.length}</b></td>
-      <td style="white-space:normal;font-size:11px;">${dayCells}</td>
-      <td>${overallText}</td>
-      <td style="white-space:normal;font-size:11.5px;max-width:260px;">${feedbackCell}</td>
+      <td>${esc(r.name)}</td>${isColumnVisible('officeId')?`<td>${esc(r.officeId||'—')}</td>`:''}${isColumnVisible('id')?`<td class="mono">${esc(id)}</td>`:''}${isColumnVisible('city')?`<td>${esc(r.city)}</td>`:''}${isColumnVisible('trainer')?`<td>${esc(r.trainer)}</td>`:''}
+      ${isColumnVisible('batch')?`<td style="white-space:normal;">${batchCell}</td>`:''}
+      ${isColumnVisible('lastCheckin')?`<td>${last?fmtDate(last.date)+' '+last.checkinTime:'<span style="color:var(--ink-soft);">Never</span>'}</td>`:''}
+      ${isColumnVisible('lastCheckout')?`<td>${last&&last.checkoutTime?fmtDate(last.date)+' '+last.checkoutTime:'<span style="color:var(--ink-soft);">—</span>'}</td>`:''}
+      ${isColumnVisible('daysDone')?`<td><b class="mono">${done}/${DAYS.length}</b></td>`:''}
+      ${isColumnVisible('dayScores')?`<td style="white-space:normal;font-size:11px;">${dayCells}</td>`:''}
+      ${isColumnVisible('overall')?`<td>${overallText}</td>`:''}
+      ${isColumnVisible('feedback')?`<td style="white-space:normal;font-size:11.5px;max-width:260px;">${feedbackCell}</td>`:''}
     </tr>`;
   }).join('');
+  const headerCells = [
+    '<th>Name</th>',
+    isColumnVisible('officeId')?'<th>Office ID</th>':'',
+    isColumnVisible('id')?'<th>ID</th>':'',
+    isColumnVisible('city')?'<th>City</th>':'',
+    isColumnVisible('trainer')?'<th>Trainer</th>':'',
+    isColumnVisible('batch')?'<th>Batch</th>':'',
+    isColumnVisible('lastCheckin')?'<th>Last check-in</th>':'',
+    isColumnVisible('lastCheckout')?'<th>Last check-out</th>':'',
+    isColumnVisible('daysDone')?'<th>Days done</th>':'',
+    isColumnVisible('dayScores')?'<th>Day scores</th>':'',
+    isColumnVisible('overall')?'<th>Overall</th>':'',
+    isColumnVisible('feedback')?'<th>Feedback</th>':'',
+  ].join('');
   return `<div class="card" style="overflow-x:auto;"><table class="data-table">
-    <tr><th>Name</th><th>Office ID</th><th>ID</th><th>City</th><th>Trainer</th><th>Batch</th><th>Last check-in</th><th>Last check-out</th><th>Days done</th><th>Day scores</th><th>Overall</th><th>Feedback</th></tr>
+    <tr>${headerCells}</tr>
     ${rows}
   </table></div>`;
 }
@@ -3599,6 +3706,7 @@ function maybeShowIOSInstallHint(){
   maybeShowIOSInstallHint();
   await checkStorageAvailability();
   await applyTheme();
+  currentLayout = await getLayout();
   const restored = await tryRestoreSession();
   if(!restored) renderGate();
 })();
