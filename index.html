@@ -58,7 +58,24 @@
         const snap = await getDocs(qq);
         return snap.docs.map(d => d.id);
       };
-      console.log('Firebase ready.');
+      console.log('Firestore ready.');
+
+      try {
+        const { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } =
+          await import("https://www.gstatic.com/firebasejs/10.7.1/firebase-storage.js");
+        const storage = getStorage(app);
+        window.__fbUploadFile = async (path, file) => {
+          const r = ref(storage, path);
+          await uploadBytes(r, file);
+          return await getDownloadURL(r);
+        };
+        window.__fbDeleteFile = async (path) => {
+          try{ await deleteObject(ref(storage, path)); }catch(e){}
+        };
+        console.log('Storage ready.');
+      } catch (storageErr) {
+        console.error('Storage initialization failed (uploads will be unavailable, but the rest of the app is unaffected):', storageErr);
+      }
     } catch (e) {
       console.error('Firebase initialization failed:', e);
     } finally {
@@ -257,6 +274,7 @@
   .pill.open{ background:var(--success-bg); color:var(--success); }
   .pill.closed{ background:var(--danger-bg); color:var(--danger); }
   .pill.scheduled{ background:var(--brand-light); color:var(--brand); }
+  .pill.warn{ background:#FCEFDA; color:#8A5A12; }
   .pill.type{ background:var(--brand-light); color:var(--brand-dark); text-transform:capitalize; }
   .empty-state{ text-align:center; padding:36px 20px; color:var(--ink-soft); font-size:13px; }
   .filter-row{ display:flex; gap:9px; margin-bottom:15px; flex-wrap:wrap; align-items:center; }
@@ -314,6 +332,9 @@ const CITIES = ["Noida","Delhi","Mumbai","Kolkata","Chennai","Hyderabad","Bangal
 const ADMIN_PASSWORD = "UCA-SADIQ-5055";
 const ISSUE_TYPES = ["Forgot Password","Login Issue","Partner Portal Access","Trainer Account Issue","Module Access Issue","Other"];
 const ISSUE_STATUSES = ["Open","In Progress","Resolved","Rejected"];
+const MEDIA_STATUSES = ["Pending","Pass","Fail","ResubmissionRequired"];
+const MEDIA_STATUS_LABEL = { Pending:"Pending Review", Pass:"Pass", Fail:"Fail", ResubmissionRequired:"Resubmission Required" };
+const DEFAULT_MAX_SCORE = 5;
 const ADMIN_CONTACT_EMAIL = "sadiqsaifi@urbancompany.com";
 const ADMIN_CONTACT_PHONE = "9870843247";
 const PASS_THRESHOLD = 70;
@@ -579,6 +600,12 @@ async function kvGet(key){ try{ await window.__fbReady; return await window.__fb
 async function kvSet(key, val){ try{ await window.__fbReady; return await window.__fbSet(key, val); }catch(e){ return false; } }
 async function kvDelete(key){ try{ await window.__fbReady; await window.__fbDelete(key); }catch(e){} }
 async function kvList(prefix){ try{ await window.__fbReady; return await window.__fbList(prefix); }catch(e){ return []; } }
+async function uploadFile(path, file){
+  try{ await window.__fbReady; if(typeof window.__fbUploadFile!=='function') return null; return await window.__fbUploadFile(path, file); }catch(e){ return null; }
+}
+async function deleteUploadedFile(path){
+  try{ await window.__fbReady; if(typeof window.__fbDeleteFile==='function') await window.__fbDeleteFile(path); }catch(e){}
+}
 
 let storageAvailable = null;
 async function checkStorageAvailability(){
@@ -631,6 +658,99 @@ async function updateIssue(id, patch){
   await kvSet('issue:'+id, updated);
   return updated;
 }
+
+/* ---- MEDIA REVIEW ---- */
+async function createMediaRecord(data){
+  const id = String(Date.now()).padStart(14,'0')+'_'+uid();
+  const record = { id, status:'Pending', score:null, maxScore:DEFAULT_MAX_SCORE, remarks:'', reviewedBy:'', reviewedAt:'', everFailed:false, resubmissionOf:null, attemptNumber:1, uploadedAt:new Date().toISOString(), ...data };
+  const ok = await kvSet('media:'+id, record);
+  return ok ? record : null;
+}
+async function getMediaRecord(id){ return await kvGet('media:'+id); }
+async function updateMediaRecord(id, patch){
+  const cur = await kvGet('media:'+id);
+  if(!cur) return null;
+  const updated = { ...cur, ...patch };
+  const ok = await kvSet('media:'+id, updated);
+  return ok ? updated : null;
+}
+async function listMediaForPartner(partnerId){
+  const keys = await kvList('media:');
+  const out = [];
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v && v.partnerId===partnerId) out.push(v); }));
+  return out.sort((a,b)=>b.uploadedAt.localeCompare(a.uploadedAt));
+}
+async function listAllMedia(){
+  const keys = await kvList('media:');
+  const out = [];
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out.push(v); }));
+  return out.sort((a,b)=>b.uploadedAt.localeCompare(a.uploadedAt));
+}
+async function logMediaAudit(entry){
+  const id = String(Date.now()).padStart(14,'0')+'_'+uid();
+  await kvSet('mediaAudit:'+id, { id, at:new Date().toISOString(), ...entry });
+}
+function computeActiveFailedMedia(mediaList){
+  return mediaList.filter(m => {
+    if(m.status !== 'Fail') return false;
+    const supersededByPassingResubmission = mediaList.some(other => other.resubmissionOf === m.id && other.status === 'Pass');
+    return !supersededByPassingResubmission;
+  }).length;
+}
+function computeLiveAuditCount(mediaList){ return mediaList.filter(m=>m.everFailed).length; }
+
+/* ---- BATCH MANAGEMENT ---- */
+function addDays(dateStr, n){
+  const d = new Date(dateStr+'T00:00:00');
+  d.setDate(d.getDate()+n);
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
+async function createBatch(data){
+  const id = String(Date.now()).padStart(14,'0')+'_'+uid();
+  const record = { id, endDate:null, createdAt:new Date().toISOString(), ...data };
+  const ok = await kvSet('batch:'+id, record);
+  return ok ? record : null;
+}
+async function updateBatch(id, patch){
+  const cur = await kvGet('batch:'+id);
+  if(!cur) return null;
+  const updated = { ...cur, ...patch };
+  const ok = await kvSet('batch:'+id, updated);
+  return ok ? updated : null;
+}
+async function listBatchesForTrainer(trainerId){
+  const keys = await kvList('batch:');
+  const out = [];
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v && v.trainerId===trainerId) out.push(v); }));
+  return out.sort((a,b)=>a.batchNumber-b.batchNumber);
+}
+async function listAllBatches(){
+  const keys = await kvList('batch:');
+  const out = [];
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out.push(v); }));
+  return out.sort((a,b)=>b.startDate.localeCompare(a.startDate));
+}
+async function getOrCreateActiveBatch(trainerId, trainerName, city){
+  const batches = await listBatchesForTrainer(trainerId);
+  let active = batches.find(b=>b.status==='Active');
+  const today = todayStr();
+  if(active){
+    const endBy = addDays(active.startDate, 7);
+    if(today > endBy){
+      await updateBatch(active.id, { status:'Completed', endDate: endBy });
+      await logHistory('batch_completed', `Batch ${active.batchNumber} for ${trainerName} (${city}) auto-completed`, {batchId:active.id, trainerId});
+      active = null;
+    }
+  }
+  if(!active){
+    const batchNumber = batches.length + 1;
+    active = await createBatch({ batchNumber, trainerId, trainerName, city, startDate: today, status:'Active' });
+    if(active) await logHistory('batch_started', `Batch ${batchNumber} started for ${trainerName} (${city})`, {batchId:active.id, trainerId});
+  }
+  return active;
+}
+
+
 
 async function getRosterEntry(id){ return await kvGet('roster:'+id); }
 async function setRosterEntry(id, data){ return await kvSet('roster:'+id, data); }
@@ -896,6 +1016,8 @@ async function loginAsPartner(id, opts){
     const ov = await getContentOverride(d.id);
     if(ov) contentOverrides[d.id] = migrateOldOverrideToUnified(ov);
   }));
+  const homeOv = await getContentOverride('home');
+  if(homeOv) contentOverrides['home'] = migrateOldOverrideToUnified(homeOv);
   await logCheckin(s);
   if(!opts.silent) await logHistory('partner_login', `${r.name} (${id}) checked in for Day ${s.day}`, {partnerId:id, city:r.city, trainer:r.trainer, day:s.day});
   saveSession({ role:'partner', partnerId:id });
@@ -1111,6 +1233,7 @@ function goTo(dayId, tab){
   closeSidebar();
   renderApp(); window.scrollTo(0,0);
 }
+let myMediaCache = {};
 function setTab(tab){
   const day = DAYS.find(d=>d.id===currentDay);
   ensureDay(day.id);
@@ -1119,6 +1242,12 @@ function setTab(tab){
   if((tab==='assignment'||tab==='quiz') && !dp.videoDone){ showToast('Watch at least 90% of the video first.', 'error'); return; }
   cleanupPlayer();
   currentTab = tab; renderMainOnly();
+  if(tab==='assignment') loadMyMedia(day.id);
+}
+async function loadMyMedia(dayId){
+  const all = await listMediaForPartner(currentUser.id);
+  myMediaCache[dayId] = all.filter(m=>m.dayId===dayId);
+  if(currentTab==='assignment' && currentDay===dayId) renderMainOnly();
 }
 function renderMainOnly(){ document.getElementById('main').innerHTML = renderCurrentPage(); if(currentDay>0 && currentDay<99 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay)); }
 function renderMain(){ document.getElementById('main').innerHTML = renderCurrentPage(); if(currentDay>0 && currentDay<99 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay)); }
@@ -1128,8 +1257,31 @@ function renderCurrentPage(){
   return renderDayShell(DAYS.find(d=>d.id===currentDay));
 }
 
+function renderHomeContentItem(item){
+  if(item.type==='theory') return `<div class="card"><h3>${esc(item.heading)}</h3><p style="white-space:pre-wrap;">${esc(item.body)}</p></div>`;
+  if(item.type==='text') return `<div class="card"><p style="white-space:pre-wrap;">${esc(item.body)}</p></div>`;
+  if(item.type==='video'){
+    const n = normalizeUrl(item.url);
+    const inner = n.embedUrl ? `<iframe src="${esc(n.embedUrl)}" allowfullscreen></iframe>` : `<div class="video-placeholder">${item.url?'Video link not recognised.':'No video linked yet.'}</div>`;
+    return `<div class="card"><h3>${esc(item.title||'Video')}</h3><div class="video-frame">${inner}</div></div>`;
+  }
+  if(item.type==='audio') return `<div class="card"><h3>${esc(item.title||'Audio')}</h3><audio controls><source src="${esc(item.url)}"></audio></div>`;
+  if(item.type==='photo') return `<div class="card"><h3>${esc(item.title||'Photo')}</h3>${item.url?`<img src="${esc(item.url)}" style="max-width:100%;border-radius:8px;">`:'<div class="video-placeholder">No image linked yet.</div>'}${item.caption?`<p style="margin-top:8px;color:var(--ink-soft);font-size:12.5px;">${esc(item.caption)}</p>`:''}</div>`;
+  if(item.type==='banner') return `<div class="card" style="text-align:center;background:linear-gradient(135deg,var(--brand-light),#fff);">${item.imageUrl?`<img src="${esc(item.imageUrl)}" style="max-width:100%;border-radius:8px;margin-bottom:10px;">`:''}<h2 style="margin:0 0 6px;">${esc(item.headline)}</h2>${item.subtext?`<p style="color:var(--ink-soft);margin:0;">${esc(item.subtext)}</p>`:''}</div>`;
+  if(item.type==='button') return `<div class="card" style="text-align:center;"><a class="btn amber" href="${esc(item.action||'#')}" target="_blank" rel="noopener" style="text-decoration:none;display:inline-block;">${esc(item.label||'Button')}</a></div>`;
+  return '';
+}
 function renderHome(){
   const s = overallStats();
+  const ov = contentOverrides['home'];
+  if(ov){
+    let html = `<div class="crumb">Welcome, ${esc(currentUser.name)}</div><h1 class="page-title">${esc(ov.title||COURSE_NAME)}</h1>${ov.sub?`<p class="page-sub">${esc(ov.sub)}</p>`:''}`;
+    html += `<div class="today-banner"><b>Class today:</b> Day ${currentUser.day} &middot; ${esc(currentUser.city)} &middot; Trainer ${esc(currentUser.trainer)} &middot; Check-in window ${esc(currentUser.open)}&ndash;${esc(currentUser.close)}</div>`;
+    html += `<div class="home-grid"><div class="stat-card"><div class="n">${s.done}/${s.total}</div><div class="l">Days complete</div></div><div class="stat-card"><div class="n">${s.pct}%</div><div class="l">Course progress</div></div><div class="stat-card"><div class="n">${currentUserUnlockedDays.length}</div><div class="l">Days unlocked</div></div></div>`;
+    (ov.content||[]).forEach(item=>{ html += renderHomeContentItem(item); });
+    html += currentUserUnlockedDays.length ? `<button class="btn amber" onclick="goTo(${Math.max(...currentUserUnlockedDays)},'theory')">Go to Day ${Math.max(...currentUserUnlockedDays)} &rarr;</button>` : `<div class="lock-banner">No days are unlocked yet. Your trainer will unlock Day 1 to begin class.</div>`;
+    return html;
+  }
   return `
     <div class="crumb">Welcome, ${esc(currentUser.name)}</div>
     <h1 class="page-title">${esc(COURSE_NAME)}</h1>
@@ -1392,16 +1544,73 @@ function renderAssignment(day){
   const tasks = getEffectiveTasks(day.id);
   const intro = getEffectiveAssignmentIntro(day.id);
   while(dp.tasksChecked.length < tasks.length) dp.tasksChecked.push(false);
+  const myMedia = myMediaCache[day.id] || [];
   return `
     <div class="card"><h3>Hands-on assignment</h3><p>${esc(intro)}</p>
       ${tasks.map((t,i)=>`<div class="task-row"><input type="checkbox" id="task-${i}" ${dp.tasksChecked[i]?'checked':''} onchange="toggleTask(${day.id},${i})"><label for="task-${i}">${esc(t)}</label></div>`).join('')}
       <div class="save-note">${dp.tasksChecked.filter(Boolean).length} of ${tasks.length} tasks checked off &middot; saved automatically</div>
+    </div>
+    <div class="card"><h3>Photo & video upload</h3><p style="margin-bottom:10px;">Upload photos or videos of your practical work for your trainer to review.</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <label class="btn secondary small" style="cursor:pointer;">+ Upload photo<input type="file" accept="image/*" style="display:none;" onchange="handleMediaUpload(event, ${day.id}, 'photo')"></label>
+        <label class="btn secondary small" style="cursor:pointer;">+ Upload video<input type="file" accept="video/*" style="display:none;" onchange="handleMediaUpload(event, ${day.id}, 'video')"></label>
+      </div>
+      ${myMedia.length>0 ? `<div style="margin-top:14px;">${myMedia.map(m=>renderMyMediaRow(m)).join('')}</div>` : `<p class="save-note" style="margin-top:10px;">No uploads yet for this day.</p>`}
     </div>
     <div class="card"><h3>Notes</h3><p style="margin-bottom:8px;">Optional — jot down anything worth remembering from today's practical.</p>
       <textarea class="reflect" id="reflect-box" placeholder="e.g. Struggled with brake arm alignment, need more practice.">${dp.reflection||''}</textarea>
       <div style="margin-top:10px;"><button class="btn secondary" onclick="saveReflection(${day.id})">Save note</button></div>
     </div>
   `;
+}
+function mediaStatusPillClass(status){ return {Pending:'scheduled', Pass:'open', Fail:'closed', ResubmissionRequired:'warn'}[status] || 'scheduled'; }
+function renderMyMediaRow(m){
+  return `
+    <div style="border-bottom:1px solid var(--line);padding:10px 0;">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">
+        <span style="font-size:13px;">${m.type==='photo'?'Photo':'Video'} &middot; ${fmtDateTime(m.uploadedAt)}${m.attemptNumber>1?` &middot; Attempt ${m.attemptNumber}`:''}</span>
+        <span class="pill ${mediaStatusPillClass(m.status)}">${MEDIA_STATUS_LABEL[m.status]}</span>
+      </div>
+      ${m.score!==null && m.score!==undefined ? `<div style="font-size:12.5px;margin-top:4px;">Score: <b>${m.score}/${m.maxScore}</b></div>` : ''}
+      ${m.remarks ? `<div style="font-size:12.5px;color:var(--ink-soft);margin-top:2px;">&ldquo;${esc(m.remarks)}&rdquo;</div>` : ''}
+      ${m.status==='ResubmissionRequired' ? `<label class="btn amber small" style="margin-top:8px;display:inline-block;cursor:pointer;">Upload replacement<input type="file" accept="${m.type==='photo'?'image/*':'video/*'}" style="display:none;" onchange="handleResubmission(event,'${m.id}')"></label>` : ''}
+    </div>
+  `;
+}
+async function handleMediaUpload(event, dayId, type){
+  const file = event.target.files[0];
+  if(!file) return;
+  showToast('Uploading...', 'info');
+  const path = `media/${currentUser.id}/${dayId}/${Date.now()}_${file.name}`;
+  const url = await uploadFile(path, file);
+  if(!url){ showToast("Upload failed — check your connection.", 'error'); return; }
+  const record = await createMediaRecord({
+    partnerId: currentUser.id, partnerName: currentUser.name, trainerName: currentUser.trainer, city: currentUser.city,
+    dayId, activityLabel: `Day ${dayId} practical`, type, storagePath: path, url
+  });
+  if(!record){ showToast("Couldn't save the upload record.", 'error'); return; }
+  await logMediaAudit({ mediaId: record.id, partnerId: currentUser.id, action:'uploaded', previousStatus:null, newStatus:'Pending', by: currentUser.name, byRole:'Partner', remark:'' });
+  showToast('Uploaded — waiting for trainer review.', 'success');
+  await loadMyMedia(dayId);
+}
+async function handleResubmission(event, originalId){
+  const file = event.target.files[0];
+  if(!file) return;
+  const original = await getMediaRecord(originalId);
+  if(!original) return;
+  showToast('Uploading replacement...', 'info');
+  const path = `media/${currentUser.id}/${original.dayId}/${Date.now()}_${file.name}`;
+  const url = await uploadFile(path, file);
+  if(!url){ showToast("Upload failed — check your connection.", 'error'); return; }
+  const record = await createMediaRecord({
+    partnerId: currentUser.id, partnerName: currentUser.name, trainerName: currentUser.trainer, city: currentUser.city,
+    dayId: original.dayId, activityLabel: original.activityLabel, type: original.type, storagePath: path, url,
+    resubmissionOf: originalId, attemptNumber: (original.attemptNumber||1)+1
+  });
+  if(!record){ showToast("Couldn't save the upload record.", 'error'); return; }
+  await logMediaAudit({ mediaId: record.id, partnerId: currentUser.id, action:'resubmission_uploaded', previousStatus:null, newStatus:'Pending', by: currentUser.name, byRole:'Partner', remark:`Replacement for ${originalId}` });
+  showToast('Replacement uploaded — waiting for review.', 'success');
+  await loadMyMedia(original.dayId);
 }
 async function toggleTask(dayId, idx){
   const cb = document.getElementById('task-'+idx);
@@ -1506,6 +1715,10 @@ let adminProgressCache = {}; let adminCheckinsCache = {}; let adminHistoryCache 
 let lastPartnerCredential = null;
 let lastTrainerCredential = null;
 let adminIssuesCache = [];
+let adminMediaCache = [];
+let adminBatchesCache = [];
+let selectedBatchId = null;
+let mediaFilterStatus = '';
 
 function isAdminRole(){ return trainerIdentity && trainerIdentity.isAdmin; }
 function myScopeFilter(list, cityKey, trainerKey){
@@ -1521,6 +1734,8 @@ function adminTabDefs(){
       ['support','Support','Requests & issues'],
       ['history','History','Audit log'],
       ['modules','Modules','Edit course content'],
+      ['media','Media Review','Photo & video review'],
+      ['batches','Batches','Track by batch'],
       ['sessions','Sessions','Check-in windows'],
       ['access','Day Access','Unlock days'],
       ['partners','Partners','All partners'],
@@ -1533,6 +1748,8 @@ function adminTabDefs(){
     ['access','Day Access','Unlock days for your batch'],
     ['partners','Partners','Your partners'],
     ['tracking','Tracking','Your partners\' scores'],
+    ['media','Media Review','Photo & video review'],
+    ['batches','Batches','Your batch history'],
     ['report','Report an Issue','Get help from Admin'],
   ];
 }
@@ -1584,6 +1801,7 @@ function closeSidebar(){ const sb=document.getElementById('sidebar'); if(sb) sb.
 function setAdminTab(t){
   if(t!=='partners') lastPartnerCredential=null;
   if(t!=='trainers') lastTrainerCredential=null;
+  if(t!=='batches') selectedBatchId=null;
   adminTab=t;
   closeSidebar();
   renderAdminSidebar();
@@ -1607,10 +1825,26 @@ async function renderAdminMain(){
     else{
       adminModuleStatus = {};
       await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id); adminModuleStatus[d.id] = !!ov; adminModuleOverrideCache[d.id] = ov; }));
+      const homeOv = await getContentOverride('home');
+      adminModuleStatus['home'] = !!homeOv;
+      adminModuleOverrideCache['home'] = homeOv;
       el.innerHTML = renderModulesListTab();
     }
   }
   else if(adminTab==='tracking'){ await loadTrackingData(); el.innerHTML = renderTrackingTab(); }
+  else if(adminTab==='media'){
+    const all = await listAllMedia();
+    adminMediaCache = isAdminRole() ? all : all.filter(m=>m.trainerName===trainerIdentity.name);
+    el.innerHTML = renderMediaReviewTab();
+  }
+  else if(adminTab==='batches'){
+    if(selectedBatchId){ el.innerHTML = await renderBatchDetailAsync(); }
+    else{
+      const all = await listAllBatches();
+      adminBatchesCache = isAdminRole() ? all : all.filter(b=>b.trainerId===trainerIdentity.trainerId);
+      el.innerHTML = renderBatchesListTab();
+    }
+  }
   else if(adminTab==='videos'){ videosCache={}; audiosCache={}; await Promise.all(DAYS.map(async d=>{ videosCache[d.id]=await getVideoUrl(d.id); audiosCache[d.id]=await getAudioUrl(d.id); })); el.innerHTML = renderVideosTab(); }
 }
 
@@ -1747,6 +1981,169 @@ function renderHistoryTableInner(typeFilter){
 }
 
 /* ---- SUPPORT / ISSUES (admin only) ---- */
+/* ---- MEDIA REVIEW ---- */
+function renderMediaReviewTab(){
+  const filtered = mediaFilterStatus ? adminMediaCache.filter(m=>m.status===mediaFilterStatus) : adminMediaCache;
+  const pending = filtered.filter(m=>m.status==='Pending');
+  const others = filtered.filter(m=>m.status!=='Pending');
+  return `
+    <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'}</div>
+    <h1 class="page-title">Media Review</h1>
+    <p class="page-sub">Review every photo and video your partners upload — give a score, mark Pass/Fail, or ask for a resubmission.</p>
+    <div class="stat-mini-grid">
+      <div class="stat-card"><div class="n">${adminMediaCache.length}</div><div class="l">Total uploads</div></div>
+      <div class="stat-card"><div class="n">${adminMediaCache.filter(m=>m.status==='Pending').length}</div><div class="l">Pending review</div></div>
+      <div class="stat-card"><div class="n">${adminMediaCache.filter(m=>m.status==='Pass').length}</div><div class="l">Passed</div></div>
+      <div class="stat-card"><div class="n">${adminMediaCache.filter(m=>m.status==='Fail').length}</div><div class="l">Failed</div></div>
+    </div>
+    <div class="filter-row">
+      <select id="media-status-filter" onchange="mediaFilterStatus=this.value; renderAdminMain();">
+        <option value="">All statuses</option>
+        ${MEDIA_STATUSES.map(s=>`<option value="${s}" ${mediaFilterStatus===s?'selected':''}>${MEDIA_STATUS_LABEL[s]}</option>`).join('')}
+      </select>
+      <button class="btn secondary small" onclick="renderAdminMain()">Refresh</button>
+    </div>
+    ${filtered.length===0?`<div class="card"><div class="empty-state">No uploads match this filter.</div></div>`:''}
+    ${pending.length>0?`<h2 class="page-title" style="font-size:18px;">Pending review &middot; ${pending.length}</h2>${pending.map(m=>renderMediaReviewCard(m)).join('')}`:''}
+    ${others.length>0?`<h2 class="page-title" style="font-size:18px;margin-top:22px;">${mediaFilterStatus?'Filtered':'Already reviewed'}</h2>${others.map(m=>renderMediaReviewCard(m)).join('')}`:''}
+  `;
+}
+function renderMediaReviewCard(m){
+  return `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
+        <div><b>${esc(m.partnerName)}</b> &middot; Day ${m.dayId} &middot; ${m.type==='photo'?'Photo':'Video'}${m.attemptNumber>1?` &middot; Attempt ${m.attemptNumber}`:''}${!isAdminRole()?'':` &middot; ${esc(m.trainerName||'')}`}</div>
+        <span class="pill ${mediaStatusPillClass(m.status)}">${MEDIA_STATUS_LABEL[m.status]}</span>
+      </div>
+      <div style="margin-bottom:10px;">
+        ${m.type==='photo'
+          ? `<img src="${esc(m.url)}" style="max-width:100%;max-height:360px;border-radius:8px;">`
+          : `<video src="${esc(m.url)}" controls style="max-width:100%;max-height:360px;border-radius:8px;"></video>`}
+      </div>
+      <div class="form-grid">
+        <div><span class="field-label">Score (out of ${m.maxScore})</span><input class="field-input" type="number" min="0" max="${m.maxScore}" step="0.5" id="media-score-${m.id}" value="${m.score!==null && m.score!==undefined?m.score:''}"></div>
+        <div class="full"><span class="field-label">Remarks</span><textarea class="field-input reflect" id="media-remarks-${m.id}">${esc(m.remarks||'')}</textarea></div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn amber small" onclick="submitMediaReview('${m.id}','Pass')">Mark Pass</button>
+        <button class="btn danger small" onclick="submitMediaReview('${m.id}','Fail')">Mark Fail</button>
+        <button class="btn secondary small" onclick="submitMediaReview('${m.id}','ResubmissionRequired')">Request Resubmission</button>
+      </div>
+      ${m.reviewedBy?`<div class="save-note">Last reviewed by ${esc(m.reviewedBy)} &middot; ${fmtDateTime(m.reviewedAt)}</div>`:''}
+    </div>
+  `;
+}
+async function submitMediaReview(mediaId, newStatus){
+  const scoreEl = document.getElementById('media-score-'+mediaId);
+  const remarksEl = document.getElementById('media-remarks-'+mediaId);
+  const score = scoreEl && scoreEl.value !== '' ? parseFloat(scoreEl.value) : null;
+  const remarks = remarksEl ? remarksEl.value : '';
+  const cur = await getMediaRecord(mediaId);
+  if(!cur){ showToast('Could not find this upload.', 'error'); return; }
+  const previousStatus = cur.status;
+  const everFailed = cur.everFailed || newStatus==='Fail';
+  const updated = await updateMediaRecord(mediaId, { status:newStatus, score, remarks, reviewedBy:trainerIdentity.name, reviewedAt:new Date().toISOString(), everFailed });
+  if(!updated){ showToast("Couldn't save the review — check your connection.", 'error'); return; }
+  await logMediaAudit({ mediaId, partnerId:cur.partnerId, action:'status_changed', previousStatus, newStatus, by:trainerIdentity.name, byRole:isAdminRole()?'Admin':'Trainer', remark:remarks });
+  showToast('Review saved.', 'success');
+  renderAdminMain();
+}
+
+/* ---- BATCHES ---- */
+function renderBatchesListTab(){
+  return `
+    <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'}</div>
+    <h1 class="page-title">Batches</h1>
+    <p class="page-sub">Every 7-day batch, auto-numbered per trainer. A new batch starts automatically once the previous one's 7 days are up — or you can close one early.</p>
+    ${adminBatchesCache.length===0?`<div class="card"><div class="empty-state">No batches yet — the first one is created automatically as soon as a partner is added.</div></div>`:''}
+    ${adminBatchesCache.map(b=>`
+      <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+        <div>
+          <h3 style="margin-bottom:2px;">Batch ${b.batchNumber} &middot; ${esc(b.trainerName)} &middot; ${esc(b.city)}</h3>
+          <span class="pill ${b.status==='Active'?'open':'scheduled'}">${b.status}</span>
+          <span style="font-size:12px;color:var(--ink-soft);margin-left:8px;">${fmtDate(b.startDate)} ${b.endDate?'&ndash; '+fmtDate(b.endDate):'&ndash; ongoing'}</span>
+        </div>
+        <div style="display:flex;gap:8px;">
+          ${b.status==='Active'?`<button class="btn small secondary" onclick="markBatchCompleteNow('${b.id}')">Mark complete now</button>`:''}
+          <button class="btn amber small" onclick="openBatchDetail('${b.id}')">View &rarr;</button>
+        </div>
+      </div>
+    `).join('')}
+  `;
+}
+async function markBatchCompleteNow(batchId){
+  showConfirmModal("Mark this batch complete now? The trainer's next new partner will automatically start a new batch.", async ()=>{
+    const b = await kvGet('batch:'+batchId);
+    if(!b) return;
+    await updateBatch(batchId, { status:'Completed', endDate: todayStr() });
+    await logHistory('batch_completed', `Batch ${b.batchNumber} for ${b.trainerName} (${b.city}) marked complete by ${trainerIdentity.name}`, {batchId});
+    showToast('Batch marked complete.', 'success');
+    renderAdminMain();
+  });
+}
+async function openBatchDetail(batchId){ selectedBatchId = batchId; renderAdminMain(); }
+function closeBatchDetail(){ selectedBatchId = null; renderAdminMain(); }
+async function computeBatchRows(batchId){
+  const allRoster = await listRoster();
+  const partners = Object.entries(allRoster).filter(([id,r])=>r.batchId===batchId);
+  const rows = [];
+  for(const [id,r] of partners){
+    const prog = await getProgress(id);
+    const checkins = await listCheckinsForPartner(id);
+    const media = await listMediaForPartner(id);
+    const submitted = DAYS.filter(d=>prog[d.id] && prog[d.id].quizSubmitted);
+    let overallText = 'In progress', isPass = null;
+    if(submitted.length===DAYS.length && DAYS.length>0){
+      const overallPct = Math.round(submitted.reduce((s,d)=>s+prog[d.id].quizPct,0)/DAYS.length);
+      const rr = ratingFromPct(overallPct);
+      isPass = submitted.every(d=>prog[d.id].quizPct>=PASS_THRESHOLD) && overallPct>=PASS_THRESHOLD;
+      overallText = `${overallPct}% &middot; ${ratingLabel(rr)} &middot; ${isPass?'<b style="color:var(--success);">PASS</b>':'<b style="color:var(--danger);">FAIL</b>'}`;
+    }
+    const daysDone = DAYS.filter(d=>{ const dp=prog[d.id]; if(!dp) return false; const total=getEffectiveTasks(d.id).length; return dp.quizSubmitted && dp.tasksChecked.filter(Boolean).length===total; }).length;
+    rows.push({ name:r.name, id, officeId:r.officeId||'—', attendance:checkins.length, daysDone, overallText, isPass, activeFailedMedia:computeActiveFailedMedia(media), liveAuditCount:computeLiveAuditCount(media) });
+  }
+  return rows;
+}
+async function renderBatchDetailAsync(){
+  const batch = await kvGet('batch:'+selectedBatchId);
+  if(!batch) return `<div class="card"><div class="empty-state">Batch not found.</div></div><button class="btn secondary" onclick="closeBatchDetail()">Back</button>`;
+  const rows = await computeBatchRows(selectedBatchId);
+  return `
+    <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'} &middot; Batches</div>
+    <div class="back-link" onclick="closeBatchDetail()">&larr; Back to Batches</div>
+    <h1 class="page-title">Batch ${batch.batchNumber} &middot; ${esc(batch.trainerName)} &middot; ${esc(batch.city)}</h1>
+    <p class="page-sub">${fmtDate(batch.startDate)} ${batch.endDate?'&ndash; '+fmtDate(batch.endDate):'&ndash; ongoing'} &middot; <span class="pill ${batch.status==='Active'?'open':'scheduled'}">${batch.status}</span></p>
+    <div class="stat-mini-grid">
+      <div class="stat-card"><div class="n">${rows.length}</div><div class="l">Partners</div></div>
+      <div class="stat-card"><div class="n">${rows.filter(r=>r.isPass===true).length}</div><div class="l">Passed</div></div>
+      <div class="stat-card"><div class="n">${rows.filter(r=>r.isPass===false).length}</div><div class="l">Failed</div></div>
+      <div class="stat-card"><div class="n">${rows.reduce((s,r)=>s+r.liveAuditCount,0)}</div><div class="l">Total Live Audit Count</div></div>
+    </div>
+    ${rows.length===0?`<div class="card"><div class="empty-state">No partners in this batch yet.</div></div>`:`
+    <div class="card" style="overflow-x:auto;">
+      <table class="data-table">
+        <tr><th>Name</th><th>Office ID</th><th>Attendance</th><th>Days Done</th><th>Overall</th><th>Active Failed Media</th><th>Live Audit Count</th></tr>
+        ${rows.map(r=>`<tr><td>${esc(r.name)}</td><td>${esc(r.officeId)}</td><td class="mono">${r.attendance}</td><td class="mono">${r.daysDone}/${DAYS.length}</td><td>${r.overallText}</td><td class="mono">${r.activeFailedMedia}</td><td class="mono">${r.liveAuditCount}</td></tr>`).join('')}
+      </table>
+    </div>`}
+    <button class="btn amber" onclick="exportBatchExcel('${selectedBatchId}')">Export batch to Excel</button>
+  `;
+}
+async function exportBatchExcel(batchId){
+  if(typeof XLSX==='undefined'){ showToast('Excel library did not load. Try again when online.', 'error'); return; }
+  const batch = await kvGet('batch:'+batchId);
+  const rows = await computeBatchRows(batchId);
+  const summary = [['Name','Office ID','Partner ID','Batch','Attendance Days','Days Complete','Overall Result','Active Failed Media','Live Audit Count']];
+  rows.forEach(r=>{
+    const plainOverall = r.overallText.replace(/<[^>]+>/g,'').replace(/&middot;/g,'-');
+    summary.push([r.name, r.officeId, r.id, batch?batch.batchNumber:'', r.attendance, r.daysDone+'/'+DAYS.length, plainOverall, r.activeFailedMedia, r.liveAuditCount]);
+  });
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summary), 'Batch Summary');
+  XLSX.writeFile(wb, `batch-${batch?batch.batchNumber:'x'}-${(batch?batch.trainerName:'trainer').replace(/\s+/g,'_')}.xlsx`);
+  await logHistory('batch_excel_exported', `${trainerIdentity.name} exported Batch ${batch?batch.batchNumber:'?'} report`, {batchId});
+}
+
 function renderSupportTab(){
   const openCount = adminIssuesCache.filter(i=>i.status==='Open').length;
   const statuses = ['','Open','In Progress','Resolved','Rejected'];
@@ -2005,7 +2402,7 @@ async function toggleDayUnlock(city, trainer, day){
 /* ---- PARTNERS (create with Office ID -> auto Partner Password) ---- */
 function renderPartnersTab(){
   const entries = Object.entries(adminRoster);
-  const trainerOptions = Object.entries(adminTrainers).map(([id,t])=>`<option value="${esc(t.name)}|${esc(t.city)}">${esc(t.name)} — ${esc(t.city)}</option>`).join('');
+  const trainerOptions = Object.entries(adminTrainers).map(([id,t])=>`<option value="${esc(id)}|${esc(t.name)}|${esc(t.city)}">${esc(t.name)} — ${esc(t.city)}</option>`).join('');
   return `
     <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'}</div>
     <h1 class="page-title">Partners</h1>
@@ -2034,23 +2431,24 @@ function renderPartnersTab(){
 async function createPartner(){
   const name = document.getElementById('p-name').value.trim();
   const officeId = document.getElementById('p-office').value.trim();
-  let trainerName, city;
+  let trainerName, city, trainerId;
   if(isAdminRole()){
     const sel = document.getElementById('p-trainer-select').value;
     if(!sel){ showToast('Select which trainer this partner belongs to.', 'error'); return; }
-    [trainerName, city] = sel.split('|');
+    [trainerId, trainerName, city] = sel.split('|');
   } else {
-    trainerName = trainerIdentity.name; city = trainerIdentity.city;
+    trainerName = trainerIdentity.name; city = trainerIdentity.city; trainerId = trainerIdentity.trainerId;
   }
   if(!name || !officeId){ showToast('Enter the partner name and office ID.', 'error'); return; }
+  const batch = await getOrCreateActiveBatch(trainerId, trainerName, city);
   const existingRoster = await listRoster();
   const existingIds = new Set(Object.keys(existingRoster));
   const password = genPartnerPassword(name, officeId, existingIds);
-  const ok = await setRosterEntry(password, { name, officeId, city, trainer:trainerName, createdAt:new Date().toISOString() });
+  const ok = await setRosterEntry(password, { name, officeId, city, trainer:trainerName, trainerId, batchId: batch?batch.id:null, batchNumber: batch?batch.batchNumber:null, createdAt:new Date().toISOString() });
   if(!ok){ showToast("Couldn't save this partner — can't reach the database right now. Check your connection and try again.", 'error'); return; }
   const verify = await getRosterEntry(password);
   if(!verify){ showToast("The save didn't stick. Check your connection and try again.", 'error'); return; }
-  await logHistory('partner_created', `Partner ${name} created under ${trainerName} (${city})`, {partnerId:password, name, trainerName, city});
+  await logHistory('partner_created', `Partner ${name} created under ${trainerName} (${city}), Batch ${batch?batch.batchNumber:'?'}`, {partnerId:password, name, trainerName, city});
   document.getElementById('p-name').value=''; document.getElementById('p-office').value='';
   lastPartnerCredential = { name, password };
   showToast(`Partner created. Password: ${password} — share this with them.`, 'success');
@@ -2193,6 +2591,13 @@ function renderModulesListTab(){
     <div class="crumb">Admin dashboard</div>
     <h1 class="page-title">Modules</h1>
     <p class="page-sub">Edit the theory, videos, audio, assignment, and assessment for each day. Nothing changes for partners until you click Save &amp; Publish.</p>
+    <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+      <div>
+        <h3 style="margin-bottom:2px;">Home Page</h3>
+        <span class="pill ${adminModuleStatus['home']?'open':'scheduled'}">${adminModuleStatus['home']?'Customized':'Default content'}</span>
+      </div>
+      <button class="btn amber small" onclick="openModuleEditor('home')">Edit &rarr;</button>
+    </div>
     ${DAYS.map(d=>`
       <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
         <div>
@@ -2246,13 +2651,28 @@ function migrateOldOverrideToUnified(ov){
   (ov.audios||[]).forEach(a=>content.push({type:'audio', title:a.title, url:a.url}));
   return { title:ov.title, sub:ov.sub, content, assignmentIntro:ov.assignmentIntro, tasks:ov.tasks, quiz:ov.quiz };
 }
+function defaultHomeBlocks(){
+  return {
+    title: COURSE_NAME, sub: COURSE_SUB,
+    content: [ { type:'text', body: 'Non-negotiable safety rules:\n' + HOME_SAFETY.map(x=>'• '+x).join('\n') } ],
+    assignmentIntro:'', tasks:[], quiz:[]
+  };
+}
 async function openModuleEditor(dayId){
   editingDayId = dayId;
-  if(videosCache[dayId]===undefined) videosCache[dayId] = await getVideoUrl(dayId);
-  if(audiosCache[dayId]===undefined) audiosCache[dayId] = await getAudioUrl(dayId);
+  if(dayId!=='home'){
+    if(videosCache[dayId]===undefined) videosCache[dayId] = await getVideoUrl(dayId);
+    if(audiosCache[dayId]===undefined) audiosCache[dayId] = await getAudioUrl(dayId);
+  }
   const ov = await getContentOverride(dayId);
-  const day = DAYS.find(d=>d.id===dayId);
-  moduleDraft = ov ? migrateOldOverrideToUnified(JSON.parse(JSON.stringify(ov))) : defaultToBlocks(day);
+  if(ov){
+    moduleDraft = migrateOldOverrideToUnified(JSON.parse(JSON.stringify(ov)));
+  } else if(dayId==='home'){
+    moduleDraft = defaultHomeBlocks();
+  } else {
+    const day = DAYS.find(d=>d.id===dayId);
+    moduleDraft = defaultToBlocks(day);
+  }
   renderAdminMain();
 }
 function closeModuleEditor(){
@@ -2280,6 +2700,15 @@ function syncModuleDraftFromDOM(){
       if(g('c-title-'+i)) item.title = g('c-title-'+i).value;
       if(g('c-url-'+i)) item.url = g('c-url-'+i).value;
       if(g('c-caption-'+i)) item.caption = g('c-caption-'+i).value;
+    } else if(item.type==='banner'){
+      if(g('c-headline-'+i)) item.headline = g('c-headline-'+i).value;
+      if(g('c-subtext-'+i)) item.subtext = g('c-subtext-'+i).value;
+      if(g('c-imageurl-'+i)) item.imageUrl = g('c-imageurl-'+i).value;
+    } else if(item.type==='text'){
+      if(g('c-body-'+i)) item.body = g('c-body-'+i).value;
+    } else if(item.type==='button'){
+      if(g('c-label-'+i)) item.label = g('c-label-'+i).value;
+      if(g('c-action-'+i)) item.action = g('c-action-'+i).value;
     }
   });
   moduleDraft.tasks.forEach((t,i)=>{
@@ -2297,6 +2726,9 @@ const BLANK_CONTENT_ITEM = {
   video: ()=>({type:'video', title:'New video', url:''}),
   audio: ()=>({type:'audio', title:'New audio', url:''}),
   photo: ()=>({type:'photo', title:'New photo', url:'', caption:''}),
+  banner: ()=>({type:'banner', headline:'New banner', subtext:'', imageUrl:''}),
+  text: ()=>({type:'text', body:'New text block'}),
+  button: ()=>({type:'button', label:'Button', action:''}),
 };
 function insertContentItem(afterIndex, type){
   syncModuleDraftFromDOM();
@@ -2304,6 +2736,7 @@ function insertContentItem(afterIndex, type){
   refreshModuleEditor();
 }
 function removeContentItem(i){ syncModuleDraftFromDOM(); moduleDraft.content.splice(i,1); refreshModuleEditor(); }
+function duplicateContentItem(i){ syncModuleDraftFromDOM(); const copy = JSON.parse(JSON.stringify(moduleDraft.content[i])); moduleDraft.content.splice(i+1,0,copy); refreshModuleEditor(); }
 function moveContentItem(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.content.length) return; [moduleDraft.content[i],moduleDraft.content[j]]=[moduleDraft.content[j],moduleDraft.content[i]]; refreshModuleEditor(); }
 let dragFromIndex = null;
 function onContentDragStart(i){ dragFromIndex = i; }
@@ -2325,23 +2758,25 @@ function moveQuizQuestion(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<
 
 async function saveModuleDraft(){
   syncModuleDraftFromDOM();
-  if(!moduleDraft.title.trim()){ showToast('Give the day a title.', 'error'); return; }
-  if(moduleDraft.quiz.length===0){ showToast('Add at least one assessment question.', 'error'); return; }
+  if(!moduleDraft.title.trim()){ showToast('Give it a title.', 'error'); return; }
+  if(editingDayId!=='home' && moduleDraft.quiz.length===0){ showToast('Add at least one assessment question.', 'error'); return; }
   const ok = await setContentOverride(editingDayId, moduleDraft);
   if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
-  await logHistory('module_edited', `Day ${editingDayId} content edited and published by ${trainerIdentity.name}`, {dayId:editingDayId});
+  const label = editingDayId==='home' ? 'Home Page' : 'Day '+editingDayId;
+  await logHistory('module_edited', `${label} content edited and published by ${trainerIdentity.name}`, {dayId:editingDayId});
   showToast('Saved and published.', 'success');
   closeModuleEditor();
 }
 async function resetModuleToDefault(){
-  showConfirmModal('Revert Day '+editingDayId+' to the original default content? Your customizations will be deleted.', async ()=>{
+  const label = editingDayId==='home' ? 'the Home Page' : 'Day '+editingDayId;
+  showConfirmModal('Revert '+label+' to the original default content? Your customizations will be deleted.', async ()=>{
     await deleteContentOverride(editingDayId);
     await logHistory('module_reset', `Day ${editingDayId} reverted to default content by ${trainerIdentity.name}`, {dayId:editingDayId});
     showToast('Reverted to default content.', 'success');
     closeModuleEditor();
   });
 }
-function contentTypeLabel(type){ return {theory:'Theory', video:'Video', audio:'Audio', photo:'Photo'}[type] || type; }
+function contentTypeLabel(type){ return {theory:'Theory', video:'Video', audio:'Audio', photo:'Photo', banner:'Banner', text:'Text', button:'Button'}[type] || type; }
 function renderAddRow(afterIndex){
   return `
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 14px;">
@@ -2349,6 +2784,9 @@ function renderAddRow(afterIndex){
       <button class="btn small secondary" onclick="insertContentItem(${afterIndex},'video')">+ Video</button>
       <button class="btn small secondary" onclick="insertContentItem(${afterIndex},'audio')">+ Audio</button>
       <button class="btn small secondary" onclick="insertContentItem(${afterIndex},'photo')">+ Photo</button>
+      <button class="btn small secondary" onclick="insertContentItem(${afterIndex},'banner')">+ Banner</button>
+      <button class="btn small secondary" onclick="insertContentItem(${afterIndex},'text')">+ Text</button>
+      <button class="btn small secondary" onclick="insertContentItem(${afterIndex},'button')">+ Button</button>
     </div>
   `;
 }
@@ -2375,6 +2813,19 @@ function renderContentItemCard(item, i, total){
       <input class="field-input" id="c-url-${i}" value="${esc(item.url)}" placeholder="Image URL or Google Drive share link">
       <input class="field-input" id="c-caption-${i}" value="${esc(item.caption||'')}" placeholder="Caption (optional)">
     `;
+  } else if(item.type==='banner'){
+    fields = `
+      <input class="field-input" id="c-headline-${i}" value="${esc(item.headline)}" placeholder="Headline">
+      <input class="field-input" id="c-subtext-${i}" value="${esc(item.subtext||'')}" placeholder="Subtext (optional)">
+      <input class="field-input" id="c-imageurl-${i}" value="${esc(item.imageUrl||'')}" placeholder="Background image URL (optional)">
+    `;
+  } else if(item.type==='text'){
+    fields = `<textarea class="field-input reflect" id="c-body-${i}" style="min-height:80px;" placeholder="Plain text — no heading">${esc(item.body)}</textarea>`;
+  } else if(item.type==='button'){
+    fields = `
+      <input class="field-input" id="c-label-${i}" value="${esc(item.label)}" placeholder="Button text">
+      <input class="field-input" id="c-action-${i}" value="${esc(item.action||'')}" placeholder="Link this button opens (URL)">
+    `;
   }
   return `
     <div class="card" draggable="true" ondragstart="onContentDragStart(${i})" ondragover="onContentDragOver(event)" ondrop="onContentDrop(${i})" style="cursor:grab;">
@@ -2383,6 +2834,7 @@ function renderContentItemCard(item, i, total){
         <div style="display:flex;gap:6px;">
           <button class="btn small secondary" onclick="moveContentItem(${i},-1)" ${i===0?'disabled':''} title="Move up">&uarr;</button>
           <button class="btn small secondary" onclick="moveContentItem(${i},1)" ${i===total-1?'disabled':''} title="Move down">&darr;</button>
+          <button class="btn small secondary" onclick="duplicateContentItem(${i})" title="Duplicate">Duplicate</button>
           <button class="btn small danger" onclick="removeContentItem(${i})">Delete</button>
         </div>
       </div>
@@ -2392,14 +2844,15 @@ function renderContentItemCard(item, i, total){
 }
 function renderModuleEditorTab(){
   const d = moduleDraft;
+  const isHome = editingDayId==='home';
   return `
     <div class="crumb">Admin dashboard &middot; Modules</div>
     <div class="back-link" onclick="closeModuleEditor()">&larr; Back to Modules</div>
-    <h1 class="page-title">Edit Day ${editingDayId}</h1>
+    <h1 class="page-title">${isHome?'Edit Home Page':'Edit Day '+editingDayId}</h1>
     <p class="page-sub">Changes here don't affect partners until you click Save &amp; Publish.</p>
 
     <div class="card">
-      <span class="field-label">Day title</span>
+      <span class="field-label">${isHome?'Page title':'Day title'}</span>
       <input class="field-input" id="draft-title" value="${esc(d.title)}">
       <span class="field-label">Subtitle</span>
       <input class="field-input" id="draft-sub" value="${esc(d.sub)}">
@@ -2411,6 +2864,7 @@ function renderModuleEditorTab(){
     ${renderAddRow(-1)}
     ${d.content.map((item,i)=>renderContentItemCard(item,i,d.content.length) + renderAddRow(i)).join('')}
 
+    ${isHome ? '' : `
     <h2 class="page-title" style="font-size:18px;margin-top:20px;">Assignment</h2>
     <div class="card">
       <span class="field-label">Intro text</span>
@@ -2448,6 +2902,7 @@ function renderModuleEditorTab(){
       </div>
     `).join('')}
     <button class="btn secondary" onclick="addQuizQuestion()">+ Add question</button>
+    `}
 
     <div class="card" style="margin-top:20px;display:flex;gap:10px;flex-wrap:wrap;">
       <button class="btn amber" onclick="saveModuleDraft()">Save &amp; Publish</button>
