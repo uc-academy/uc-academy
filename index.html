@@ -1440,7 +1440,7 @@ function renderTheory(day){
       if(item.type==='theory'){
         html += `<div class="card"><h3>${esc(item.heading)}</h3><p style="white-space:pre-wrap;">${esc(item.body)}</p></div>`;
       } else if(item.type==='video'){
-        html += renderOverrideVideoItem(day.id, item, idx, dp);
+        if(item.url) html += renderOverrideVideoItem(day.id, item, idx, dp);
       } else if(item.type==='audio'){
         html += `<div class="card"><h3>${esc(item.title||'Audio')}</h3><audio controls onplay="markAudioPlayed(${day.id})"><source src="${esc(item.url)}"></audio></div>`;
       } else if(item.type==='photo'){
@@ -1449,8 +1449,9 @@ function renderTheory(day){
     });
     const allVideosDone = videoIndices.every(i => dp.videoItemProgress[i]?.done);
     const canComplete = allVideosDone && (!hasAudio || dp.audioPlayed);
+    const fullyDone = dp.theoryDone && dp.videoDone;
     html += `<div class="card">
-      ${dp.theoryDone ? `<p style="color:var(--success);font-weight:500;">Marked complete. Assignment and Assessment are unlocked below.</p>` :
+      ${fullyDone ? `<p style="color:var(--success);font-weight:500;">Marked complete. Assignment and Assessment are unlocked below.</p>` :
       `<p>${videoIndices.length>0?'Watch '+(videoIndices.length>1?'all the videos':'the video')+' to 90%'+(hasAudio?', listen to the audio, ':' ')+'then mark this section complete to continue.':(hasAudio?'Listen to the audio, then mark this section complete to continue.':'Read through everything above, then mark it complete to continue.')}</p>
       <button class="btn amber" id="theory-complete-btn" ${!canComplete?'disabled':''} onclick="markTheoryDone(${day.id})">Mark complete</button>`}
     </div>`;
@@ -3163,6 +3164,7 @@ function renderContentItemCard(item, i, total){
     fields = `
       <input class="field-input" id="c-title-${i}" value="${esc(item.title)}" placeholder="Video title">
       <input class="field-input" id="c-url-${i}" value="${esc(item.url)}" placeholder="YouTube, Vimeo, or Google Drive share link">
+      ${!item.url ? `<div class="save-note" style="color:var(--danger);">No link set yet — partners won't see this video at all until you add one, or delete this block.</div>` : ''}
     `;
   } else if(item.type==='audio'){
     fields = `
