@@ -519,7 +519,7 @@ function defaultToBlocks(day){
     content.push({ type:'theory', heading: sec.h, body });
   });
   const videoUrl = videosCache[day.id]||'';
-  if(videoUrl || day.video.title) content.push({ type:'video', title: day.video.title, url: videoUrl });
+  if(videoUrl) content.push({ type:'video', title: day.video.title, url: videoUrl });
   if(audiosCache[day.id]) content.push({ type:'audio', title:'Audio narration', url: audiosCache[day.id] });
   return {
     title: day.title,
@@ -809,7 +809,7 @@ const AVAILABLE_FONTS = ['Poppins','Inter','Roboto','Lato','Montserrat','Nunito'
 const NAV_LABEL_KEYS = [
   ['overview','Overview'], ['trainers','Trainers'], ['support','Support'], ['history','History'],
   ['modules','Modules'], ['media','Media Review'], ['batches','Batches'], ['sessions','Sessions'],
-  ['access','Day Access'], ['partners','Partners'], ['tracking','Tracking'], ['videos','Videos & Audio'],
+  ['access','Day Access'], ['partners','Partners'], ['tracking','Tracking'],
   ['report','Report an Issue'], ['theme','Theme & Branding']
 ];
 const DEFAULT_THEME = {
@@ -890,14 +890,19 @@ let audiosCache = {};
 let contentOverrides = {};
 let ytPlayer = null;
 let ytPollTimer = null;
+let ytPlayers = {};
+let ytPollTimers = {};
 window.onYouTubeIframeAPIReady = function(){};
 
 function defaultDayProgress(){
   return { theoryDone:false, audioPlayed:false, videoPct:0, videoDone:false,
     quizSubmitted:false, quizScore:0, quizTotal:0, quizPct:0, quizAnswers:[], quizDate:'',
-    tasksChecked:[], reflection:'' };
+    tasksChecked:[], reflection:'', videoItemProgress:{} };
 }
-function ensureDay(d){ if(!currentUserProgress[d]) currentUserProgress[d] = defaultDayProgress(); }
+function ensureDay(d){
+  if(!currentUserProgress[d]) currentUserProgress[d] = defaultDayProgress();
+  if(!currentUserProgress[d].videoItemProgress) currentUserProgress[d].videoItemProgress = {};
+}
 function dayRating(d){
   ensureDay(d);
   const dp = currentUserProgress[d];
@@ -1327,8 +1332,16 @@ async function loadMyMedia(dayId){
   myMediaCache[dayId] = all.filter(m=>m.dayId===dayId);
   if(currentTab==='assignment' && currentDay===dayId) renderMainOnly();
 }
-function renderMainOnly(){ document.getElementById('main').innerHTML = renderCurrentPage(); if(currentDay>0 && currentDay<99 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay)); }
-function renderMain(){ document.getElementById('main').innerHTML = renderCurrentPage(); if(currentDay>0 && currentDay<99 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay)); }
+function renderMainOnly(){
+  document.getElementById('main').innerHTML = renderCurrentPage();
+  if(currentDay>0 && currentDay<99 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay));
+  if(currentDay>0 && currentDay<99 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
+}
+function renderMain(){
+  document.getElementById('main').innerHTML = renderCurrentPage();
+  if(currentDay>0 && currentDay<99 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay));
+  if(currentDay>0 && currentDay<99 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
+}
 function renderCurrentPage(){
   if(currentDay===0) return renderHome();
   if(currentDay===99) return renderResult();
@@ -1421,27 +1434,25 @@ function renderTheory(day){
   let html='';
   if(ov){
     const items = ov.content || [];
+    const videoIndices = items.map((it,i)=>(it.type==='video' && it.url)?i:null).filter(i=>i!==null);
     const hasAudio = items.some(i=>i.type==='audio');
-    const hasVideo = items.some(i=>i.type==='video');
-    items.forEach(item=>{
+    items.forEach((item,idx)=>{
       if(item.type==='theory'){
         html += `<div class="card"><h3>${esc(item.heading)}</h3><p style="white-space:pre-wrap;">${esc(item.body)}</p></div>`;
       } else if(item.type==='video'){
-        const n = normalizeUrl(item.url);
-        let inner = `<div class="video-placeholder">${esc(item.title||'Video')}<br><span style="font-size:11.5px;">No video linked yet.</span></div>`;
-        if(n.embedUrl) inner = `<iframe src="${esc(n.embedUrl)}" allowfullscreen></iframe>`;
-        else if(item.url) inner = `<div class="video-placeholder">Video link not recognised.</div>`;
-        html += `<div class="card"><h3>${esc(item.title||'Video')}</h3><div class="video-frame">${inner}</div></div>`;
+        html += renderOverrideVideoItem(day.id, item, idx, dp);
       } else if(item.type==='audio'){
         html += `<div class="card"><h3>${esc(item.title||'Audio')}</h3><audio controls onplay="markAudioPlayed(${day.id})"><source src="${esc(item.url)}"></audio></div>`;
       } else if(item.type==='photo'){
         html += `<div class="card"><h3>${esc(item.title||'Photo')}</h3>${item.url?`<img src="${esc(item.url)}" style="max-width:100%;border-radius:8px;">`:'<div class="video-placeholder">No image linked yet.</div>'}${item.caption?`<p style="margin-top:8px;color:var(--ink-soft);font-size:12.5px;">${esc(item.caption)}</p>`:''}</div>`;
       }
     });
+    const allVideosDone = videoIndices.every(i => dp.videoItemProgress[i]?.done);
+    const canComplete = allVideosDone && (!hasAudio || dp.audioPlayed);
     html += `<div class="card">
-      ${dp.theoryDone ? `<p style="color:var(--success);font-weight:500;">Marked complete. ${hasVideo||true?'Assignment and Assessment are unlocked below.':''}</p>` :
-      `<p>${hasAudio?'Listen to the audio, watch any videos, then mark this section complete to continue.':'Read through everything above, then mark it complete to continue.'}</p>
-      <button class="btn amber" id="theory-complete-btn" ${hasAudio && !dp.audioPlayed?'disabled':''} onclick="markTheoryDone(${day.id})">Mark complete</button>`}
+      ${dp.theoryDone ? `<p style="color:var(--success);font-weight:500;">Marked complete. Assignment and Assessment are unlocked below.</p>` :
+      `<p>${videoIndices.length>0?'Watch '+(videoIndices.length>1?'all the videos':'the video')+' to 90%'+(hasAudio?', listen to the audio, ':' ')+'then mark this section complete to continue.':(hasAudio?'Listen to the audio, then mark this section complete to continue.':'Read through everything above, then mark it complete to continue.')}</p>
+      <button class="btn amber" id="theory-complete-btn" ${!canComplete?'disabled':''} onclick="markTheoryDone(${day.id})">Mark complete</button>`}
     </div>`;
     return html;
   }
@@ -1467,8 +1478,23 @@ function renderTheory(day){
 }
 function markAudioPlayed(dayId){
   currentUserProgress[dayId].audioPlayed = true;
+  updateTheoryCompleteButtonState(dayId);
+}
+function updateTheoryCompleteButtonState(dayId){
   const btn = document.getElementById('theory-complete-btn');
-  if(btn) btn.disabled = false;
+  if(!btn) return;
+  const ov = contentOverrides[dayId];
+  const dp = currentUserProgress[dayId];
+  if(ov){
+    const items = ov.content || [];
+    const videoIndices = items.map((it,i)=>(it.type==='video' && it.url)?i:null).filter(i=>i!==null);
+    const hasAudio = items.some(i=>i.type==='audio');
+    const allVideosDone = videoIndices.every(i => dp.videoItemProgress[i]?.done);
+    btn.disabled = !(allVideosDone && (!hasAudio || dp.audioPlayed));
+  } else {
+    const audioUrl = audiosCache[dayId];
+    btn.disabled = !!(audioUrl && !dp.audioPlayed);
+  }
 }
 async function markTheoryDone(dayId){
   currentUserProgress[dayId].theoryDone = true;
@@ -1480,6 +1506,127 @@ async function markTheoryDone(dayId){
   renderMainOnly(); renderSidebar();
 }
 
+function renderOverrideVideoItem(dayId, item, idx, dp){
+  const n = normalizeUrl(item.url);
+  const itemProgress = dp.videoItemProgress[idx] || {pct:0, done:false};
+  let inner;
+  if(n.kind==='youtube'){
+    inner = `<div id="yt-player-${dayId}-${idx}" style="width:100%;height:100%;"></div>`;
+  } else if(n.embedUrl){
+    inner = `<iframe src="${esc(n.embedUrl)}" allowfullscreen></iframe>`;
+  } else if(item.url){
+    inner = `<div class="video-placeholder">Video link not recognised.</div>`;
+  } else {
+    inner = `<div class="video-placeholder">${esc(item.title||'Video')}<br><span style="font-size:11.5px;">No video linked yet.</span></div>`;
+  }
+  let progressBlock = '';
+  if(item.url){
+    if(n.kind==='youtube'){
+      progressBlock = `
+        <div class="video-progress-wrap">
+          <div class="video-progress-track"><div class="video-progress-fill" id="ov-progress-fill-${dayId}-${idx}" style="width:${Math.round(itemProgress.pct)}%"></div></div>
+          <div class="video-progress-label" id="ov-progress-label-${dayId}-${idx}">${Math.round(itemProgress.pct)}% watched ${itemProgress.done?'&middot; <span style="color:var(--success);">Done</span>':'&middot; needs 90% to continue'}</div>
+        </div>`;
+    } else {
+      progressBlock = `
+        <div class="video-progress-wrap">
+          <div class="video-progress-label">${itemProgress.done ? '<span style="color:var(--success);">Confirmed watched</span>' : "We can't auto-track this video type. Watch it fully, then confirm below."}</div>
+        </div>
+        ${!itemProgress.done ? `<button class="btn amber small" onclick="manualOverrideVideoComplete(${dayId},${idx})">I've watched this video</button>` : ''}`;
+    }
+  }
+  return `<div class="card"><h3>${esc(item.title||'Video')}</h3><div class="video-frame">${inner}</div>${progressBlock}</div>`;
+}
+async function manualOverrideVideoComplete(dayId, idx){
+  ensureDay(dayId);
+  currentUserProgress[dayId].videoItemProgress[idx] = {pct:100, done:true};
+  await setProgress(currentUser.id, currentUserProgress);
+  updateTheoryCompleteButtonState(dayId);
+  renderMainOnly();
+}
+function initOverrideVideoPlayers(day){
+  const ov = contentOverrides[day.id];
+  if(!ov) return;
+  const dp = currentUserProgress[day.id];
+  if(dp.theoryDone) return;
+  (ov.content||[]).forEach((item, idx)=>{
+    if(item.type!=='video') return;
+    if(dp.videoItemProgress[idx]?.done) return;
+    const n = normalizeUrl(item.url);
+    if(n.kind!=='youtube') return;
+    const m = item.url.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([\w-]+)/);
+    if(!m) return;
+    const videoId = m[1];
+    const elId = `yt-player-${day.id}-${idx}`;
+    const key = `${day.id}_${idx}`;
+    if(ytPlayers[key]) return;
+    let attempts = 0;
+    const tryInit = ()=>{
+      attempts++;
+      if(!document.getElementById(elId)) return;
+      if(window.YT && window.YT.Player){
+        ytPlayers[key] = new YT.Player(elId, {
+          videoId,
+          events:{
+            onReady:()=>{},
+            onStateChange:(e)=>{
+              if(e.data===YT.PlayerState.PLAYING){
+                if(ytPollTimers[key]) clearInterval(ytPollTimers[key]);
+                ytPollTimers[key] = setInterval(()=>pollOverrideYT(day.id, idx, key), 2000);
+              } else if(ytPollTimers[key]){
+                clearInterval(ytPollTimers[key]); delete ytPollTimers[key];
+              }
+            }
+          }
+        });
+      } else if(attempts<20){
+        setTimeout(tryInit, 300);
+      } else {
+        const c = document.getElementById(elId);
+        if(c) c.innerHTML = `<div class="video-placeholder">Video player unavailable.<br><span style="font-size:11.5px;">Confirm manually below.</span></div>`;
+        showManualFallbackOverride(day.id, idx);
+      }
+    };
+    tryInit();
+  });
+}
+function showManualFallbackOverride(dayId, idx){
+  const playerEl = document.getElementById(`yt-player-${dayId}-${idx}`);
+  const card = playerEl ? playerEl.closest('.card') : null;
+  if(card && !card.querySelector('.ov-manual-fallback-btn')){
+    const btn = document.createElement('button');
+    btn.className='btn amber small ov-manual-fallback-btn'; btn.style.marginTop='10px';
+    btn.textContent="I've watched this video";
+    btn.onclick=()=>manualOverrideVideoComplete(dayId, idx);
+    card.appendChild(btn);
+  }
+}
+async function pollOverrideYT(dayId, idx, key){
+  const player = ytPlayers[key];
+  if(!player || !player.getDuration) return;
+  try{
+    const dur = player.getDuration();
+    const cur = player.getCurrentTime();
+    if(!dur) return;
+    const pct = Math.min(100, Math.round((cur/dur)*100));
+    ensureDay(dayId);
+    const dp = currentUserProgress[dayId];
+    const prev = dp.videoItemProgress[idx] || {pct:0, done:false};
+    if(pct > (prev.pct||0)){
+      const done = pct>=90;
+      dp.videoItemProgress[idx] = {pct, done};
+      const fill = document.getElementById(`ov-progress-fill-${dayId}-${idx}`);
+      const label = document.getElementById(`ov-progress-label-${dayId}-${idx}`);
+      if(fill) fill.style.width = pct+'%';
+      if(label) label.innerHTML = pct+'% watched '+(done?'&middot; <span style="color:var(--success);">Done</span>':'&middot; needs 90% to continue');
+      if(pct % 6 === 0 || done) await setProgress(currentUser.id, currentUserProgress);
+      if(done){
+        if(ytPollTimers[key]){ clearInterval(ytPollTimers[key]); delete ytPollTimers[key]; }
+        updateTheoryCompleteButtonState(dayId);
+      }
+    }
+  }catch(e){}
+}
 function renderVideo(day){
   const dp = currentUserProgress[day.id];
   const ov = contentOverrides[day.id];
@@ -1550,6 +1697,10 @@ function cleanupPlayer(){
   if(ytPollTimer){ clearInterval(ytPollTimer); ytPollTimer=null; }
   if(ytPlayer && ytPlayer.destroy){ try{ ytPlayer.destroy(); }catch(e){} }
   ytPlayer = null;
+  Object.values(ytPollTimers).forEach(t=>clearInterval(t));
+  ytPollTimers = {};
+  Object.values(ytPlayers).forEach(p=>{ if(p && p.destroy) try{ p.destroy(); }catch(e){} });
+  ytPlayers = {};
 }
 function initVideoTab(day){
   const url = videosCache[day.id]||'';
@@ -1837,7 +1988,6 @@ function adminTabDefs(){
       ['access','Day Access','Unlock days'],
       ['partners','Partners','All partners'],
       ['tracking','Tracking','Scores & attendance'],
-      ['videos','Videos & Audio','Course content'],
     ];
   } else {
     tabs = [
@@ -1945,7 +2095,6 @@ async function renderAdminMain(){
     }
   }
   else if(adminTab==='theme'){ themeDraft = JSON.parse(JSON.stringify(currentTheme)); el.innerHTML = renderThemeTab(); }
-  else if(adminTab==='videos'){ videosCache={}; audiosCache={}; extraVideosCache={}; extraAudiosCache={}; await Promise.all(DAYS.map(async d=>{ videosCache[d.id]=await getVideoUrl(d.id); audiosCache[d.id]=await getAudioUrl(d.id); extraVideosCache[d.id]=await getExtraVideos(d.id); extraAudiosCache[d.id]=await getExtraAudios(d.id); })); el.innerHTML = renderVideosTab(); }
 }
 
 /* ---- OVERVIEW (admin only) ---- */
