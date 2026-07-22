@@ -1332,7 +1332,7 @@ function goTo(dayId, tab){
   closeSidebar();
   renderApp(); window.scrollTo(0,0);
   if(dayId>0 && dayId<99){
-    refreshDayContent(dayId).then(()=>{ if(currentDay===dayId) renderMainOnly(); });
+    refreshDayContent(dayId).then(()=>{ if(currentDay===dayId){ cleanupPlayer(); renderMainOnly(); } });
   }
 }
 async function refreshDayContent(dayId){
@@ -1571,6 +1571,7 @@ async function manualOverrideVideoComplete(dayId, idx){
   currentUserProgress[dayId].videoItemProgress[idx] = {pct:100, done:true};
   await setProgress(currentUser.id, currentUserProgress);
   updateTheoryCompleteButtonState(dayId);
+  cleanupPlayer();
   renderMainOnly();
 }
 function initOverrideVideoPlayers(day){
