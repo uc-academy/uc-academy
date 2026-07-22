@@ -1972,7 +1972,8 @@ async function submitQuiz(dayId){
 
 function renderResult(){
   const s = overallStats();
-  const ready = s.done===s.total;
+  const ready = s.done===s.total && !!(s.overall && s.overall.pass);
+  const allSubmittedButFailed = s.done===s.total && s.overall && !s.overall.pass;
   const rows = DAYS.map(d=>{
     const dp = currentUserProgress[d.id]||defaultDayProgress();
     const r = dayRating(d.id);
@@ -1997,7 +1998,7 @@ function renderResult(){
       <h2>has completed the ${esc(COURSE_SUB)}</h2>
       <p style="max-width:480px;margin:0 auto;color:var(--ink-soft);font-size:13px;">Covering Semi-Automatic and Top-Load machine working principles, dismantling and assembling, troubleshooting, and final assessment.</p>
       <div class="cert-meta">Trainer: ${esc(currentUser.trainer)} &middot; City: ${esc(currentUser.city)}<br>Issued ${new Date().toLocaleDateString('en-IN',{year:'numeric',month:'long',day:'numeric'})}</div>
-    </div>${ready?`<div style="margin-top:18px;"><button class="btn amber" onclick="window.print()">Print / save certificate</button></div>`:''}</div>
+    </div>${ready?`<div style="margin-top:18px;"><button class="btn amber" onclick="window.print()">Print / save certificate</button></div>`:(allSubmittedButFailed?`<div class="lock-banner" style="margin-top:18px;">Your overall result is a Fail, so the certificate isn't available. Speak with your trainer about resubmission or additional practice.</div>`:'')}</div>
   `;
 }
 
@@ -2005,6 +2006,7 @@ function renderResult(){
 let adminRoster = {}; let adminSessions = []; let adminUnlocks = {}; let adminTrainers = {};
 let adminProgressCache = {}; let adminCheckinsCache = {}; let adminHistoryCache = [];
 let lastPartnerCredential = null;
+let partnersHiddenCompletedCount = 0;
 let lastTrainerCredential = null;
 let adminIssuesCache = [];
 let adminMediaCache = [];
@@ -2113,7 +2115,16 @@ async function renderAdminMain(){
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
   else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); el.innerHTML = renderSessionsTab(); }
   else if(adminTab==='access'){ const allR = await listRoster(); adminRoster = isAdminRole()?allR:Object.fromEntries(Object.entries(allR).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name)); adminUnlocks = await listUnlocks(); el.innerHTML = renderAccessTab(); }
-  else if(adminTab==='partners'){ const allR2 = await listRoster(); adminRoster = isAdminRole()?allR2:Object.fromEntries(Object.entries(allR2).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name)); adminTrainers = await listTrainers(); el.innerHTML = renderPartnersTab(); }
+  else if(adminTab==='partners'){
+    const allR2 = await listRoster();
+    let scoped = isAdminRole()?allR2:Object.fromEntries(Object.entries(allR2).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name));
+    const allBatchesForFilter = await listAllBatches();
+    const completedBatchIds = new Set(allBatchesForFilter.filter(b=>b.status==='Completed').map(b=>b.id));
+    partnersHiddenCompletedCount = Object.values(scoped).filter(r=>r.batchId && completedBatchIds.has(r.batchId)).length;
+    adminRoster = Object.fromEntries(Object.entries(scoped).filter(([,r])=>!(r.batchId && completedBatchIds.has(r.batchId))));
+    adminTrainers = await listTrainers();
+    el.innerHTML = renderPartnersTab();
+  }
   else if(adminTab==='support'){ adminIssuesCache = await listIssues(); adminTrainers = await listTrainers(); el.innerHTML = renderSupportTab(); }
   else if(adminTab==='report'){ adminIssuesCache = await listIssues(); el.innerHTML = renderReportIssueTab(); }
   else if(adminTab==='modules'){
@@ -2816,6 +2827,7 @@ function renderPartnersTab(){
     <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'}</div>
     <h1 class="page-title">Partners</h1>
     <p class="page-sub">Create a partner record. A unique Partner Password is generated automatically — this is what the partner types into "Partner Unique ID" at login.</p>
+    ${partnersHiddenCompletedCount>0 ? `<p style="font-size:12.5px;color:var(--ink-soft);margin-top:-8px;">${partnersHiddenCompletedCount} partner${partnersHiddenCompletedCount>1?'s':''} from completed batches ${partnersHiddenCompletedCount>1?'are':'is'} hidden here — find them under <b>Batch Tracking</b>.</p>` : ''}
     ${lastPartnerCredential ? `<div class="credential-banner"><div class="cb-label">Partner Password generated</div><div class="cb-value">${esc(lastPartnerCredential.password)}</div><div class="cb-note">Share this with ${esc(lastPartnerCredential.name)} — they'll enter it as their Partner Unique ID to log in. <a onclick="lastPartnerCredential=null;renderAdminMain();" style="cursor:pointer;">Dismiss</a></div></div>` : ''}
     <div class="card">
       <h3>Create a partner</h3>
@@ -2873,15 +2885,34 @@ async function deletePartnerRow(id){
 }
 
 /* ---- TRACKING ---- */
+let trackingOverridesCache = {};
 async function loadTrackingData(){
   const all = await listRoster();
   adminRoster = isAdminRole() ? all : Object.fromEntries(Object.entries(all).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name));
   const ids = Object.keys(adminRoster);
-  adminProgressCache = {}; adminCheckinsCache = {};
+  adminProgressCache = {}; adminCheckinsCache = {}; trackingOverridesCache = {};
+  await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id); if(ov) trackingOverridesCache[d.id] = ov; }));
   await Promise.all(ids.map(async id=>{
     adminProgressCache[id] = await getProgress(id);
     adminCheckinsCache[id] = await listCheckinsForPartner(id);
   }));
+}
+function computeWeakAreas(prog){
+  const dayFeedback = {};
+  let allWeak = [];
+  DAYS.forEach(d=>{
+    const dp = prog[d.id];
+    if(!dp || !dp.quizSubmitted){ dayFeedback[d.id] = null; return; }
+    const ov = trackingOverridesCache[d.id];
+    const quiz = (ov && ov.quiz) ? ov.quiz.map(q=>({q:q.question, opts:q.options, correct:q.correct})) : d.quiz;
+    const wrong = [];
+    quiz.forEach((q,qi)=>{ if(dp.quizAnswers[qi] !== q.correct) wrong.push(q.q); });
+    dayFeedback[d.id] = wrong;
+    allWeak.push(...wrong);
+  });
+  const uniqueWeak = [...new Set(allWeak)];
+  const overall = uniqueWeak.length ? 'Needs more practice in: '+uniqueWeak.slice(0,3).join('; ')+(uniqueWeak.length>3?' (+'+(uniqueWeak.length-3)+' more)':'') : (Object.values(dayFeedback).some(v=>v!==null) ? 'No major weak areas identified so far.' : '');
+  return { dayFeedback, overall };
 }
 function renderTrackingTab(){
   const entries = Object.entries(adminRoster);
@@ -2923,22 +2954,27 @@ function renderTrackingTableInner(cityFilter, trainerFilter){
     }
     const myCheckins = adminCheckinsCache[id] || [];
     const last = myCheckins[0];
+    const weak = computeWeakAreas(prog);
     const dayCells = DAYS.map(d=>{
       const dp = prog[d.id];
       if(!dp || !dp.quizSubmitted) return '<span class="mono" style="color:var(--ink-soft);">D'+d.id+':—</span>';
-      return `<span class="mono" style="color:${dp.quizPct>=PASS_THRESHOLD?'var(--success)':'var(--danger)'};">D${d.id}:${dp.quizScore}/${dp.quizTotal} (${ratingOutOf5(dp.quizScore,dp.quizTotal)}/5)</span>`;
+      const pass = dp.quizPct>=PASS_THRESHOLD;
+      const tip = (weak.dayFeedback[d.id]&&weak.dayFeedback[d.id].length) ? esc('Missed: '+weak.dayFeedback[d.id].join(' | ')) : 'All correct';
+      return `<span class="mono" title="${tip}" style="color:${pass?'var(--success)':'var(--danger)'};cursor:help;">D${d.id}:${dp.quizScore}/${dp.quizTotal} ${pass?'PASS':'FAIL'}</span>`;
     }).join(' &nbsp; ');
     return `<tr>
       <td>${esc(r.name)}</td><td>${esc(r.officeId||'—')}</td><td class="mono">${esc(id)}</td><td>${esc(r.city)}</td><td>${esc(r.trainer)}</td>
+      <td>${r.batchNumber?'Batch '+r.batchNumber:'<span style="color:var(--ink-soft);">—</span>'}</td>
       <td>${last?fmtDate(last.date)+' '+last.checkinTime:'<span style="color:var(--ink-soft);">Never</span>'}</td>
       <td>${last&&last.checkoutTime?fmtDate(last.date)+' '+last.checkoutTime:'<span style="color:var(--ink-soft);">—</span>'}</td>
       <td><b class="mono">${done}/${DAYS.length}</b></td>
       <td style="white-space:normal;font-size:11px;">${dayCells}</td>
       <td>${overallText}</td>
+      <td style="white-space:normal;font-size:11.5px;max-width:220px;">${weak.overall?esc(weak.overall):'<span style="color:var(--ink-soft);">—</span>'}</td>
     </tr>`;
   }).join('');
   return `<div class="card" style="overflow-x:auto;"><table class="data-table">
-    <tr><th>Name</th><th>Office ID</th><th>ID</th><th>City</th><th>Trainer</th><th>Last check-in</th><th>Last check-out</th><th>Days done</th><th>Day scores</th><th>Overall</th></tr>
+    <tr><th>Name</th><th>Office ID</th><th>ID</th><th>City</th><th>Trainer</th><th>Batch</th><th>Last check-in</th><th>Last check-out</th><th>Days done</th><th>Day scores</th><th>Overall</th><th>Feedback</th></tr>
     ${rows}
   </table></div>`;
 }
