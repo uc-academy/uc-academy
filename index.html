@@ -527,8 +527,16 @@ function defaultToBlocks(day){
     content,
     assignmentIntro: day.assignment.intro,
     tasks: [...day.assignment.tasks],
+    mediaUploadEnabled: true,
     quiz: day.quiz.map(q=>({ question:q.q, options:[...q.opts], correct:q.correct }))
   };
+}
+function renderAudioEmbed(url, onPlayJs){
+  const n = normalizeUrl(url);
+  if(n.kind==='drive'){
+    return `<div class="video-frame" style="height:160px;"><iframe src="${esc(n.embedUrl)}" allow="autoplay"></iframe></div><p style="font-size:11px;color:var(--ink-soft);margin-top:6px;">If this doesn't play, make sure the Google Drive file is shared as "Anyone with the link can view" — not "Restricted."</p>`;
+  }
+  return `<audio controls ${onPlayJs?`onplay="${onPlayJs}"`:''}><source src="${esc(url)}"></audio>`;
 }
 function normalizeUrl(url, kind){
   if(!url) return { embedUrl:'', kind:'none' };
@@ -892,7 +900,8 @@ let ytPlayer = null;
 let ytPollTimer = null;
 let ytPlayers = {};
 let ytPollTimers = {};
-window.onYouTubeIframeAPIReady = function(){};
+let ytApiReady = false;
+window.onYouTubeIframeAPIReady = function(){ ytApiReady = true; };
 
 function defaultDayProgress(){
   return { theoryDone:false, audioPlayed:false, videoPct:0, videoDone:false,
@@ -1073,7 +1082,7 @@ async function loginAsPartner(id, opts){
     return { ok:false, reason:`No class has been scheduled yet for you. Please check with your trainer.` };
   }
   const s = result.session;
-  currentUser = { id, name:r.name, officeId:r.officeId||'', city:r.city, trainer:r.trainer, day:s.day, open:s.open, close:s.close };
+  currentUser = { id, name:r.name, officeId:r.officeId||'', city:r.city, trainer:r.trainer, trainerId:r.trainerId||null, day:s.day, open:s.open, close:s.close };
   currentUserUnlockedDays = await getUnlock(r.city, r.trainer);
   currentUserProgress = await getProgress(id);
   await loadAndApplyDayRegistry();
@@ -1356,7 +1365,7 @@ function renderHomeContentItem(item){
     const inner = n.embedUrl ? `<iframe src="${esc(n.embedUrl)}" allowfullscreen></iframe>` : `<div class="video-placeholder">${item.url?'Video link not recognised.':'No video linked yet.'}</div>`;
     return `<div class="card"><h3>${esc(item.title||'Video')}</h3><div class="video-frame">${inner}</div></div>`;
   }
-  if(item.type==='audio') return `<div class="card"><h3>${esc(item.title||'Audio')}</h3><audio controls><source src="${esc(item.url)}"></audio></div>`;
+  if(item.type==='audio') return `<div class="card"><h3>${esc(item.title||'Audio')}</h3>${renderAudioEmbed(item.url)}</div>`;
   if(item.type==='photo') return `<div class="card"><h3>${esc(item.title||'Photo')}</h3>${item.url?`<img src="${esc(item.url)}" style="max-width:100%;border-radius:8px;">`:'<div class="video-placeholder">No image linked yet.</div>'}${item.caption?`<p style="margin-top:8px;color:var(--ink-soft);font-size:12.5px;">${esc(item.caption)}</p>`:''}</div>`;
   if(item.type==='banner') return `<div class="card" style="text-align:center;background:linear-gradient(135deg,var(--brand-light),#fff);">${item.imageUrl?`<img src="${esc(item.imageUrl)}" style="max-width:100%;border-radius:8px;margin-bottom:10px;">`:''}<h2 style="margin:0 0 6px;">${esc(item.headline)}</h2>${item.subtext?`<p style="color:var(--ink-soft);margin:0;">${esc(item.subtext)}</p>`:''}</div>`;
   if(item.type==='button') return `<div class="card" style="text-align:center;"><a class="btn amber" href="${esc(item.action||'#')}" target="_blank" rel="noopener" style="text-decoration:none;display:inline-block;">${esc(item.label||'Button')}</a></div>`;
@@ -1442,7 +1451,7 @@ function renderTheory(day){
       } else if(item.type==='video'){
         if(item.url) html += renderOverrideVideoItem(day.id, item, idx, dp);
       } else if(item.type==='audio'){
-        html += `<div class="card"><h3>${esc(item.title||'Audio')}</h3><audio controls onplay="markAudioPlayed(${day.id})"><source src="${esc(item.url)}"></audio></div>`;
+        if(item.url) html += `<div class="card"><h3>${esc(item.title||'Audio')}</h3>${renderAudioEmbed(item.url, 'markAudioPlayed('+day.id+')')}</div>`;
       } else if(item.type==='photo'){
         html += `<div class="card"><h3>${esc(item.title||'Photo')}</h3>${item.url?`<img src="${esc(item.url)}" style="max-width:100%;border-radius:8px;">`:'<div class="video-placeholder">No image linked yet.</div>'}${item.caption?`<p style="margin-top:8px;color:var(--ink-soft);font-size:12.5px;">${esc(item.caption)}</p>`:''}</div>`;
       }
@@ -1467,7 +1476,7 @@ function renderTheory(day){
     html+=`</div>`;
   });
   if(audioUrl){
-    html += `<div class="card"><h3>Audio narration</h3><audio controls id="theory-audio" onplay="markAudioPlayed(${day.id})"><source src="${esc(audioUrl)}"></audio></div>`;
+    html += `<div class="card"><h3>Audio narration</h3>${renderAudioEmbed(audioUrl, 'markAudioPlayed('+day.id+')')}</div>`;
   }
   html += renderExtraAudios(day.id);
   html += `<div class="card">
@@ -1549,10 +1558,9 @@ function initOverrideVideoPlayers(day){
   const ov = contentOverrides[day.id];
   if(!ov) return;
   const dp = currentUserProgress[day.id];
-  if(dp.theoryDone) return;
   (ov.content||[]).forEach((item, idx)=>{
     if(item.type!=='video') return;
-    if(dp.videoItemProgress[idx]?.done) return;
+    if(!item.url) return;
     const n = normalizeUrl(item.url);
     if(n.kind!=='youtube') return;
     const m = item.url.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([\w-]+)/);
@@ -1561,16 +1569,24 @@ function initOverrideVideoPlayers(day){
     const elId = `yt-player-${day.id}-${idx}`;
     const key = `${day.id}_${idx}`;
     if(ytPlayers[key]) return;
+    const alreadyDone = !!dp.videoItemProgress[idx]?.done;
+    const fail = (reason)=>{
+      const c = document.getElementById(elId);
+      if(c) c.innerHTML = `<div class="video-placeholder">${reason}<br><span style="font-size:11.5px;">Confirm manually below.</span></div>`;
+      if(!alreadyDone) showManualFallbackOverride(day.id, idx);
+    };
     let attempts = 0;
     const tryInit = ()=>{
       attempts++;
       if(!document.getElementById(elId)) return;
-      if(window.YT && window.YT.Player){
+      if((ytApiReady || (window.YT && window.YT.Player))){
         ytPlayers[key] = new YT.Player(elId, {
           videoId,
           events:{
             onReady:()=>{},
+            onError:()=>{ fail('This video link could not be played.'); },
             onStateChange:(e)=>{
+              if(alreadyDone) return;
               if(e.data===YT.PlayerState.PLAYING){
                 if(ytPollTimers[key]) clearInterval(ytPollTimers[key]);
                 ytPollTimers[key] = setInterval(()=>pollOverrideYT(day.id, idx, key), 2000);
@@ -1580,15 +1596,14 @@ function initOverrideVideoPlayers(day){
             }
           }
         });
-      } else if(attempts<20){
+      } else if(attempts<10){
         setTimeout(tryInit, 300);
       } else {
-        const c = document.getElementById(elId);
-        if(c) c.innerHTML = `<div class="video-placeholder">Video player unavailable.<br><span style="font-size:11.5px;">Confirm manually below.</span></div>`;
-        showManualFallbackOverride(day.id, idx);
+        fail('Video player unavailable.');
       }
     };
     tryInit();
+    if(!alreadyDone) showManualFallbackOverride(day.id, idx);
   });
 }
 function showManualFallbackOverride(dayId, idx){
@@ -1686,7 +1701,7 @@ function renderExtraVideos(dayId){
 function renderExtraAudios(dayId){
   const extras = extraAudiosCache[dayId] || [];
   if(extras.length===0) return '';
-  return extras.map(a=>`<div class="card"><h3>${esc(a.title||'Additional audio')}</h3><audio controls onplay="markAudioPlayed(${dayId})"><source src="${esc(a.url)}"></audio></div>`).join('');
+  return extras.map(a=>`<div class="card"><h3>${esc(a.title||'Additional audio')}</h3>${renderAudioEmbed(a.url, 'markAudioPlayed('+dayId+')')}</div>`).join('');
 }
 function manualVideoComplete(dayId){
   currentUserProgress[dayId].videoPct = 100;
@@ -1709,15 +1724,21 @@ function initVideoTab(day){
   if(!m) return;
   const videoId = m[1];
   const elId = 'yt-player-'+day.id;
+  const fail = (reason)=>{
+    const c = document.getElementById(elId);
+    if(c) c.innerHTML = `<div class="video-placeholder">${reason}<br><span style="font-size:11.5px;">Confirm manually below.</span></div>`;
+    showManualFallback(day.id);
+  };
   let attempts=0;
   const tryInit = ()=>{
     attempts++;
     if(!document.getElementById(elId)) return;
-    if(window.YT && window.YT.Player){
+    if((ytApiReady || (window.YT && window.YT.Player))){
       ytPlayer = new YT.Player(elId, {
         videoId,
         events:{
           onReady:()=>{},
+          onError:()=>{ fail('This video link could not be played.'); },
           onStateChange:(e)=>{
             if(e.data===YT.PlayerState.PLAYING){
               if(ytPollTimer) clearInterval(ytPollTimer);
@@ -1728,15 +1749,14 @@ function initVideoTab(day){
           }
         }
       });
-    } else if(attempts<20){
+    } else if(attempts<10){
       setTimeout(tryInit, 300);
     } else {
-      const c = document.getElementById(elId);
-      if(c) c.innerHTML = `<div class="video-placeholder">Video player unavailable.<br><span style="font-size:11.5px;">Confirm manually below.</span></div>`;
-      showManualFallback(day.id);
+      fail('Video player unavailable.');
     }
   };
   tryInit();
+  showManualFallback(day.id);
 }
 function showManualFallback(dayId){
   const wrap = document.querySelector('.video-progress-wrap');
@@ -1785,24 +1805,30 @@ function getEffectiveAssignmentIntro(dayId){
   return DAYS.find(d=>d.id===dayId).assignment.intro;
 }
 
+function getEffectiveMediaUploadEnabled(dayId){
+  const ov = contentOverrides[dayId];
+  if(ov && typeof ov.mediaUploadEnabled === 'boolean') return ov.mediaUploadEnabled;
+  return true;
+}
 function renderAssignment(day){
   const dp = currentUserProgress[day.id];
   const tasks = getEffectiveTasks(day.id);
   const intro = getEffectiveAssignmentIntro(day.id);
   while(dp.tasksChecked.length < tasks.length) dp.tasksChecked.push(false);
   const myMedia = myMediaCache[day.id] || [];
+  const uploadEnabled = getEffectiveMediaUploadEnabled(day.id);
   return `
     <div class="card"><h3>Hands-on assignment</h3><p>${esc(intro)}</p>
       ${tasks.map((t,i)=>`<div class="task-row"><input type="checkbox" id="task-${i}" ${dp.tasksChecked[i]?'checked':''} onchange="toggleTask(${day.id},${i})"><label for="task-${i}">${esc(t)}</label></div>`).join('')}
       <div class="save-note">${dp.tasksChecked.filter(Boolean).length} of ${tasks.length} tasks checked off &middot; saved automatically</div>
     </div>
-    <div class="card"><h3>Photo & video upload</h3><p style="margin-bottom:10px;">Upload photos or videos of your practical work for your trainer to review.</p>
+    ${uploadEnabled ? `<div class="card"><h3>Photo & video upload</h3><p style="margin-bottom:10px;">Upload photos or videos of your practical work for your trainer to review.</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap;">
         <label class="btn secondary small" style="cursor:pointer;">+ Upload photo<input type="file" accept="image/*" style="display:none;" onchange="handleMediaUpload(event, ${day.id}, 'photo')"></label>
         <label class="btn secondary small" style="cursor:pointer;">+ Upload video<input type="file" accept="video/*" style="display:none;" onchange="handleMediaUpload(event, ${day.id}, 'video')"></label>
       </div>
       ${myMedia.length>0 ? `<div style="margin-top:14px;">${myMedia.map(m=>renderMyMediaRow(m)).join('')}</div>` : `<p class="save-note" style="margin-top:10px;">No uploads yet for this day.</p>`}
-    </div>
+    </div>` : ''}
     <div class="card"><h3>Notes</h3><p style="margin-bottom:8px;">Optional — jot down anything worth remembering from today's practical.</p>
       <textarea class="reflect" id="reflect-box" placeholder="e.g. Struggled with brake arm alignment, need more practice.">${dp.reflection||''}</textarea>
       <div style="margin-top:10px;"><button class="btn secondary" onclick="saveReflection(${day.id})">Save note</button></div>
@@ -1831,7 +1857,7 @@ async function handleMediaUpload(event, dayId, type){
   const url = await uploadFile(path, file);
   if(!url){ showToast("Upload failed — check your connection.", 'error'); return; }
   const record = await createMediaRecord({
-    partnerId: currentUser.id, partnerName: currentUser.name, trainerName: currentUser.trainer, city: currentUser.city,
+    partnerId: currentUser.id, partnerName: currentUser.name, trainerName: currentUser.trainer, trainerId: currentUser.trainerId, city: currentUser.city,
     dayId, activityLabel: `Day ${dayId} practical`, type, storagePath: path, url
   });
   if(!record){ showToast("Couldn't save the upload record.", 'error'); return; }
@@ -2084,7 +2110,7 @@ async function renderAdminMain(){
   else if(adminTab==='tracking'){ await loadTrackingData(); el.innerHTML = renderTrackingTab(); }
   else if(adminTab==='media'){
     const all = await listAllMedia();
-    adminMediaCache = isAdminRole() ? all : all.filter(m=>m.trainerName===trainerIdentity.name);
+    adminMediaCache = isAdminRole() ? all : all.filter(m=>m.trainerId ? m.trainerId===trainerIdentity.trainerId : m.trainerName===trainerIdentity.name);
     el.innerHTML = renderMediaReviewTab();
   }
   else if(adminTab==='batches'){
@@ -3052,6 +3078,7 @@ function syncModuleDraftFromDOM(){
   if(g('draft-title')) moduleDraft.title = g('draft-title').value;
   if(g('draft-sub')) moduleDraft.sub = g('draft-sub').value;
   if(g('draft-assignment-intro')) moduleDraft.assignmentIntro = g('draft-assignment-intro').value;
+  if(g('draft-media-upload-enabled')) moduleDraft.mediaUploadEnabled = g('draft-media-upload-enabled').checked;
   moduleDraft.content.forEach((item,i)=>{
     if(item.type==='theory'){
       if(g('c-heading-'+i)) item.heading = g('c-heading-'+i).value;
@@ -3170,6 +3197,7 @@ function renderContentItemCard(item, i, total){
     fields = `
       <input class="field-input" id="c-title-${i}" value="${esc(item.title)}" placeholder="Audio title">
       <input class="field-input" id="c-url-${i}" value="${esc(item.url)}" placeholder="Audio file URL (mp3) or Google Drive share link">
+      ${!item.url ? `<div class="save-note" style="color:var(--danger);">No link set yet — partners won't see this audio at all until you add one, or delete this block.</div>` : (normalizeUrl(item.url).kind==='drive' ? `<div class="save-note">Using a Google Drive link — this only plays for partners if the file's sharing is set to "Anyone with the link," not "Restricted."</div>` : '')}
     `;
   } else if(item.type==='photo'){
     fields = `
@@ -3243,6 +3271,13 @@ function renderModuleEditorTab(){
       </div>
     `).join('')}
     <button class="btn secondary" onclick="addTask()">+ Add task</button>
+
+    <div class="card" style="margin-top:16px;">
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
+        <input type="checkbox" id="draft-media-upload-enabled" ${d.mediaUploadEnabled!==false?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
+        <span>Let partners upload photos/videos of their practical work on this day (for you to review in Media Review)</span>
+      </label>
+    </div>
 
     <h2 class="page-title" style="font-size:18px;margin-top:20px;">Assessment questions</h2>
     ${d.quiz.map((q,i)=>`
