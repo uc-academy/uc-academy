@@ -1348,6 +1348,10 @@ function renderSidebar(){
     DAYS.forEach(d=>html+=knobRow(d));
   }
   html += `
+    <div class="knob-row ${currentDay===98?'active':''}" onclick="goTo(98,'theory')">
+      <div class="knob"></div>
+      <div class="nav-text"><div class="nav-title">Key Learning Points</div><div class="nav-sub">Updates after each assessment</div></div>
+    </div>
     <div class="knob-row ${currentDay===99?'active':''}" onclick="goTo(99,'theory')">
       <div class="knob"></div>
       <div class="nav-text"><div class="nav-title">Result & Certificate</div><div class="nav-sub">${s.done===s.total?'Ready':'Locked'}</div></div>
@@ -1373,12 +1377,12 @@ function knobRow(d){
 }
 function lockedToast(d){ showToast('Day '+d+' has not been unlocked by your trainer yet.', 'error'); }
 function goTo(dayId, tab){
-  if(dayId>0 && dayId<99 && !isDayUnlocked(dayId)){ lockedToast(dayId); return; }
+  if(dayId>0 && dayId<98 && !isDayUnlocked(dayId)){ lockedToast(dayId); return; }
   cleanupPlayer();
   currentDay = dayId; currentTab = tab||'theory';
   closeSidebar();
   renderApp(); window.scrollTo(0,0);
-  if(dayId>0 && dayId<99){
+  if(dayId>0 && dayId<98){
     refreshDayContent(dayId).then(()=>{ if(currentDay===dayId){ cleanupPlayer(); renderMainOnly(); } });
   }
 }
@@ -1410,16 +1414,17 @@ async function loadMyMedia(dayId){
 }
 function renderMainOnly(){
   document.getElementById('main').innerHTML = renderCurrentPage();
-  if(currentDay>0 && currentDay<99 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay));
-  if(currentDay>0 && currentDay<99 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
+  if(currentDay>0 && currentDay<98 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay));
+  if(currentDay>0 && currentDay<98 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
 }
 function renderMain(){
   document.getElementById('main').innerHTML = renderCurrentPage();
-  if(currentDay>0 && currentDay<99 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay));
-  if(currentDay>0 && currentDay<99 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
+  if(currentDay>0 && currentDay<98 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay));
+  if(currentDay>0 && currentDay<98 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
 }
 function renderCurrentPage(){
   if(currentDay===0) return renderHome();
+  if(currentDay===98) return renderKeyLearningPoints();
   if(currentDay===99) return renderResult();
   return renderDayShell(DAYS.find(d=>d.id===currentDay));
 }
@@ -2016,6 +2021,38 @@ async function submitQuiz(dayId){
   renderMainOnly();
 }
 
+function renderKeyLearningPoints(){
+  const submittedDays = DAYS.filter(d => currentUserProgress[d.id] && currentUserProgress[d.id].quizSubmitted);
+  if(submittedDays.length===0){
+    return `
+      <div class="crumb">Key Learning Points</div>
+      <h1 class="page-title">Key Learning Points</h1>
+      <p class="page-sub">This fills in automatically as you submit each day's assessment — showing exactly what to revisit.</p>
+      <div class="lock-banner">Submit your first assessment to see your key learning points here.</div>
+    `;
+  }
+  const sections = submittedDays.map(d=>{
+    const dp = currentUserProgress[d.id];
+    const quiz = getEffectiveQuiz(d.id);
+    const wrong = [];
+    quiz.forEach((q,qi)=>{ if(dp.quizAnswers[qi] !== q.correct) wrong.push({ question:q.q, correct:q.opts[q.correct] }); });
+    const title = (contentOverrides[d.id] && contentOverrides[d.id].title) || d.title;
+    return `
+      <div class="card">
+        <h3>Day ${d.id} &middot; ${esc(isFinalDay(d.id)?'Final Assessment':title)}</h3>
+        ${wrong.length===0
+          ? `<p style="color:var(--success);">Perfect score — nothing to revisit for this day.</p>`
+          : `<ul class="list">${wrong.map(w=>`<li>${esc(w.question)} <span style="color:var(--ink-soft);">&mdash; correct answer: ${esc(w.correct)}</span></li>`).join('')}</ul>`}
+      </div>
+    `;
+  }).join('');
+  return `
+    <div class="crumb">Key Learning Points</div>
+    <h1 class="page-title">Key Learning Points</h1>
+    <p class="page-sub">Everything you missed on submitted assessments, day by day — this updates automatically each time you submit a new one.</p>
+    ${sections}
+  `;
+}
 function renderResult(){
   const s = overallStats();
   const ready = s.done===s.total && !!(s.overall && s.overall.pass);
