@@ -1240,6 +1240,18 @@ function goTo(dayId, tab){
   currentDay = dayId; currentTab = tab||'theory';
   closeSidebar();
   renderApp(); window.scrollTo(0,0);
+  if(dayId>0 && dayId<99){
+    refreshDayContent(dayId).then(()=>{ if(currentDay===dayId) renderMainOnly(); });
+  }
+}
+async function refreshDayContent(dayId){
+  videosCache[dayId] = await getVideoUrl(dayId);
+  audiosCache[dayId] = await getAudioUrl(dayId);
+  extraVideosCache[dayId] = await getExtraVideos(dayId);
+  extraAudiosCache[dayId] = await getExtraAudios(dayId);
+  const ov = await getContentOverride(dayId);
+  if(ov) contentOverrides[dayId] = migrateOldOverrideToUnified(ov);
+  else delete contentOverrides[dayId];
 }
 let myMediaCache = {};
 function setTab(tab){
@@ -2948,11 +2960,13 @@ function renderVideosTab(){
         <div style="display:flex;gap:8px;margin-bottom:10px;">
           <input class="field-input" style="margin-bottom:0;" type="text" id="v-${d.id}" value="${esc(videosCache[d.id]||'')}">
           <button class="btn secondary small" onclick="saveVideoRow(${d.id})">Save</button>
+          <button class="btn danger small" onclick="deleteVideoRow(${d.id})" ${!videosCache[d.id]?'disabled':''}>Delete</button>
         </div>
         <span class="field-label">Primary audio narration link (optional)</span>
         <div style="display:flex;gap:8px;margin-bottom:16px;">
           <input class="field-input" style="margin-bottom:0;" type="text" id="a-${d.id}" value="${esc(audiosCache[d.id]||'')}">
           <button class="btn secondary small" onclick="saveAudioRow(${d.id})">Save</button>
+          <button class="btn danger small" onclick="deleteAudioRow(${d.id})" ${!audiosCache[d.id]?'disabled':''}>Delete</button>
         </div>
         <div style="border-top:1px solid var(--line);padding-top:14px;">
           <span class="field-label">Additional videos (optional, supplementary)</span>
@@ -3034,6 +3048,24 @@ async function saveExtraAudio(dayId, idx){
 }
 async function saveVideoRow(dayId){ videosCache[dayId] = document.getElementById('v-'+dayId).value.trim(); await setVideoUrl(dayId, videosCache[dayId]); showToast('Video link saved.', 'success'); renderAdminMain(); }
 async function saveAudioRow(dayId){ audiosCache[dayId] = document.getElementById('a-'+dayId).value.trim(); await setAudioUrl(dayId, audiosCache[dayId]); showToast('Audio link saved.', 'success'); renderAdminMain(); }
+async function deleteVideoRow(dayId){
+  showConfirmModal('Remove the primary video for Day '+dayId+'?', async ()=>{
+    videosCache[dayId] = '';
+    await setVideoUrl(dayId, '');
+    await logHistory('video_removed', `Primary video removed for Day ${dayId} by ${trainerIdentity.name}`, {dayId});
+    showToast('Video removed.', 'success');
+    renderAdminMain();
+  });
+}
+async function deleteAudioRow(dayId){
+  showConfirmModal('Remove the primary audio for Day '+dayId+'?', async ()=>{
+    audiosCache[dayId] = '';
+    await setAudioUrl(dayId, '');
+    await logHistory('audio_removed', `Primary audio removed for Day ${dayId} by ${trainerIdentity.name}`, {dayId});
+    showToast('Audio removed.', 'success');
+    renderAdminMain();
+  });
+}
 
 /* ============================= PWA INSTALL ============================= */
 let deferredInstallPrompt = null;
