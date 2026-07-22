@@ -794,6 +794,10 @@ async function getVideoUrl(dayId){ const v = await kvGet('video:'+dayId); return
 async function setVideoUrl(dayId, url){ return await kvSet('video:'+dayId, {url}); }
 async function getAudioUrl(dayId){ const v = await kvGet('audio:'+dayId); return v ? v.url : ''; }
 async function setAudioUrl(dayId, url){ return await kvSet('audio:'+dayId, {url}); }
+async function getExtraVideos(dayId){ const v = await kvGet('extraVideos:'+dayId); return v ? v.items : []; }
+async function setExtraVideos(dayId, items){ return await kvSet('extraVideos:'+dayId, {items}); }
+async function getExtraAudios(dayId){ const v = await kvGet('extraAudios:'+dayId); return v ? v.items : []; }
+async function setExtraAudios(dayId, items){ return await kvSet('extraAudios:'+dayId, {items}); }
 
 async function getContentOverride(dayId){ return await kvGet('content:'+dayId); }
 async function setContentOverride(dayId, data){ return await kvSet('content:'+dayId, data); }
@@ -822,6 +826,8 @@ let currentDay = 0;
 let currentTab = 'theory';
 let adminTab = 'sessions';
 let videosCache = {};
+let extraVideosCache = {};
+let extraAudiosCache = {};
 let audiosCache = {};
 let contentOverrides = {};
 let ytPlayer = null;
@@ -1009,10 +1015,12 @@ async function loginAsPartner(id, opts){
   currentUserProgress = await getProgress(id);
   await loadAndApplyDayRegistry();
   for(const d of DAYS) ensureDay(d.id);
-  videosCache = {}; audiosCache = {}; contentOverrides = {};
+  videosCache = {}; audiosCache = {}; contentOverrides = {}; extraVideosCache = {}; extraAudiosCache = {};
   await Promise.all(DAYS.map(async d=>{
     videosCache[d.id]=await getVideoUrl(d.id);
     audiosCache[d.id]=await getAudioUrl(d.id);
+    extraVideosCache[d.id]=await getExtraVideos(d.id);
+    extraAudiosCache[d.id]=await getExtraAudios(d.id);
     const ov = await getContentOverride(d.id);
     if(ov) contentOverrides[d.id] = migrateOldOverrideToUnified(ov);
   }));
@@ -1379,6 +1387,7 @@ function renderTheory(day){
   if(audioUrl){
     html += `<div class="card"><h3>Audio narration</h3><audio controls id="theory-audio" onplay="markAudioPlayed(${day.id})"><source src="${esc(audioUrl)}"></audio></div>`;
   }
+  html += renderExtraAudios(day.id);
   html += `<div class="card">
     ${dp.theoryDone ? `<p style="color:var(--success);font-weight:500;">Theory marked complete. The video tab is unlocked below.</p>` :
     `<p>${audioUrl?'Listen to the audio above, then mark this section complete to unlock the video.':'Read through the theory above, then mark it complete to unlock the video.'}</p>
@@ -1444,7 +1453,22 @@ function renderVideo(day){
       <div class="video-progress-track"><div class="video-progress-fill" style="width:${pct}%"></div></div>
       <div class="video-progress-label">${pct}% watched ${dp.videoDone?'&middot; <span style="color:var(--success);">Unlocked next steps</span>':'&middot; needs 90% to continue'}</div>
     </div>
+    ${renderExtraVideos(day.id)}
   `;
+}
+function renderExtraVideos(dayId){
+  const extras = extraVideosCache[dayId] || [];
+  if(extras.length===0) return '';
+  return extras.map(v=>{
+    const n = normalizeUrl(v.url);
+    const inner = n.embedUrl ? `<iframe src="${esc(n.embedUrl)}" allowfullscreen></iframe>` : `<div class="video-placeholder">${v.url?'Video link not recognised.':'No video linked yet.'}</div>`;
+    return `<div class="card"><h3>${esc(v.title||'Additional video')}</h3><div class="video-frame">${inner}</div></div>`;
+  }).join('');
+}
+function renderExtraAudios(dayId){
+  const extras = extraAudiosCache[dayId] || [];
+  if(extras.length===0) return '';
+  return extras.map(a=>`<div class="card"><h3>${esc(a.title||'Additional audio')}</h3><audio controls onplay="markAudioPlayed(${dayId})"><source src="${esc(a.url)}"></audio></div>`).join('');
 }
 function manualVideoComplete(dayId){
   currentUserProgress[dayId].videoPct = 100;
@@ -1845,7 +1869,7 @@ async function renderAdminMain(){
       el.innerHTML = renderBatchesListTab();
     }
   }
-  else if(adminTab==='videos'){ videosCache={}; audiosCache={}; await Promise.all(DAYS.map(async d=>{ videosCache[d.id]=await getVideoUrl(d.id); audiosCache[d.id]=await getAudioUrl(d.id); })); el.innerHTML = renderVideosTab(); }
+  else if(adminTab==='videos'){ videosCache={}; audiosCache={}; extraVideosCache={}; extraAudiosCache={}; await Promise.all(DAYS.map(async d=>{ videosCache[d.id]=await getVideoUrl(d.id); audiosCache[d.id]=await getAudioUrl(d.id); extraVideosCache[d.id]=await getExtraVideos(d.id); extraAudiosCache[d.id]=await getExtraAudios(d.id); })); el.innerHTML = renderVideosTab(); }
 }
 
 /* ---- OVERVIEW (admin only) ---- */
@@ -2916,23 +2940,97 @@ function renderVideosTab(){
   return `
     <div class="crumb">Admin dashboard</div>
     <h1 class="page-title">Videos & audio</h1>
-    <p class="page-sub">Set the video (required for the learning flow) and an optional audio narration for each day. YouTube links get automatic watch-percentage tracking; other links need a partner's manual confirmation.</p>
+    <p class="page-sub">Set the primary video (required for the learning flow, gets automatic watch-percentage tracking on YouTube) and an optional audio narration for each day. You can also add extra videos and audio as supplementary material — these don't block progress, they just show alongside the primary content.</p>
     ${DAYS.map(d=>`
       <div class="card">
         <h3>Day ${d.id} &middot; ${d.title}</h3>
-        <span class="field-label">Video link (YouTube recommended)</span>
+        <span class="field-label">Primary video link (YouTube recommended)</span>
         <div style="display:flex;gap:8px;margin-bottom:10px;">
           <input class="field-input" style="margin-bottom:0;" type="text" id="v-${d.id}" value="${esc(videosCache[d.id]||'')}">
           <button class="btn secondary small" onclick="saveVideoRow(${d.id})">Save</button>
         </div>
-        <span class="field-label">Audio narration link (optional)</span>
-        <div style="display:flex;gap:8px;">
+        <span class="field-label">Primary audio narration link (optional)</span>
+        <div style="display:flex;gap:8px;margin-bottom:16px;">
           <input class="field-input" style="margin-bottom:0;" type="text" id="a-${d.id}" value="${esc(audiosCache[d.id]||'')}">
           <button class="btn secondary small" onclick="saveAudioRow(${d.id})">Save</button>
+        </div>
+        <div style="border-top:1px solid var(--line);padding-top:14px;">
+          <span class="field-label">Additional videos (optional, supplementary)</span>
+          ${(extraVideosCache[d.id]||[]).map((v,i)=>`
+            <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
+              <input class="field-input" style="margin-bottom:0;width:160px;" id="ev-title-${d.id}-${i}" value="${esc(v.title||'')}" placeholder="Title">
+              <input class="field-input" style="margin-bottom:0;flex:1;" id="ev-url-${d.id}-${i}" value="${esc(v.url||'')}" placeholder="YouTube, Vimeo, or Google Drive link">
+              <button class="btn secondary small" onclick="saveExtraVideo(${d.id},${i})">Save</button>
+              <button class="btn danger small" onclick="removeExtraVideo(${d.id},${i})">Delete</button>
+            </div>
+          `).join('')}
+          <button class="btn secondary small" onclick="addExtraVideo(${d.id})">+ Add video</button>
+        </div>
+        <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:14px;">
+          <span class="field-label">Additional audio (optional, supplementary)</span>
+          ${(extraAudiosCache[d.id]||[]).map((a,i)=>`
+            <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
+              <input class="field-input" style="margin-bottom:0;width:160px;" id="ea-title-${d.id}-${i}" value="${esc(a.title||'')}" placeholder="Title">
+              <input class="field-input" style="margin-bottom:0;flex:1;" id="ea-url-${d.id}-${i}" value="${esc(a.url||'')}" placeholder="Audio file URL (mp3) or Google Drive link">
+              <button class="btn secondary small" onclick="saveExtraAudio(${d.id},${i})">Save</button>
+              <button class="btn danger small" onclick="removeExtraAudio(${d.id},${i})">Delete</button>
+            </div>
+          `).join('')}
+          <button class="btn secondary small" onclick="addExtraAudio(${d.id})">+ Add audio</button>
         </div>
       </div>
     `).join('')}
   `;
+}
+async function addExtraVideo(dayId){
+  const items = extraVideosCache[dayId] || [];
+  items.push({title:'', url:''});
+  extraVideosCache[dayId] = items;
+  const ok = await setExtraVideos(dayId, items);
+  if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
+  renderAdminMain();
+}
+async function removeExtraVideo(dayId, idx){
+  const items = extraVideosCache[dayId] || [];
+  items.splice(idx,1);
+  extraVideosCache[dayId] = items;
+  await setExtraVideos(dayId, items);
+  showToast('Removed.', 'success');
+  renderAdminMain();
+}
+async function saveExtraVideo(dayId, idx){
+  const items = extraVideosCache[dayId] || [];
+  if(!items[idx]) return;
+  items[idx].title = document.getElementById(`ev-title-${dayId}-${idx}`).value.trim();
+  items[idx].url = document.getElementById(`ev-url-${dayId}-${idx}`).value.trim();
+  const ok = await setExtraVideos(dayId, items);
+  if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
+  showToast('Video saved.', 'success');
+}
+async function addExtraAudio(dayId){
+  const items = extraAudiosCache[dayId] || [];
+  items.push({title:'', url:''});
+  extraAudiosCache[dayId] = items;
+  const ok = await setExtraAudios(dayId, items);
+  if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
+  renderAdminMain();
+}
+async function removeExtraAudio(dayId, idx){
+  const items = extraAudiosCache[dayId] || [];
+  items.splice(idx,1);
+  extraAudiosCache[dayId] = items;
+  await setExtraAudios(dayId, items);
+  showToast('Removed.', 'success');
+  renderAdminMain();
+}
+async function saveExtraAudio(dayId, idx){
+  const items = extraAudiosCache[dayId] || [];
+  if(!items[idx]) return;
+  items[idx].title = document.getElementById(`ea-title-${dayId}-${idx}`).value.trim();
+  items[idx].url = document.getElementById(`ea-url-${dayId}-${idx}`).value.trim();
+  const ok = await setExtraAudios(dayId, items);
+  if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
+  showToast('Audio saved.', 'success');
 }
 async function saveVideoRow(dayId){ videosCache[dayId] = document.getElementById('v-'+dayId).value.trim(); await setVideoUrl(dayId, videosCache[dayId]); showToast('Video link saved.', 'success'); renderAdminMain(); }
 async function saveAudioRow(dayId){ audiosCache[dayId] = document.getElementById('a-'+dayId).value.trim(); await setAudioUrl(dayId, audiosCache[dayId]); showToast('Audio link saved.', 'success'); renderAdminMain(); }
