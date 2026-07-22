@@ -950,6 +950,25 @@ function findSessionForRoster(r, allSessions){
 }
 
 /* ============================= GATE ============================= */
+function renderFileProtocolWarning(){
+  const root = document.getElementById('root');
+  document.getElementById('hamburger').style.display='none';
+  root.innerHTML = `
+    <div style="max-width:560px;margin:60px auto;padding:0 20px;">
+      <div class="gate-card" style="text-align:left;">
+        <div class="gate-brand">
+          <div class="gate-mark">UC</div>
+          <div class="gate-brand-text"><div>${esc(COURSE_NAME)}</div><div style="font-weight:800;font-size:19px;">${esc(COURSE_SUB)}</div></div>
+        </div>
+        <div class="gate-msg error" style="margin-top:20px;">
+          <b>This page won't work opened this way.</b>
+          <p style="margin-top:8px;">You've opened this file directly from your computer (a <code>file://</code> link) instead of visiting the real website. In this mode, the database, videos, and uploads are all blocked by your browser for security reasons — this isn't a bug, it's expected.</p>
+          <p style="margin-top:8px;"><b>To fix it:</b> close this tab, and open your actual live site address instead (the one starting with <code>https://</code> — for example <code>https://uc-academy.github.io/uc-academy/</code>). Never open the downloaded file itself.</p>
+        </div>
+      </div>
+    </div>
+  `;
+}
 function renderGate(){
   const root = document.getElementById('root');
   document.getElementById('hamburger').style.display='none';
@@ -3489,6 +3508,10 @@ function maybeShowIOSInstallHint(){
 
 /* ============================= INIT ============================= */
 (async function init(){
+  if(window.location.protocol === 'file:' && !window.__UCA_ALLOW_FILE_PROTOCOL__){
+    renderFileProtocolWarning();
+    return;
+  }
   registerServiceWorker();
   maybeShowIOSInstallHint();
   await checkStorageAvailability();
