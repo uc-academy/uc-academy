@@ -789,6 +789,14 @@ async function listUnlocks(){
   await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out[k.slice(7)] = v.days; }));
   return out;
 }
+async function getAssessmentUnlock(city, trainer){ const v = await kvGet('assessUnlock:'+slug(city)+'__'+slug(trainer)); return v ? v.days : []; }
+async function setAssessmentUnlock(city, trainer, days){ return await kvSet('assessUnlock:'+slug(city)+'__'+slug(trainer), {days}); }
+async function listAssessmentUnlocks(){
+  const keys = await kvList('assessUnlock:');
+  const out = {};
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out[k.slice(13)] = v.days; }));
+  return out;
+}
 async function getCheckin(pid, date){ return await kvGet('checkin:'+pid+'__'+date); }
 async function setCheckin(pid, date, data){ return await kvSet('checkin:'+pid+'__'+date, data); }
 async function listCheckinsForPartner(pid){
@@ -883,6 +891,7 @@ async function loadAndApplyDayRegistry(){
 let currentUser = null;
 let currentUserProgress = {};
 let currentUserUnlockedDays = [];
+let currentUserAssessmentUnlockedDays = [];
 let trainerIdentity = null;
 let gateMode = 'partner';
 let gateError = '';
@@ -918,6 +927,12 @@ function dayRating(d){
   if(!dp.quizSubmitted) return {label:'pending', display:'Not attempted', pass:null};
   return ratingFromPct(dp.quizPct);
 }
+function nextDayForPartner(){
+  if(!currentUserUnlockedDays.length) return null;
+  const incomplete = currentUserUnlockedDays.filter(d=>!isDayComplete(d)).sort((a,b)=>a-b);
+  if(incomplete.length) return incomplete[0];
+  return Math.max(...currentUserUnlockedDays);
+}
 function isDayComplete(d){
   ensureDay(d);
   const dp = currentUserProgress[d];
@@ -931,6 +946,7 @@ function isDayStarted(d){
   return dp.theoryDone || dp.videoPct>0 || dp.quizSubmitted || dp.tasksChecked.some(Boolean);
 }
 function isDayUnlocked(d){ return currentUserUnlockedDays.includes(d); }
+function isAssessmentUnlocked(d){ return currentUserAssessmentUnlockedDays.includes(d); }
 
 function isSessionActive(s){
   if(s.override==='closed') return false;
@@ -1103,6 +1119,7 @@ async function loginAsPartner(id, opts){
   const s = result.session;
   currentUser = { id, name:r.name, officeId:r.officeId||'', city:r.city, trainer:r.trainer, trainerId:r.trainerId||null, day:s.day, open:s.open, close:s.close };
   currentUserUnlockedDays = await getUnlock(r.city, r.trainer);
+  currentUserAssessmentUnlockedDays = await getAssessmentUnlock(r.city, r.trainer);
   currentUserProgress = await getProgress(id);
   await loadAndApplyDayRegistry();
   for(const d of DAYS) ensureDay(d.id);
@@ -1351,6 +1368,7 @@ function setTab(tab){
   const dp = currentUserProgress[day.id];
   if(tab==='video' && !dp.theoryDone){ showToast('Complete the Theory (and audio, if provided) first.', 'error'); return; }
   if((tab==='assignment'||tab==='quiz') && !dp.videoDone){ showToast('Watch at least 90% of the video first.', 'error'); return; }
+  if(tab==='quiz' && !isAssessmentUnlocked(day.id)){ showToast("Your trainer hasn't unlocked this assessment yet.", 'error'); return; }
   cleanupPlayer();
   currentTab = tab; renderMainOnly();
   if(tab==='assignment') loadMyMedia(day.id);
@@ -1398,7 +1416,7 @@ function renderHome(){
     html += `<div class="today-banner"><b>Class today:</b> Day ${currentUser.day} &middot; ${esc(currentUser.city)} &middot; Trainer ${esc(currentUser.trainer)} &middot; Check-in window ${esc(currentUser.open)}&ndash;${esc(currentUser.close)}</div>`;
     html += `<div class="home-grid"><div class="stat-card"><div class="n">${s.done}/${s.total}</div><div class="l">Days complete</div></div><div class="stat-card"><div class="n">${s.pct}%</div><div class="l">Course progress</div></div><div class="stat-card"><div class="n">${currentUserUnlockedDays.length}</div><div class="l">Days unlocked</div></div></div>`;
     (ov.content||[]).forEach(item=>{ html += renderHomeContentItem(item); });
-    html += currentUserUnlockedDays.length ? `<button class="btn amber" onclick="goTo(${Math.max(...currentUserUnlockedDays)},'theory')">Go to Day ${Math.max(...currentUserUnlockedDays)} &rarr;</button>` : `<div class="lock-banner">No days are unlocked yet. Your trainer will unlock Day 1 to begin class.</div>`;
+    html += currentUserUnlockedDays.length ? `<button class="btn amber" onclick="goTo(${nextDayForPartner()},'theory')">Go to Day ${nextDayForPartner()} &rarr;</button>` : `<div class="lock-banner">No days are unlocked yet. Your trainer will unlock Day 1 to begin class.</div>`;
     return html;
   }
   return `
@@ -1418,7 +1436,7 @@ function renderHome(){
       <table class="value-table"><tr><th>Time</th><th>Block</th><th>Duration</th></tr>${HOME_SCHEDULE.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td><td class="mono">${r[2]}</td></tr>`).join('')}</table>
     </div>
     <div class="card"><h3>Non-negotiable safety rules</h3><ul class="list">${HOME_SAFETY.map(x=>`<li>${x}</li>`).join('')}</ul></div>
-    ${currentUserUnlockedDays.length ? `<button class="btn amber" onclick="goTo(${Math.max(...currentUserUnlockedDays)},'theory')">Go to Day ${Math.max(...currentUserUnlockedDays)} &rarr;</button>` : `<div class="lock-banner">No days are unlocked yet. Your trainer will unlock Day 1 to begin class.</div>`}
+    ${currentUserUnlockedDays.length ? `<button class="btn amber" onclick="goTo(${nextDayForPartner()},'theory')">Go to Day ${nextDayForPartner()} &rarr;</button>` : `<div class="lock-banner">No days are unlocked yet. Your trainer will unlock Day 1 to begin class.</div>`}
   `;
 }
 
@@ -1431,15 +1449,17 @@ function renderDayShell(day){
   const totalTasks = getEffectiveTasks(day.id).length;
   const doneTasks = dp.tasksChecked.filter(Boolean).length;
   const laterLocked = !dp.videoDone;
+  const quizLocked = laterLocked || !isAssessmentUnlocked(day.id);
+  const quizLockReason = laterLocked ? 'Complete the Theory/Video first.' : (quizLocked ? "Your trainer hasn't unlocked this assessment yet." : '');
   const tabsHtml = ov ? `
       <button class="tab-btn ${currentTab==='theory'?'active':''}" onclick="setTab('theory')">Theory${dp.theoryDone?'<span class="dot"></span>':''}</button>
       <button class="tab-btn ${currentTab==='assignment'?'active':''} ${laterLocked?'locked':''}" onclick="setTab('assignment')">Assignment${doneTasks===totalTasks && totalTasks>0?'<span class="dot"></span>':(laterLocked?'<span class="lk">&#128274;</span>':'')}</button>
-      <button class="tab-btn ${currentTab==='quiz'?'active':''} ${laterLocked?'locked':''}" onclick="setTab('quiz')">${isFinalDay(day.id)?'Final Assessment':'Assessment'}${dp.quizSubmitted?'<span class="dot"></span>':(laterLocked?'<span class="lk">&#128274;</span>':'')}</button>
+      <button class="tab-btn ${currentTab==='quiz'?'active':''} ${quizLocked?'locked':''}" onclick="setTab('quiz')" title="${esc(quizLockReason)}">${isFinalDay(day.id)?'Final Assessment':'Assessment'}${dp.quizSubmitted?'<span class="dot"></span>':(quizLocked?'<span class="lk">&#128274;</span>':'')}</button>
   ` : `
       <button class="tab-btn ${currentTab==='theory'?'active':''}" onclick="setTab('theory')">Theory${dp.theoryDone?'<span class="dot"></span>':''}</button>
       <button class="tab-btn ${currentTab==='video'?'active':''} ${!dp.theoryDone?'locked':''}" onclick="setTab('video')">Video${dp.videoDone?'<span class="dot"></span>':(!dp.theoryDone?'<span class="lk">&#128274;</span>':'')}</button>
       <button class="tab-btn ${currentTab==='assignment'?'active':''} ${laterLocked?'locked':''}" onclick="setTab('assignment')">Assignment${doneTasks===totalTasks && totalTasks>0?'<span class="dot"></span>':(laterLocked?'<span class="lk">&#128274;</span>':'')}</button>
-      <button class="tab-btn ${currentTab==='quiz'?'active':''} ${laterLocked?'locked':''}" onclick="setTab('quiz')">${isFinalDay(day.id)?'Final Assessment':'Assessment'}${dp.quizSubmitted?'<span class="dot"></span>':(laterLocked?'<span class="lk">&#128274;</span>':'')}</button>
+      <button class="tab-btn ${currentTab==='quiz'?'active':''} ${quizLocked?'locked':''}" onclick="setTab('quiz')" title="${esc(quizLockReason)}">${isFinalDay(day.id)?'Final Assessment':'Assessment'}${dp.quizSubmitted?'<span class="dot"></span>':(quizLocked?'<span class="lk">&#128274;</span>':'')}</button>
   `;
   return `
     <div class="crumb">Day ${day.id} &middot; ${day.machine==='SA'?'Semi-Automatic':day.machine==='TL'?'Top-Load':'Semi-Automatic & Top-Load'}</div>
@@ -1592,8 +1612,7 @@ function initOverrideVideoPlayers(day){
     const alreadyDone = !!dp.videoItemProgress[idx]?.done;
     const fail = (reason)=>{
       const c = document.getElementById(elId);
-      if(c) c.innerHTML = `<div class="video-placeholder">${reason}<br><span style="font-size:11.5px;">Confirm manually below.</span></div>`;
-      if(!alreadyDone) showManualFallbackOverride(day.id, idx);
+      if(c) c.innerHTML = `<div class="video-placeholder">${reason}<br><span style="font-size:11.5px;">This can't be skipped — if the video won't load, ask your trainer to unlock it for you.</span></div>`;
     };
     let attempts = 0;
     const tryInit = ()=>{
@@ -1623,7 +1642,6 @@ function initOverrideVideoPlayers(day){
       }
     };
     tryInit();
-    if(!alreadyDone) showManualFallbackOverride(day.id, idx);
   });
 }
 function showManualFallbackOverride(dayId, idx){
@@ -1746,8 +1764,7 @@ function initVideoTab(day){
   const elId = 'yt-player-'+day.id;
   const fail = (reason)=>{
     const c = document.getElementById(elId);
-    if(c) c.innerHTML = `<div class="video-placeholder">${reason}<br><span style="font-size:11.5px;">Confirm manually below.</span></div>`;
-    showManualFallback(day.id);
+    if(c) c.innerHTML = `<div class="video-placeholder">${reason}<br><span style="font-size:11.5px;">This can't be skipped — if the video won't load, ask your trainer to unlock it for you.</span></div>`;
   };
   let attempts=0;
   const tryInit = ()=>{
@@ -1776,7 +1793,6 @@ function initVideoTab(day){
     }
   };
   tryInit();
-  showManualFallback(day.id);
 }
 function showManualFallback(dayId){
   const wrap = document.querySelector('.video-progress-wrap');
@@ -2003,7 +2019,7 @@ function renderResult(){
 }
 
 /* ============================= ADMIN / TRAINER DASHBOARD ============================= */
-let adminRoster = {}; let adminSessions = []; let adminUnlocks = {}; let adminTrainers = {};
+let adminRoster = {}; let adminSessions = []; let adminUnlocks = {}; let adminAssessmentUnlocks = {}; let adminTrainers = {};
 let adminProgressCache = {}; let adminCheckinsCache = {}; let adminHistoryCache = [];
 let lastPartnerCredential = null;
 let partnersHiddenCompletedCount = 0;
@@ -2114,7 +2130,7 @@ async function renderAdminMain(){
   else if(adminTab==='trainers'){ adminTrainers = await listTrainers(); el.innerHTML = renderTrainersTab(); }
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
   else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); el.innerHTML = renderSessionsTab(); }
-  else if(adminTab==='access'){ const allR = await listRoster(); adminRoster = isAdminRole()?allR:Object.fromEntries(Object.entries(allR).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name)); adminUnlocks = await listUnlocks(); el.innerHTML = renderAccessTab(); }
+  else if(adminTab==='access'){ const allR = await listRoster(); adminRoster = isAdminRole()?allR:Object.fromEntries(Object.entries(allR).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name)); adminUnlocks = await listUnlocks(); adminAssessmentUnlocks = await listAssessmentUnlocks(); el.innerHTML = renderAccessTab(); }
   else if(adminTab==='partners'){
     const allR2 = await listRoster();
     let scoped = isAdminRole()?allR2:Object.fromEntries(Object.entries(allR2).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name));
@@ -2794,15 +2810,21 @@ function renderAccessTab(){
   return `
     <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'}</div>
     <h1 class="page-title">Day access</h1>
-    <p class="page-sub">Control which days are visible to your partners — like a certificate lock. Nothing is visible until you unlock it here.</p>
+    <p class="page-sub">Control which days are visible to your partners — like a certificate lock. Nothing is visible until you unlock it here. Assessments have their own separate unlock below — partners can't attempt one until you unlock it, even after finishing the day's video and assignment.</p>
     ${groupList.length===0?`<div class="card"><div class="empty-state">Add partners first — batches are grouped by city and trainer.</div></div>`:
     groupList.map(g=>{
       const key = slug(g.city)+'__'+slug(g.trainer);
       const unlocked = adminUnlocks[key] || [];
+      const assessUnlocked = adminAssessmentUnlocks[key] || [];
       return `<div class="card">
         <h3>${esc(g.city)} &middot; ${esc(g.trainer)}</h3>
+        <span class="field-label">Day access</span>
         <div class="day-unlock-grid">
           ${DAYS.map(d=>`<button class="day-toggle ${unlocked.includes(d.id)?'on':''}" onclick="toggleDayUnlock('${esc(g.city)}','${esc(g.trainer)}',${d.id})">Day ${d.id} ${unlocked.includes(d.id)?'&#10003;':''}</button>`).join('')}
+        </div>
+        <span class="field-label" style="margin-top:14px;">Assessment access <span style="font-weight:400;color:var(--ink-soft);text-transform:none;">— locked by default, even after Day Access is on</span></span>
+        <div class="day-unlock-grid">
+          ${DAYS.map(d=>`<button class="day-toggle ${assessUnlocked.includes(d.id)?'on':''}" onclick="toggleAssessmentUnlock('${esc(g.city)}','${esc(g.trainer)}',${d.id})">Day ${d.id} ${assessUnlocked.includes(d.id)?'&#10003;':''}</button>`).join('')}
         </div>
       </div>`;
     }).join('')}
@@ -2816,6 +2838,16 @@ async function toggleDayUnlock(city, trainer, day){
   adminUnlocks[key] = days;
   await setUnlock(city, trainer, days);
   if(wasLocked) await logHistory('day_unlocked', `Day ${day} unlocked for ${city} · ${trainer}`, {city, trainer, day});
+  renderAdminMain();
+}
+async function toggleAssessmentUnlock(city, trainer, day){
+  const key = slug(city)+'__'+slug(trainer);
+  let days = adminAssessmentUnlocks[key] || [];
+  const wasLocked = !days.includes(day);
+  days = days.includes(day) ? days.filter(d=>d!==day) : [...days, day];
+  adminAssessmentUnlocks[key] = days;
+  await setAssessmentUnlock(city, trainer, days);
+  await logHistory(wasLocked?'assessment_unlocked':'assessment_relocked', `Day ${day} assessment ${wasLocked?'unlocked':'re-locked'} for ${city} · ${trainer} by ${trainerIdentity.name}`, {city, trainer, day});
   renderAdminMain();
 }
 
@@ -2886,12 +2918,14 @@ async function deletePartnerRow(id){
 
 /* ---- TRACKING ---- */
 let trackingOverridesCache = {};
+let trackingBatchesCache = [];
 async function loadTrackingData(){
   const all = await listRoster();
   adminRoster = isAdminRole() ? all : Object.fromEntries(Object.entries(all).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name));
   const ids = Object.keys(adminRoster);
   adminProgressCache = {}; adminCheckinsCache = {}; trackingOverridesCache = {};
   await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id); if(ov) trackingOverridesCache[d.id] = ov; }));
+  trackingBatchesCache = await listAllBatches();
   await Promise.all(ids.map(async id=>{
     adminProgressCache[id] = await getProgress(id);
     adminCheckinsCache[id] = await listCheckinsForPartner(id);
@@ -2908,11 +2942,12 @@ function computeWeakAreas(prog){
     const wrong = [];
     quiz.forEach((q,qi)=>{ if(dp.quizAnswers[qi] !== q.correct) wrong.push(q.q); });
     dayFeedback[d.id] = wrong;
-    allWeak.push(...wrong);
+    wrong.forEach(w=>allWeak.push({day:d.id, text:w}));
   });
-  const uniqueWeak = [...new Set(allWeak)];
-  const overall = uniqueWeak.length ? 'Needs more practice in: '+uniqueWeak.slice(0,3).join('; ')+(uniqueWeak.length>3?' (+'+(uniqueWeak.length-3)+' more)':'') : (Object.values(dayFeedback).some(v=>v!==null) ? 'No major weak areas identified so far.' : '');
-  return { dayFeedback, overall };
+  const seen = new Set();
+  const overallList = allWeak.filter(w=>{ const k=w.day+'|'+w.text; if(seen.has(k)) return false; seen.add(k); return true; });
+  const anySubmitted = Object.values(dayFeedback).some(v=>v!==null);
+  return { dayFeedback, overallList, anySubmitted };
 }
 function renderTrackingTab(){
   const entries = Object.entries(adminRoster);
@@ -2962,15 +2997,22 @@ function renderTrackingTableInner(cityFilter, trainerFilter){
       const tip = (weak.dayFeedback[d.id]&&weak.dayFeedback[d.id].length) ? esc('Missed: '+weak.dayFeedback[d.id].join(' | ')) : 'All correct';
       return `<span class="mono" title="${tip}" style="color:${pass?'var(--success)':'var(--danger)'};cursor:help;">D${d.id}:${dp.quizScore}/${dp.quizTotal} ${pass?'PASS':'FAIL'}</span>`;
     }).join(' &nbsp; ');
+    const feedbackCell = weak.overallList.length
+      ? `<ul style="margin:0;padding-left:16px;">${weak.overallList.map(w=>`<li>Day ${w.day}: ${esc(w.text)}</li>`).join('')}</ul>`
+      : (weak.anySubmitted ? '<span style="color:var(--success);">No weak areas so far.</span>' : '<span style="color:var(--ink-soft);">—</span>');
+    const batch = r.batchId ? trackingBatchesCache.find(b=>b.id===r.batchId) : null;
+    const batchCell = batch
+      ? `Batch ${batch.batchNumber}${batch.status==='Active' ? `<br><button class="btn small secondary" style="margin-top:4px;" onclick="markBatchCompleteNow('${batch.id}')">Mark Batch Complete</button>` : ` <span class="pill scheduled" style="font-size:10px;">Completed</span>`}`
+      : '<span style="color:var(--ink-soft);">—</span>';
     return `<tr>
       <td>${esc(r.name)}</td><td>${esc(r.officeId||'—')}</td><td class="mono">${esc(id)}</td><td>${esc(r.city)}</td><td>${esc(r.trainer)}</td>
-      <td>${r.batchNumber?'Batch '+r.batchNumber:'<span style="color:var(--ink-soft);">—</span>'}</td>
+      <td style="white-space:normal;">${batchCell}</td>
       <td>${last?fmtDate(last.date)+' '+last.checkinTime:'<span style="color:var(--ink-soft);">Never</span>'}</td>
       <td>${last&&last.checkoutTime?fmtDate(last.date)+' '+last.checkoutTime:'<span style="color:var(--ink-soft);">—</span>'}</td>
       <td><b class="mono">${done}/${DAYS.length}</b></td>
       <td style="white-space:normal;font-size:11px;">${dayCells}</td>
       <td>${overallText}</td>
-      <td style="white-space:normal;font-size:11.5px;max-width:220px;">${weak.overall?esc(weak.overall):'<span style="color:var(--ink-soft);">—</span>'}</td>
+      <td style="white-space:normal;font-size:11.5px;max-width:260px;">${feedbackCell}</td>
     </tr>`;
   }).join('');
   return `<div class="card" style="overflow-x:auto;"><table class="data-table">
@@ -2982,8 +3024,8 @@ function renderTrackingTableInner(cityFilter, trainerFilter){
 async function exportExcel(){
   if(typeof XLSX==='undefined'){ showToast('Excel library did not load (no internet access?). Please try again when online.', 'error'); return; }
   const entries = Object.entries(adminRoster);
-  const summary = [['Name','Office ID','Partner ID','City','Trainer','Days Complete','Overall %','Overall Rating','Overall Pass/Fail','Last Check-in','Last Check-out']];
-  const dayScores = [['Name','Partner ID', ...DAYS.flatMap(d=>['Day'+d.id+' Score','Day'+d.id+' %','Day'+d.id+' Rating /5','Day'+d.id+' Level','Day'+d.id+' Pass/Fail'])]];
+  const summary = [['Name','Office ID','Partner ID','City','Trainer','Batch','Days Complete','Overall %','Overall Rating','Overall Pass/Fail','Last Check-in','Last Check-out','Overall Feedback']];
+  const dayScores = [['Name','Partner ID', ...DAYS.flatMap(d=>['Day'+d.id+' Score','Day'+d.id+' %','Day'+d.id+' Rating /5','Day'+d.id+' Level','Day'+d.id+' Pass/Fail','Day'+d.id+' Weak Areas'])]];
   const attendance = [['Name','Partner ID','City','Trainer','Date','Day','Check-in','Check-out']];
   for(const [id,r] of entries){
     const prog = adminProgressCache[id] || await getProgress(id);
@@ -2998,14 +3040,18 @@ async function exportExcel(){
     }
     const myCheckins = adminCheckinsCache[id] || await listCheckinsForPartner(id);
     const last = myCheckins[0];
-    summary.push([r.name, r.officeId||'', id, r.city, r.trainer, done+'/'+DAYS.length, overallPct, overallRating, overallPass, last?(last.date+' '+last.checkinTime):'', last&&last.checkoutTime?(last.date+' '+last.checkoutTime):'']);
+    const weak = computeWeakAreas(prog);
+    const feedbackText = weak.overallList.length ? weak.overallList.map(w=>`Day ${w.day}: ${w.text}`).join(' | ') : (weak.anySubmitted ? 'No weak areas so far.' : '');
+    const batchLabel = r.batchId ? ('Batch '+(trackingBatchesCache.find(b=>b.id===r.batchId)?.batchNumber||'')) : '';
+    summary.push([r.name, r.officeId||'', id, r.city, r.trainer, batchLabel, done+'/'+DAYS.length, overallPct, overallRating, overallPass, last?(last.date+' '+last.checkinTime):'', last&&last.checkoutTime?(last.date+' '+last.checkoutTime):'', feedbackText]);
     const dayRow = [r.name, id];
     DAYS.forEach(d=>{
       const dp = prog[d.id];
       if(dp && dp.quizSubmitted){
         const rr = ratingFromPct(dp.quizPct);
-        dayRow.push(dp.quizScore+'/'+dp.quizTotal, dp.quizPct, ratingOutOf5(dp.quizScore,dp.quizTotal), ratingLabel(rr), rr.pass?'Pass':'Fail');
-      } else { dayRow.push('','','','',''); }
+        const dayWeak = (weak.dayFeedback[d.id]||[]).join(' | ');
+        dayRow.push(dp.quizScore+'/'+dp.quizTotal, dp.quizPct, ratingOutOf5(dp.quizScore,dp.quizTotal), ratingLabel(rr), rr.pass?'Pass':'Fail', dayWeak);
+      } else { dayRow.push('','','','','',''); }
     });
     dayScores.push(dayRow);
     myCheckins.forEach(c=>{ attendance.push([r.name, id, r.city, r.trainer, c.date, 'Day '+c.day, c.checkinTime||'', c.checkoutTime||'']); });
