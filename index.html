@@ -772,6 +772,37 @@ async function listRoster(){
   await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out[k.slice(7)] = v; }));
   return out;
 }
+/* ---- CATEGORIES & COURSES ---- */
+const DEFAULT_CATEGORY_SEED = [
+  { name:'AC', courses:['Service Course – Split & Window','Gas Charging Course – Split & Window','Installation Course – Split & Window (All Brands)'] },
+  { name:'RWM', courses:['Washing Machine','Refrigerator','Microwave'] },
+  { name:'OA', courses:['Laptop','TV','Chimney & HOB'] },
+  { name:'Native', courses:['RO (M0, M1, M1 Pro, M2, M2 Pro, M3)','AC – Installation','AC – Repair'] },
+];
+async function listCategories(){
+  const keys = await kvList('category:');
+  const out = {};
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out[k.slice(9)] = v; }));
+  return out;
+}
+async function listCourses(){
+  const keys = await kvList('course:');
+  const out = {};
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out[k.slice(7)] = v; }));
+  return out;
+}
+async function seedDefaultCategoriesIfEmpty(){
+  const existing = await listCategories();
+  if(Object.keys(existing).length>0) return;
+  for(const cat of DEFAULT_CATEGORY_SEED){
+    const categoryId = uid();
+    await kvSet('category:'+categoryId, { name:cat.name, active:true, createdAt:new Date().toISOString() });
+    for(const courseName of cat.courses){
+      const courseId = uid();
+      await kvSet('course:'+courseId, { categoryId, name:courseName, active:true, createdAt:new Date().toISOString() });
+    }
+  }
+}
 async function listTrainers(){
   const keys = await kvList('trainer:');
   const out = {};
@@ -1421,7 +1452,7 @@ async function loginAsCC(ccId, opts){
   opts = opts || {};
   const c = await kvGet('cc:'+ccId);
   if(!c || c.active===false) return { ok:false };
-  trainerIdentity = { isAdmin:false, isCC:true, ccId, name:c.name, phone:c.phone };
+  trainerIdentity = { isAdmin:false, isCC:true, ccId, name:c.name, phone:c.phone, assignedCategories:c.assignedCategories||[] };
   if(!opts.silent) await logHistory('cc_login', `${c.name} (Content Creator) logged in`, {ccId});
   saveSession({ role:'cc', ccId });
   return { ok:true };
@@ -1444,7 +1475,7 @@ async function loginAsZT(ztId, opts){
   opts = opts || {};
   const z = await kvGet('zt:'+ztId);
   if(!z || z.active===false) return { ok:false };
-  trainerIdentity = { isAdmin:false, isZT:true, ztId, name:z.name, phone:z.phone, assignedZones:z.assignedZones||[], assignedCities:z.assignedCities||[], assignedTrainerIds:z.assignedTrainerIds||[] };
+  trainerIdentity = { isAdmin:false, isZT:true, ztId, name:z.name, phone:z.phone, assignedZones:z.assignedZones||[], assignedCities:z.assignedCities||[], assignedCategories:z.assignedCategories||[], assignedTrainerIds:z.assignedTrainerIds||[] };
   if(!opts.silent) await logHistory('zt_login', `${z.name} (Zonal Training Manager) logged in`, {ztId});
   saveSession({ role:'zt', ztId });
   return { ok:true };
@@ -2540,6 +2571,7 @@ function renderResult(){
 /* ============================= ADMIN / TRAINER DASHBOARD ============================= */
 let adminRoster = {}; let adminSessions = []; let adminUnlocks = {}; let adminAssessmentUnlocks = {}; let adminTrainers = {};
 let adminCCs = {}; let adminZTs = {}; let lastCCCredential = null; let lastZTCredential = null;
+let adminCategories = {}; let adminCourses = {};
 let adminProgressCache = {}; let adminCheckinsCache = {}; let adminHistoryCache = [];
 let lastPartnerCredential = null;
 let partnersHiddenCompletedCount = 0;
@@ -2599,6 +2631,7 @@ const ADMIN_TAB_KEYS_DEFAULT = [
   ['trainers','Trainers','Create & manage'],
   ['ccmanage','Content Creators','Manage CC access'],
   ['ztmanage','Zonal Managers','Manage ZT access & zones'],
+  ['categories','Category Management','Categories & courses'],
   ['support','Support','Requests & issues'],
   ['history','History','Audit log'],
   ['modules','Modules','Edit course content'],
@@ -2724,9 +2757,10 @@ async function renderAdminMain(){
   const el = document.getElementById('main');
   el.innerHTML = `<div class="spinner-note">Loading...</div>`;
   if(adminTab==='overview'){ el.innerHTML = await renderOverviewTabAsync(); }
-  else if(adminTab==='trainers'){ adminTrainers = await listTrainers(); el.innerHTML = renderTrainersTab(); }
-  else if(adminTab==='ccmanage'){ adminCCs = await listCCs(); el.innerHTML = renderCCManageTab(); }
-  else if(adminTab==='ztmanage'){ adminZTs = await listZTs(); adminTrainers = await listTrainers(); el.innerHTML = renderZTManageTab(); }
+  else if(adminTab==='trainers'){ adminTrainers = await listTrainers(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderTrainersTab(); }
+  else if(adminTab==='ccmanage'){ adminCCs = await listCCs(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); el.innerHTML = renderCCManageTab(); }
+  else if(adminTab==='ztmanage'){ adminZTs = await listZTs(); adminTrainers = await listTrainers(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); el.innerHTML = renderZTManageTab(); }
+  else if(adminTab==='categories'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderCategoryManageTab(); }
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
   else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); el.innerHTML = renderSessionsTab(); }
   else if(adminTab==='access'){ const allR = await listRoster(); adminRoster = Object.fromEntries(Object.entries(allR).filter(([,r])=>isRosterEntryVisibleToViewer(r))); adminUnlocks = await listUnlocks(); adminAssessmentUnlocks = await listAssessmentUnlocks(); el.innerHTML = renderAccessTab(); }
@@ -2739,6 +2773,9 @@ async function renderAdminMain(){
     adminRoster = Object.fromEntries(Object.entries(scoped).filter(([,r])=>!(r.batchId && completedBatchIds.has(r.batchId))));
     adminTrainers = await listTrainers();
     if(isZTRole()) adminTrainers = Object.fromEntries(Object.entries(adminTrainers).filter(([,t])=>cityVisibleToViewer(t.city)));
+    await seedDefaultCategoriesIfEmpty();
+    adminCategories = await listCategories();
+    adminCourses = await listCourses();
     el.innerHTML = renderPartnersTab();
   }
   else if(adminTab==='support'){ adminIssuesCache = await listIssues(); adminTrainers = await listTrainers(); el.innerHTML = renderSupportTab(); }
@@ -2836,14 +2873,22 @@ function renderTrainersTab(){
         <div><span class="field-label">Category</span><select class="field-input" id="t-category"><option value="">Select category</option>${CATEGORIES.map(c=>`<option>${c}</option>`).join('')}</select></div>
         <div><span class="field-label">City</span><select class="field-input" id="t-city"><option value="">Select city</option>${CITIES.map(c=>`<option>${c}</option>`).join('')}</select></div>
       </div>
+      <span class="field-label">Assigned courses (which courses this trainer can manage)</span>
+      <div style="margin-bottom:10px;">
+        ${Object.entries(adminCategories).map(([catId,cat])=>{
+          const courses = Object.entries(adminCourses).filter(([,c])=>c.categoryId===catId);
+          if(courses.length===0) return '';
+          return `<div style="margin-bottom:6px;"><b style="font-size:12px;">${esc(cat.name)}:</b> ${courses.map(([courseId,course])=>`<label style="display:inline-flex;gap:4px;align-items:center;margin-right:12px;cursor:pointer;"><input type="checkbox" class="t-new-course" value="${courseId}" style="accent-color:var(--brand);">${esc(course.name)}</label>`).join('')}</div>`;
+        }).join('') || '<span style="color:var(--ink-soft);font-size:12.5px;">No courses yet — add some under Category Management.</span>'}
+      </div>
       <button class="btn amber" onclick="createTrainer()">Generate trainer password</button>
     </div>
     <div class="card">
       <h3>All trainers &middot; ${entries.length}</h3>
       ${entries.length===0?`<div class="empty-state">No trainers created yet. Add your first trainer above.</div>`:`
       <table class="data-table">
-        <tr><th>Name</th><th>Phone</th><th>Category</th><th>City</th><th>Password</th><th>Created</th><th></th></tr>
-        ${entries.map(([id,t])=>`<tr><td>${esc(t.name)}</td><td>${esc(t.phone)}</td><td>${esc(t.category)}</td><td>${esc(t.city)}</td><td class="mono">${esc(t.password)}</td><td>${fmtDateTime(t.createdAt)}</td><td><button class="btn small danger" onclick="removeTrainer('${id}')">Remove</button></td></tr>`).join('')}
+        <tr><th>Name</th><th>Phone</th><th>Category</th><th>City</th><th>Assigned courses</th><th>Password</th><th>Created</th><th></th></tr>
+        ${entries.map(([id,t])=>`<tr><td>${esc(t.name)}</td><td>${esc(t.phone)}</td><td>${esc(t.category)}</td><td>${esc(t.city)}</td><td style="max-width:200px;white-space:normal;">${(t.assignedCourses||[]).map(cid=>esc(adminCourses[cid]?.name||'')).filter(Boolean).join(', ') || '<span style="color:var(--ink-soft);">— none —</span>'}</td><td class="mono">${esc(t.password)}</td><td>${fmtDateTime(t.createdAt)}</td><td><button class="btn small danger" onclick="removeTrainer('${id}')">Remove</button></td></tr>`).join('')}
       </table>`}
     </div>
   `;
@@ -2853,15 +2898,16 @@ async function createTrainer(){
   const phone = document.getElementById('t-phone').value.trim();
   const category = document.getElementById('t-category').value;
   const city = document.getElementById('t-city').value;
+  const assignedCourses = Array.from(document.querySelectorAll('.t-new-course:checked')).map(el=>el.value);
   if(!name || !phone || !category || !city){ showToast('Fill in name, phone, category, and city.', 'error'); return; }
   if(!/^\d{7,15}$/.test(phone.replace(/\D/g,''))){ showToast('Enter a valid phone number.', 'error'); return; }
   const existingTrainers = await listTrainers();
   const existingPasswords = new Set(Object.values(existingTrainers).map(t=>t.password));
   const password = genTrainerPassword(name, phone, existingPasswords);
   const trainerId = uid();
-  const ok = await kvSet('trainer:'+trainerId, { name, phone, category, city, password, createdAt:new Date().toISOString() });
+  const ok = await kvSet('trainer:'+trainerId, { name, phone, category, city, assignedCourses, password, createdAt:new Date().toISOString() });
   if(!ok){ showToast("Couldn't save — saving isn't working on this copy of the page.", 'error'); return; }
-  await logHistory('trainer_created', `Trainer ${name} created (${category} · ${city})`, {trainerId, name, category, city});
+  await logHistory('trainer_created', `Trainer ${name} created (${category} · ${city})`, {trainerId, name, category, city, assignedCourses});
   lastTrainerCredential = { name, phone, password };
   showToast(`Trainer created. Password: ${password} — share this with them.`, 'success');
   renderAdminMain();
@@ -2895,15 +2941,20 @@ function renderCCManageTab(){
         <div><span class="field-label">Name</span><input class="field-input" id="cc-name"></div>
         <div><span class="field-label">Phone number</span><input class="field-input" id="cc-phone" type="tel"></div>
       </div>
+      <span class="field-label">Assign categories (which course content they can edit)</span>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px;">
+        ${Object.entries(adminCategories).map(([id,cat])=>`<label style="display:flex;gap:6px;align-items:center;cursor:pointer;"><input type="checkbox" class="cc-new-category" value="${id}" style="accent-color:var(--brand);">${esc(cat.name)}</label>`).join('') || '<span style="color:var(--ink-soft);font-size:12.5px;">No categories yet — add one under Category Management first.</span>'}
+      </div>
       <button class="btn amber" onclick="createCC()">Generate CC password</button>
     </div>
     <div class="card">
       <h3>All Content Creators &middot; ${entries.length}</h3>
       ${entries.length===0?`<div class="empty-state">No Content Creator accounts yet.</div>`:`
       <table class="data-table">
-        <tr><th>Name</th><th>Phone</th><th>Password</th><th>Status</th><th>Created</th><th></th></tr>
+        <tr><th>Name</th><th>Phone</th><th>Password</th><th>Categories</th><th>Status</th><th>Created</th><th></th></tr>
         ${entries.map(([id,c])=>`<tr>
           <td>${esc(c.name)}</td><td>${esc(c.phone)}</td><td class="mono">${esc(c.password)}</td>
+          <td style="max-width:180px;white-space:normal;">${(c.assignedCategories||[]).map(cid=>esc(adminCategories[cid]?.name||'')).filter(Boolean).join(', ') || '<span style="color:var(--ink-soft);">— none —</span>'}</td>
           <td><span class="pill ${c.active!==false?'open':'closed'}">${c.active!==false?'Active':'Deactivated'}</span></td>
           <td>${fmtDateTime(c.createdAt)}</td>
           <td style="display:flex;gap:6px;flex-wrap:wrap;">
@@ -2919,15 +2970,16 @@ function renderCCManageTab(){
 async function createCC(){
   const name = document.getElementById('cc-name').value.trim();
   const phone = document.getElementById('cc-phone').value.trim();
+  const assignedCategories = Array.from(document.querySelectorAll('.cc-new-category:checked')).map(el=>el.value);
   if(!name || !phone){ showToast('Fill in name and phone.', 'error'); return; }
   if(!/^\d{7,15}$/.test(phone.replace(/\D/g,''))){ showToast('Enter a valid phone number.', 'error'); return; }
   const existing = await listCCs();
   const existingPasswords = new Set(Object.values(existing).map(c=>c.password));
   const password = genTrainerPassword(name, phone, existingPasswords);
   const ccId = uid();
-  const ok = await kvSet('cc:'+ccId, { name, phone, password, active:true, createdAt:new Date().toISOString() });
+  const ok = await kvSet('cc:'+ccId, { name, phone, password, active:true, assignedCategories, createdAt:new Date().toISOString() });
   if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
-  await logHistory('cc_created', `Content Creator ${name} created by ${trainerIdentity.name}`, {ccId, name});
+  await logHistory('cc_created', `Content Creator ${name} created by ${trainerIdentity.name}`, {ccId, name, assignedCategories});
   lastCCCredential = { name, phone, password };
   showToast(`Content Creator created. Password: ${password}`, 'success');
   renderAdminMain();
@@ -2992,20 +3044,26 @@ function renderZTManageTab(){
       <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px;">
         ${CITIES.map(c=>`<label style="display:flex;gap:6px;align-items:center;cursor:pointer;"><input type="checkbox" class="zt-new-city" value="${c}" style="accent-color:var(--brand);">${c} <span style="color:var(--ink-soft);font-size:11px;">(${CITY_ZONE[c]})</span></label>`).join('')}
       </div>
+      <span class="field-label">Assign categories</span>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px;">
+        ${Object.entries(adminCategories).map(([id,cat])=>`<label style="display:flex;gap:6px;align-items:center;cursor:pointer;"><input type="checkbox" class="zt-new-category" value="${id}" style="accent-color:var(--brand);">${esc(cat.name)}</label>`).join('') || '<span style="color:var(--ink-soft);font-size:12.5px;">No categories yet.</span>'}
+      </div>
       <button class="btn amber" onclick="createZT()">Generate ZT password</button>
     </div>
     <div class="card">
       <h3>All Zonal Training Managers &middot; ${entries.length}</h3>
       ${entries.length===0?`<div class="empty-state">No Zonal Training Manager accounts yet.</div>`:`
       <table class="data-table">
-        <tr><th>Name</th><th>Phone</th><th>Password</th><th>Assigned</th><th>Status</th><th></th></tr>
+        <tr><th>Name</th><th>Phone</th><th>Password</th><th>Assigned</th><th>Categories</th><th>Status</th><th></th></tr>
         ${entries.map(([id,z])=>{
           const zones = z.assignedZones||[]; const cities = z.assignedCities||[];
           const extraCities = cities.filter(c=>!zones.includes(CITY_ZONE[c]));
           const assignedText = [...zones, ...extraCities].join(', ') || '— none yet —';
+          const catText = (z.assignedCategories||[]).map(cid=>adminCategories[cid]?.name).filter(Boolean).join(', ') || '— none —';
           return `<tr>
           <td>${esc(z.name)}</td><td>${esc(z.phone)}</td><td class="mono">${esc(z.password)}</td>
           <td style="max-width:220px;white-space:normal;">${esc(assignedText)}</td>
+          <td style="max-width:180px;white-space:normal;">${esc(catText)}</td>
           <td><span class="pill ${z.active!==false?'open':'closed'}">${z.active!==false?'Active':'Deactivated'}</span></td>
           <td style="display:flex;gap:6px;flex-wrap:wrap;">
             <button class="btn small secondary" onclick="editZTAssignment('${id}')">Edit zones/cities</button>
@@ -3023,15 +3081,16 @@ async function createZT(){
   const phone = document.getElementById('zt-phone').value.trim();
   const assignedZones = Array.from(document.querySelectorAll('.zt-new-zone:checked')).map(el=>el.value);
   const assignedCities = Array.from(document.querySelectorAll('.zt-new-city:checked')).map(el=>el.value);
+  const assignedCategories = Array.from(document.querySelectorAll('.zt-new-category:checked')).map(el=>el.value);
   if(!name || !phone){ showToast('Fill in name and phone.', 'error'); return; }
   if(!/^\d{7,15}$/.test(phone.replace(/\D/g,''))){ showToast('Enter a valid phone number.', 'error'); return; }
   const existing = await listZTs();
   const existingPasswords = new Set(Object.values(existing).map(z=>z.password));
   const password = genTrainerPassword(name, phone, existingPasswords);
   const ztId = uid();
-  const ok = await kvSet('zt:'+ztId, { name, phone, password, active:true, assignedZones, assignedCities, assignedTrainerIds:[], createdAt:new Date().toISOString() });
+  const ok = await kvSet('zt:'+ztId, { name, phone, password, active:true, assignedZones, assignedCities, assignedCategories, assignedTrainerIds:[], createdAt:new Date().toISOString() });
   if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
-  await logHistory('zt_created', `Zonal Training Manager ${name} created by ${trainerIdentity.name}`, {ztId, name, assignedZones, assignedCities});
+  await logHistory('zt_created', `Zonal Training Manager ${name} created by ${trainerIdentity.name}`, {ztId, name, assignedZones, assignedCities, assignedCategories});
   lastZTCredential = { name, phone, password };
   showToast(`Zonal Training Manager created. Password: ${password}`, 'success');
   renderAdminMain();
@@ -3039,11 +3098,11 @@ async function createZT(){
 function editZTAssignment(ztId){
   const z = adminZTs[ztId];
   if(!z) return;
-  const zones = z.assignedZones||[]; const cities = z.assignedCities||[];
+  const zones = z.assignedZones||[]; const cities = z.assignedCities||[]; const cats = z.assignedCategories||[];
   const overlay = document.createElement('div');
   overlay.className = 'confirm-overlay';
   overlay.innerHTML = `<div class="confirm-box" style="max-width:520px;text-align:left;">
-    <h3 style="margin-top:0;">Zones &amp; cities for ${esc(z.name)}</h3>
+    <h3 style="margin-top:0;">Zones, cities &amp; categories for ${esc(z.name)}</h3>
     <span class="field-label">Zones</span>
     <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px;">
       ${ZONES.map(zn=>`<label style="display:flex;gap:6px;align-items:center;cursor:pointer;"><input type="checkbox" class="zt-edit-zone" value="${zn}" ${zones.includes(zn)?'checked':''} style="accent-color:var(--brand);">${zn}</label>`).join('')}
@@ -3051,6 +3110,10 @@ function editZTAssignment(ztId){
     <span class="field-label">Individual cities</span>
     <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px;">
       ${CITIES.map(c=>`<label style="display:flex;gap:6px;align-items:center;cursor:pointer;"><input type="checkbox" class="zt-edit-city" value="${c}" ${cities.includes(c)?'checked':''} style="accent-color:var(--brand);">${c}</label>`).join('')}
+    </div>
+    <span class="field-label">Categories</span>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px;">
+      ${Object.entries(adminCategories).map(([id,cat])=>`<label style="display:flex;gap:6px;align-items:center;cursor:pointer;"><input type="checkbox" class="zt-edit-category" value="${id}" ${cats.includes(id)?'checked':''} style="accent-color:var(--brand);">${esc(cat.name)}</label>`).join('') || '<span style="color:var(--ink-soft);font-size:12.5px;">No categories yet.</span>'}
     </div>
     <div class="confirm-actions">
       <button class="btn secondary" id="zt-edit-cancel">Cancel</button>
@@ -3065,8 +3128,9 @@ async function saveZTAssignment(ztId){
   if(!z) return;
   const assignedZones = Array.from(document.querySelectorAll('.zt-edit-zone:checked')).map(el=>el.value);
   const assignedCities = Array.from(document.querySelectorAll('.zt-edit-city:checked')).map(el=>el.value);
-  await kvSet('zt:'+ztId, { ...z, assignedZones, assignedCities });
-  await logHistory('zt_assignment_updated', `${z.name}'s zone/city assignment updated by ${trainerIdentity.name}`, {ztId, assignedZones, assignedCities});
+  const assignedCategories = Array.from(document.querySelectorAll('.zt-edit-category:checked')).map(el=>el.value);
+  await kvSet('zt:'+ztId, { ...z, assignedZones, assignedCities, assignedCategories });
+  await logHistory('zt_assignment_updated', `${z.name}'s zone/city/category assignment updated by ${trainerIdentity.name}`, {ztId, assignedZones, assignedCities, assignedCategories});
   document.querySelectorAll('.confirm-overlay').forEach(o=>o.remove());
   showToast('Assignment saved.', 'success');
   renderAdminMain();
@@ -3099,6 +3163,167 @@ async function removeZT(ztId){
   showConfirmModal(`Permanently remove ${z?.name||ztId}? This cannot be undone.`, async ()=>{
     await kvDelete('zt:'+ztId);
     await logHistory('zt_removed', `Zonal Training Manager ${z?.name||ztId} removed by ${trainerIdentity.name}`, {ztId});
+    renderAdminMain();
+  });
+}
+
+/* ---- CATEGORY MANAGEMENT (admin only) ---- */
+function renderCategoryManageTab(){
+  const categories = Object.entries(adminCategories);
+  return `
+    <div class="crumb">Admin dashboard</div>
+    <h1 class="page-title">Category Management</h1>
+    <p class="page-sub">Categories and their courses. This is the foundation for assigning Trainers, Content Creators, Zonal Managers, and Partners to specific categories and courses — course content itself isn't split up by category yet.</p>
+    <div class="card">
+      <h3>Add a category</h3>
+      <div style="display:flex;gap:10px;">
+        <input class="field-input" id="new-category-name" style="margin-bottom:0;flex:1;" placeholder="e.g. AC">
+        <button class="btn amber" onclick="createCategory()">Add category</button>
+      </div>
+    </div>
+    ${categories.length===0 ? `<div class="card"><div class="empty-state">No categories yet — add one above.</div></div>` :
+    categories.map(([catId,cat])=>{
+      const courses = Object.entries(adminCourses).filter(([,c])=>c.categoryId===catId);
+      return `<div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
+          <h3 style="margin:0;">${esc(cat.name)} <span class="pill ${cat.active!==false?'open':'closed'}" style="font-size:10px;">${cat.active!==false?'Active':'Disabled'}</span></h3>
+          <div style="display:flex;gap:6px;">
+            <button class="btn small secondary" onclick="renameCategory('${catId}')">Rename</button>
+            <button class="btn small secondary" onclick="toggleCategoryActive('${catId}')">${cat.active!==false?'Disable':'Enable'}</button>
+            <button class="btn small danger" onclick="removeCategory('${catId}')">Remove</button>
+          </div>
+        </div>
+        <table class="data-table">
+          <tr><th>Course</th><th>Status</th><th></th></tr>
+          ${courses.map(([courseId,course])=>`<tr>
+            <td>${esc(course.name)}</td>
+            <td><span class="pill ${course.active!==false?'open':'closed'}">${course.active!==false?'Active':'Disabled'}</span></td>
+            <td style="display:flex;gap:6px;flex-wrap:wrap;">
+              <button class="btn small secondary" onclick="renameCourse('${courseId}')">Rename</button>
+              <button class="btn small secondary" onclick="toggleCourseActive('${courseId}')">${course.active!==false?'Disable':'Enable'}</button>
+              <button class="btn small danger" onclick="removeCourse('${courseId}')">Remove</button>
+            </td>
+          </tr>`).join('')}
+        </table>
+        <div style="display:flex;gap:10px;margin-top:10px;">
+          <input class="field-input" id="new-course-name-${catId}" style="margin-bottom:0;flex:1;" placeholder="New course name">
+          <button class="btn secondary" onclick="createCourse('${catId}')">Add course</button>
+        </div>
+      </div>`;
+    }).join('')}
+  `;
+}
+async function createCategory(){
+  const nameEl = document.getElementById('new-category-name');
+  const name = nameEl.value.trim();
+  if(!name){ showToast('Enter a category name.', 'error'); return; }
+  const existing = Object.values(adminCategories).map(c=>c.name.toLowerCase());
+  if(existing.includes(name.toLowerCase())){ showToast('A category with that name already exists.', 'error'); return; }
+  const categoryId = uid();
+  await kvSet('category:'+categoryId, { name, active:true, createdAt:new Date().toISOString() });
+  await logHistory('category_created', `Category "${name}" created by ${trainerIdentity.name}`, {categoryId, name});
+  showToast('Category added.', 'success');
+  renderAdminMain();
+}
+function renameCategory(categoryId){
+  const cat = adminCategories[categoryId];
+  if(!cat) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `<div class="confirm-box" style="text-align:left;">
+    <h3 style="margin-top:0;">Rename category</h3>
+    <input class="field-input" id="rename-category-input" value="${esc(cat.name)}">
+    <div class="confirm-actions">
+      <button class="btn secondary" id="rename-cat-cancel">Cancel</button>
+      <button class="btn amber" onclick="saveCategoryRename('${categoryId}')">Save</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#rename-cat-cancel').addEventListener('click', ()=> overlay.remove());
+}
+async function saveCategoryRename(categoryId){
+  const input = document.getElementById('rename-category-input');
+  const name = input.value.trim();
+  if(!name){ showToast('Enter a name.', 'error'); return; }
+  const cat = adminCategories[categoryId];
+  await kvSet('category:'+categoryId, { ...cat, name });
+  await logHistory('category_renamed', `Category "${cat.name}" renamed to "${name}" by ${trainerIdentity.name}`, {categoryId, oldName:cat.name, newName:name});
+  document.querySelectorAll('.confirm-overlay').forEach(o=>o.remove());
+  showToast('Category renamed.', 'success');
+  renderAdminMain();
+}
+async function toggleCategoryActive(categoryId){
+  const cat = adminCategories[categoryId];
+  if(!cat) return;
+  const newActive = cat.active===false;
+  await kvSet('category:'+categoryId, { ...cat, active:newActive });
+  await logHistory(newActive?'category_enabled':'category_disabled', `Category "${cat.name}" ${newActive?'enabled':'disabled'} by ${trainerIdentity.name}`, {categoryId});
+  showToast(newActive?'Enabled.':'Disabled.', 'success');
+  renderAdminMain();
+}
+async function removeCategory(categoryId){
+  const cat = adminCategories[categoryId];
+  const courseCount = Object.values(adminCourses).filter(c=>c.categoryId===categoryId).length;
+  showConfirmModal(`Remove "${cat?.name||categoryId}"?${courseCount>0?` This will also remove its ${courseCount} course(s).`:''} This cannot be undone.`, async ()=>{
+    const coursesToRemove = Object.entries(adminCourses).filter(([,c])=>c.categoryId===categoryId);
+    for(const [courseId] of coursesToRemove){ await kvDelete('course:'+courseId); }
+    await kvDelete('category:'+categoryId);
+    await logHistory('category_removed', `Category "${cat?.name||categoryId}" removed by ${trainerIdentity.name}`, {categoryId});
+    renderAdminMain();
+  });
+}
+async function createCourse(categoryId){
+  const nameEl = document.getElementById('new-course-name-'+categoryId);
+  const name = nameEl.value.trim();
+  if(!name){ showToast('Enter a course name.', 'error'); return; }
+  const courseId = uid();
+  await kvSet('course:'+courseId, { categoryId, name, active:true, createdAt:new Date().toISOString() });
+  const cat = adminCategories[categoryId];
+  await logHistory('course_created', `Course "${name}" added under ${cat?.name||categoryId} by ${trainerIdentity.name}`, {courseId, categoryId, name});
+  showToast('Course added.', 'success');
+  renderAdminMain();
+}
+function renameCourse(courseId){
+  const course = adminCourses[courseId];
+  if(!course) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `<div class="confirm-box" style="text-align:left;">
+    <h3 style="margin-top:0;">Rename course</h3>
+    <input class="field-input" id="rename-course-input" value="${esc(course.name)}">
+    <div class="confirm-actions">
+      <button class="btn secondary" id="rename-course-cancel">Cancel</button>
+      <button class="btn amber" onclick="saveCourseRename('${courseId}')">Save</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#rename-course-cancel').addEventListener('click', ()=> overlay.remove());
+}
+async function saveCourseRename(courseId){
+  const input = document.getElementById('rename-course-input');
+  const name = input.value.trim();
+  if(!name){ showToast('Enter a name.', 'error'); return; }
+  const course = adminCourses[courseId];
+  await kvSet('course:'+courseId, { ...course, name });
+  await logHistory('course_renamed', `Course "${course.name}" renamed to "${name}" by ${trainerIdentity.name}`, {courseId, oldName:course.name, newName:name});
+  document.querySelectorAll('.confirm-overlay').forEach(o=>o.remove());
+  showToast('Course renamed.', 'success');
+  renderAdminMain();
+}
+async function toggleCourseActive(courseId){
+  const course = adminCourses[courseId];
+  if(!course) return;
+  const newActive = course.active===false;
+  await kvSet('course:'+courseId, { ...course, active:newActive });
+  await logHistory(newActive?'course_enabled':'course_disabled', `Course "${course.name}" ${newActive?'enabled':'disabled'} by ${trainerIdentity.name}`, {courseId});
+  showToast(newActive?'Enabled — this preserves all historical data.':'Disabled — new enrollment blocked, historical data untouched.', 'success');
+  renderAdminMain();
+}
+async function removeCourse(courseId){
+  const course = adminCourses[courseId];
+  showConfirmModal(`Remove "${course?.name||courseId}"? This cannot be undone.`, async ()=>{
+    await kvDelete('course:'+courseId);
+    await logHistory('course_removed', `Course "${course?.name||courseId}" removed by ${trainerIdentity.name}`, {courseId});
     renderAdminMain();
   });
 }
@@ -3820,6 +4045,7 @@ function renderPartnersTab(){
         <div><span class="field-label">Partner office ID</span><input class="field-input" id="p-office"></div>
         ${(isAdminRole()||isZTRole()) ? `<div class="full"><span class="field-label">Trainer name</span><select class="field-input" id="p-trainer-select"><option value="">Select trainer</option>${trainerOptions}</select></div>`
         : `<div class="full"><span class="field-label">Trainer name</span><div class="readonly-chip">${esc(trainerIdentity.name)} — ${esc(trainerIdentity.city)}</div></div>`}
+        <div class="full"><span class="field-label">Course</span><select class="field-input" id="p-course-select"><option value="">Select course</option>${Object.entries(adminCategories).flatMap(([catId,cat])=>Object.entries(adminCourses).filter(([,c])=>c.categoryId===catId && c.active!==false).map(([courseId,course])=>`<option value="${courseId}">${esc(cat.name)} — ${esc(course.name)}</option>`)).join('')}</select></div>
       </div>
       <button class="btn amber" onclick="createPartner()">Generate partner password</button>
     </div>
@@ -3827,8 +4053,8 @@ function renderPartnersTab(){
       <h3>All partners &middot; ${entries.length}</h3>
       ${entries.length===0?`<div class="empty-state">No partners added yet. Add your first partner above.</div>`:`
       <table class="data-table">
-        <tr><th>Name</th><th>Office ID</th><th>Partner password (ID)</th><th>City</th><th>Trainer</th><th>Created</th><th></th></tr>
-        ${entries.map(([id,r])=>`<tr><td>${esc(r.name)}</td><td>${esc(r.officeId||'—')}</td><td class="mono">${esc(id)}</td><td>${esc(r.city)}</td><td>${esc(r.trainer)}</td><td>${fmtDateTime(r.createdAt)}</td><td><button class="btn small danger" onclick="deletePartnerRow('${id}')">Remove</button></td></tr>`).join('')}
+        <tr><th>Name</th><th>Office ID</th><th>Partner password (ID)</th><th>City</th><th>Trainer</th><th>Course</th><th>Created</th><th></th></tr>
+        ${entries.map(([id,r])=>`<tr><td>${esc(r.name)}</td><td>${esc(r.officeId||'—')}</td><td class="mono">${esc(id)}</td><td>${esc(r.city)}</td><td>${esc(r.trainer)}</td><td>${esc(adminCourses[r.courseId]?.name||'—')}</td><td>${fmtDateTime(r.createdAt)}</td><td><button class="btn small danger" onclick="deletePartnerRow('${id}')">Remove</button></td></tr>`).join('')}
       </table>`}
     </div>
   `;
@@ -3836,6 +4062,7 @@ function renderPartnersTab(){
 async function createPartner(){
   const name = document.getElementById('p-name').value.trim();
   const officeId = document.getElementById('p-office').value.trim();
+  const courseId = document.getElementById('p-course-select')?.value || null;
   let trainerName, city, trainerId;
   if(isAdminRole()||isZTRole()){
     const sel = document.getElementById('p-trainer-select').value;
@@ -3849,11 +4076,11 @@ async function createPartner(){
   const existingRoster = await listRoster();
   const existingIds = new Set(Object.keys(existingRoster));
   const password = genPartnerPassword(name, officeId, existingIds);
-  const ok = await setRosterEntry(password, { name, officeId, city, trainer:trainerName, trainerId, batchId: batch?batch.id:null, batchNumber: batch?batch.batchNumber:null, createdAt:new Date().toISOString() });
+  const ok = await setRosterEntry(password, { name, officeId, city, trainer:trainerName, trainerId, courseId, batchId: batch?batch.id:null, batchNumber: batch?batch.batchNumber:null, createdAt:new Date().toISOString() });
   if(!ok){ showToast("Couldn't save this partner — can't reach the database right now. Check your connection and try again.", 'error'); return; }
   const verify = await getRosterEntry(password);
   if(!verify){ showToast("The save didn't stick. Check your connection and try again.", 'error'); return; }
-  await logHistory('partner_created', `Partner ${name} created under ${trainerName} (${city}), Batch ${batch?batch.batchNumber:'?'}`, {partnerId:password, name, trainerName, city});
+  await logHistory('partner_created', `Partner ${name} created under ${trainerName} (${city}), Batch ${batch?batch.batchNumber:'?'}`, {partnerId:password, name, trainerName, city, courseId});
   document.getElementById('p-name').value=''; document.getElementById('p-office').value='';
   lastPartnerCredential = { name, password };
   showToast(`Partner created. Password: ${password} — share this with them.`, 'success');
