@@ -914,6 +914,80 @@ Use "Manual Review" whenever the photo is unclear, doesn't clearly show the acti
     return { result:'Manual Review', score:null, mistakes:[], feedback:'AI review could not be completed automatically — please review this manually.', aiError:true };
   }
 }
+function extractVideoFrames(file, frameCount){
+  frameCount = frameCount || 4;
+  return new Promise((resolve, reject)=>{
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.muted = true;
+    video.playsInline = true;
+    const objectUrl = URL.createObjectURL(file);
+    video.src = objectUrl;
+    const frames = [];
+    let timedOut = false;
+    const timer = setTimeout(()=>{ timedOut = true; URL.revokeObjectURL(objectUrl); reject(new Error('Timed out reading video')); }, 15000);
+    video.onloadedmetadata = ()=>{
+      const duration = video.duration;
+      if(!duration || !isFinite(duration) || duration<=0){ clearTimeout(timer); URL.revokeObjectURL(objectUrl); reject(new Error('Could not read video duration')); return; }
+      const canvas = document.createElement('canvas');
+      canvas.width = 480;
+      canvas.height = Math.max(1, Math.round(480 * ((video.videoHeight||270)/(video.videoWidth||480))));
+      const ctx = canvas.getContext('2d');
+      const times = Array.from({length:frameCount}, (_,i)=> duration * (i+1)/(frameCount+1));
+      let idx = 0;
+      const captureNext = ()=>{
+        if(timedOut) return;
+        if(idx>=times.length){ clearTimeout(timer); URL.revokeObjectURL(objectUrl); resolve(frames); return; }
+        video.currentTime = times[idx];
+      };
+      video.onseeked = ()=>{
+        if(timedOut) return;
+        try{
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          frames.push(canvas.toDataURL('image/jpeg', 0.7).split(',')[1]);
+        }catch(e){}
+        idx++;
+        captureNext();
+      };
+      captureNext();
+    };
+    video.onerror = ()=>{ clearTimeout(timer); URL.revokeObjectURL(objectUrl); reject(new Error('Could not load video for frame extraction')); };
+  });
+}
+async function runAIVideoReview(frames, activityLabel, criteria){
+  try{
+    if(!frames || !frames.length) throw new Error('No frames to review');
+    const content = frames.map(f=>({type:'image', source:{type:'base64', media_type:'image/jpeg', data:f}}));
+    content.push({type:'text', text: `You are reviewing ${frames.length} still frames sampled at even intervals from a washing machine repair training video, for this activity: "${activityLabel||'practical activity'}".
+IMPORTANT: these are sampled still frames only — you cannot see motion, technique, sequence, or anything that happened between frames. Grade conservatively.
+Grading criteria: ${criteria || 'General correctness and safety of the work shown.'}
+Respond with ONLY raw JSON, no markdown formatting, no other text, in exactly this shape:
+{"result":"Pass","score":4,"mistakes":[],"feedback":"short improvement note"}
+"result" must be exactly one of: "Pass", "Fail", "Manual Review". Score is out of 5.
+Use "Manual Review" whenever the frames are unclear, don't clearly show the activity, or you are not confident enough to give a Pass/Fail from still frames alone.` });
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method:'POST',
+      headers: {
+        'Content-Type':'application/json',
+        'x-api-key': currentAiSettings.apiKey,
+        'anthropic-version':'2023-06-01',
+        'anthropic-dangerous-direct-browser-access':'true'
+      },
+      body: JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:800, messages:[{ role:'user', content }] })
+    });
+    if(!resp.ok) throw new Error('AI API returned status '+resp.status);
+    const data = await resp.json();
+    const textBlock = (data.content||[]).find(c=>c.type==='text');
+    if(!textBlock) throw new Error('No text content in AI response');
+    const clean = textBlock.text.replace(/```json|```/g,'').trim();
+    const parsed = JSON.parse(clean);
+    if(!['Pass','Fail','Manual Review'].includes(parsed.result)) throw new Error('Unexpected result value from AI');
+    return { result:parsed.result, score: typeof parsed.score==='number'?parsed.score:null, mistakes: Array.isArray(parsed.mistakes)?parsed.mistakes:[], feedback: parsed.feedback||'', sampledFrames: frames.length };
+  }catch(e){
+    console.error('AI video review failed:', e);
+    return { result:'Manual Review', score:null, mistakes:[], feedback:'AI review could not be completed automatically — please review this manually.', aiError:true };
+  }
+}
 function applyNavOrder(tabs, order){
   if(!order || !order.length) return tabs;
   const byKey = Object.fromEntries(tabs.map(t=>[t[0],t]));
@@ -1696,13 +1770,23 @@ async function handleActivityUpload(event){
   if(!url){ showToast("Upload failed — check your connection.", 'error'); return; }
 
   let aiResult = null;
-  if(mediaType==='photo' && currentAiSettings.enabled && currentAiSettings.apiKey){
-    showToast('Uploaded — running AI review...', 'info');
-    try{
-      const base64 = await fileToBase64(file);
-      aiResult = await runAIPhotoReview(base64, file.type, activityLabel, aiCriteria);
-    }catch(e){
-      aiResult = { result:'Manual Review', score:null, mistakes:[], feedback:'AI review could not be completed automatically — please review manually.', aiError:true };
+  if(currentAiSettings.enabled && currentAiSettings.apiKey){
+    if(mediaType==='photo'){
+      showToast('Uploaded — running AI review...', 'info');
+      try{
+        const base64 = await fileToBase64(file);
+        aiResult = await runAIPhotoReview(base64, file.type, activityLabel, aiCriteria);
+      }catch(e){
+        aiResult = { result:'Manual Review', score:null, mistakes:[], feedback:'AI review could not be completed automatically — please review manually.', aiError:true };
+      }
+    } else if(mediaType==='video'){
+      showToast('Uploaded — sampling frames for AI review...', 'info');
+      try{
+        const frames = await extractVideoFrames(file, 4);
+        aiResult = await runAIVideoReview(frames, activityLabel, aiCriteria);
+      }catch(e){
+        aiResult = { result:'Manual Review', score:null, mistakes:[], feedback:'AI review could not be completed automatically — please review manually.', aiError:true };
+      }
     }
   }
   const record = await createMediaRecord({
@@ -2731,18 +2815,18 @@ function renderThemeTab(){
     </div>
 
     <div class="card">
-      <h3>AI Photo Review <span class="pill scheduled" style="font-size:10px;">Beta</span></h3>
+      <h3>AI Photo &amp; Video Review <span class="pill scheduled" style="font-size:10px;">Beta</span></h3>
       <div class="gate-msg error" style="margin-bottom:12px;">
         <b>Security warning — read before enabling.</b>
         <p style="margin-top:6px;">This app has no private backend. Your API key is stored in the open database and used directly from partners' and trainers' browsers. Anyone who opens this site's developer tools could see and copy it, and use it to run up charges on your account. Only enable this with a key you're comfortable being exposed — for example, one with a strict spending limit set in your Anthropic account.</p>
       </div>
       <label style="display:flex;gap:10px;align-items:center;margin-bottom:12px;cursor:pointer;">
         <input type="checkbox" id="ai-enabled" ${aiDraft.enabled?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
-        <span>Enable AI review for photo upload activities</span>
+        <span>Enable AI review for upload activities</span>
       </label>
       <span class="field-label">Anthropic API key</span>
       <input class="field-input" id="ai-api-key" type="password" value="${esc(aiDraft.apiKey)}" placeholder="sk-ant-...">
-      <p style="font-size:12px;color:var(--ink-soft);margin-top:6px;">Applies to photo uploads only. Video uploads always go to manual Trainer/Admin review — AI review of video isn't reliable enough to offer here.</p>
+      <p style="font-size:12px;color:var(--ink-soft);margin-top:6px;">Photos are reviewed directly. Videos are reviewed by sampling a few still frames — it can't see motion or technique, so treat video results as a rougher first pass than photos. Either way, this is always a suggestion for your Trainer to confirm, never a final decision on its own.</p>
     </div>
 
     <div class="card" style="display:flex;gap:10px;flex-wrap:wrap;">
@@ -3719,17 +3803,16 @@ function renderContentItemCard(item, i, total){
     fields = `
       <input class="field-input" id="c-activitylabel-${i}" value="${esc(item.activityLabel||'')}" placeholder="Activity name (e.g. Component testing demo)">
       <span class="field-label">What should the partner upload?</span>
-      <select class="field-input" id="c-mediatype-${i}">
+      <select class="field-input" id="c-mediatype-${i}" onchange="syncModuleDraftFromDOM(); refreshModuleEditor();">
         <option value="photo" ${item.mediaType==='photo'?'selected':''}>Photo</option>
         <option value="video" ${item.mediaType==='video'?'selected':''}>Video</option>
       </select>
       <span class="field-label">Instructions shown to the partner</span>
       <textarea class="field-input reflect" id="c-instructions-${i}" style="min-height:70px;">${esc(item.instructions||'')}</textarea>
-      ${item.mediaType==='photo' ? `
-        <span class="field-label">AI grading criteria (photo only — what should the AI check for?)</span>
-        <textarea class="field-input reflect" id="c-aicriteria-${i}" style="min-height:70px;" placeholder="e.g. The multimeter probes should be correctly placed on the component terminals, and the display should show a visible reading.">${esc(item.aiCriteria||'')}</textarea>
-        ${currentAiSettings.enabled ? `<p style="font-size:12px;color:var(--ink-soft);">AI review is enabled — uploads here get an automatic Pass/Fail/Manual Review before your Trainer reviews it.</p>` : `<p style="font-size:12px;color:var(--danger);">AI review is currently OFF. Enable it in Theme &amp; Branding to use this. Until then, uploads here go straight to manual review.</p>`}
-      ` : `<p style="font-size:12px;color:var(--ink-soft);">Video uploads always go to manual Trainer/Admin review — no AI grading.</p>`}
+      <span class="field-label">AI grading criteria (what should the AI check for?)</span>
+      <textarea class="field-input reflect" id="c-aicriteria-${i}" style="min-height:70px;" placeholder="e.g. The multimeter probes should be correctly placed on the component terminals, and the display should show a visible reading.">${esc(item.aiCriteria||'')}</textarea>
+      ${item.mediaType==='video' ? `<p style="font-size:12px;color:var(--danger);">Video review samples a few still frames — it can't see motion, technique, or anything that happens between frames. Treat it as a rough first pass, more so than for photos.</p>` : ''}
+      ${currentAiSettings.enabled ? `<p style="font-size:12px;color:var(--ink-soft);">AI review is enabled — uploads here get an automatic first-pass result before your Trainer confirms it.</p>` : `<p style="font-size:12px;color:var(--danger);">AI review is currently OFF. Enable it in Theme &amp; Branding to use this. Until then, uploads here go straight to manual review.</p>`}
     `;
   }
   return `
