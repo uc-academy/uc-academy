@@ -933,7 +933,7 @@ function isCardVisible(key){ return currentLayout.overviewCards[key] !== false; 
 function isColumnVisible(key){ return currentLayout.trackingColumns[key] !== false; }
 
 /* ---- AI PHOTO REVIEW SETTINGS ---- */
-const DEFAULT_AI_SETTINGS = { enabled:false, apiKey:'' };
+const DEFAULT_AI_SETTINGS = { enabled:false, apiKey:'', chatEnabled:false };
 let currentAiSettings = { ...DEFAULT_AI_SETTINGS };
 async function getAiSettings(){ const v = await kvGet('aiSettings:config'); return v ? { ...DEFAULT_AI_SETTINGS, ...v } : { ...DEFAULT_AI_SETTINGS }; }
 async function setAiSettings(s){ return await kvSet('aiSettings:config', s); }
@@ -1057,6 +1057,69 @@ Use "Manual Review" whenever the frames are unclear, don't clearly show the acti
   }catch(e){
     console.error('AI video review failed:', e);
     return { result:'Manual Review', score:null, mistakes:[], feedback:'AI review could not be completed automatically — please review this manually.', aiError:true };
+  }
+}
+/* ---- AI TRAINER ASSISTANT ---- */
+async function createDoubtRecord(data){
+  const id = String(Date.now()).padStart(14,'0')+'_'+uid();
+  const record = { id, at:new Date().toISOString(), resolved:false, escalated:false, ...data };
+  await kvSet('doubt:'+id, record);
+  return record;
+}
+async function updateDoubtRecord(id, patch){
+  const cur = await kvGet('doubt:'+id);
+  if(!cur) return null;
+  const updated = { ...cur, ...patch };
+  await kvSet('doubt:'+id, updated);
+  return updated;
+}
+async function listDoubts(){
+  const keys = await kvList('doubt:');
+  const out = [];
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out.push(v); }));
+  return out.sort((a,b)=> new Date(b.at)-new Date(a.at));
+}
+async function askAiTrainer(question, dayId){
+  try{
+    const day = DAYS.find(d=>d.id===dayId);
+    const ov = contentOverrides[dayId];
+    const title = ov ? ov.title : (day ? day.title : '');
+    const theoryText = (ov && ov.content) ? ov.content.filter(c=>c.type==='theory').map(c=>c.heading+': '+c.body).join('\n').slice(0,2000) : '';
+    let quizTopics = '';
+    try{ quizTopics = getEffectiveQuiz(dayId).map(q=>q.q).join('; '); }catch(e){}
+    const lang = (currentUser && currentUser.preferredLanguage) || DEFAULT_LANGUAGE;
+    const history = (aiTrainerHistory[dayId]||[]).slice(-6).map(m=>({role:m.role, content:m.content}));
+
+    const systemPrompt = `You are an AI Trainer Assistant inside a technical training course, "${COURSE_NAME}". You're helping a trainee technician named ${currentUser.name}, currently on: "${title}".
+
+Theory content for this day (reference only, don't just repeat it verbatim):
+${theoryText || '(no theory content available for this day)'}
+
+This day's assessment covers these topics — do NOT reveal answers to these questions: ${quizTopics || 'none'}
+
+Your behavior:
+- Explain things in simple language with practical, real-world repair examples
+- Give step-by-step guidance, and ask a simple follow-up question when it helps clarify what the student needs
+- Keep answers SHORT — a few sentences, not an essay
+- Respond in ${lang} (natural mix matching how Indian technicians actually speak) unless the student writes in a different language, in which case match them
+- If the question is unrelated to this training course, respond with EXACTLY: "I can help you only with your assigned training course. Please ask a course-related question."
+- NEVER give direct answers to assessment/quiz questions — encourage the student to review the theory and try again instead
+- ALWAYS emphasize safety precautions relevant to electrical/appliance repair (unplugging power, water safety, etc.) when relevant
+- You cannot change scores, mark anything complete, or unlock locked content — if asked, say only their Trainer can do that`;
+
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method:'POST',
+      headers: { 'Content-Type':'application/json', 'x-api-key': currentAiSettings.apiKey, 'anthropic-version':'2023-06-01', 'anthropic-dangerous-direct-browser-access':'true' },
+      body: JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:400, system:systemPrompt, messages:[...history, {role:'user', content:question}] })
+    });
+    if(!resp.ok) throw new Error('AI API returned status '+resp.status);
+    const data = await resp.json();
+    const textBlock = (data.content||[]).find(c=>c.type==='text');
+    if(!textBlock) throw new Error('No text content in AI response');
+    return { ok:true, text: textBlock.text.trim() };
+  }catch(e){
+    console.error('AI Trainer Assistant failed:', e);
+    return { ok:false, text: "Sorry, I couldn't respond right now. Please try again, or ask your Trainer directly." };
   }
 }
 function applyNavOrder(tabs, order){
@@ -1830,12 +1893,14 @@ function renderDayShell(day){
       <button class="tab-btn ${currentTab==='assignment'?'active':''} ${laterLocked?'locked':''}" onclick="setTab('assignment')">Assignment${doneTasks===totalTasks && totalTasks>0?'<span class="dot"></span>':(laterLocked?'<span class="lk">&#128274;</span>':'')}</button>
       <button class="tab-btn ${currentTab==='quiz'?'active':''} ${quizLocked?'locked':''}" onclick="setTab('quiz')" title="${esc(quizLockReason)}">${isFinalDay(day.id)?'Final Assessment':'Assessment'}${dp.quizSubmitted?'<span class="dot"></span>':(quizLocked?'<span class="lk">&#128274;</span>':'')}</button>
   `;
+  const showAiButton = currentAiSettings.chatEnabled && currentAiSettings.apiKey && currentTab!=='quiz' && !(ov && ov.aiAssistantDisabled);
   return `
     <div class="crumb">Day ${day.id} &middot; ${day.machine==='SA'?'Semi-Automatic':day.machine==='TL'?'Top-Load':'Semi-Automatic & Top-Load'}</div>
     <h1 class="page-title">${esc(displayTitle)}</h1>
     <p class="page-sub">${esc(displaySub)}</p>
     <div class="tabs">${tabsHtml}</div>
     <div id="tab-content">${renderTab(day)}</div>
+    ${showAiButton ? `<button class="btn amber" onclick="openAiTrainerChat(${day.id})" style="position:fixed;bottom:20px;right:20px;border-radius:24px;padding:12px 18px;box-shadow:0 4px 14px rgba(0,0,0,0.25);z-index:50;">&#128172; Hello Trainer</button>` : ''}
   `;
 }
 function renderTab(day){
@@ -2273,6 +2338,10 @@ function showManualFallback(dayId){
 }
 /* ---- IN-VIDEO QUIZ (partner playback) ---- */
 let activeInVideoQuiz = null;
+let aiTrainerHistory = {};
+let aiTrainerOpen = false;
+let aiTrainerBusy = false;
+let aiTrainerRevisitCount = {};
 function checkInVideoQuizTriggers(dayId, idx, key, currentTime){
   if(idx===null || idx===undefined) return;
   if(activeInVideoQuiz) return;
@@ -2364,6 +2433,97 @@ function resumeAfterInVideoQuiz(){
   activeInVideoQuiz = null;
   const player = ytPlayers[key];
   if(player && player.playVideo) player.playVideo();
+}
+
+/* ---- AI TRAINER CHAT UI ---- */
+function openAiTrainerChat(dayId){
+  aiTrainerOpen = true;
+  if(!aiTrainerHistory[dayId]) aiTrainerHistory[dayId] = [];
+  const overlay = document.createElement('div');
+  overlay.id = 'ai-trainer-overlay';
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = renderAiTrainerChatBox(dayId);
+  document.body.appendChild(overlay);
+  const cleanup = ()=>{ if(overlay.parentNode) overlay.remove(); aiTrainerOpen=false; };
+  overlay.addEventListener('click', (e)=>{ if(e.target===overlay) cleanup(); });
+}
+function closeAiTrainerChat(){
+  const overlay = document.getElementById('ai-trainer-overlay');
+  if(overlay) overlay.remove();
+  aiTrainerOpen = false;
+}
+function renderAiTrainerChatBox(dayId){
+  const history = aiTrainerHistory[dayId] || [];
+  return `<div class="confirm-box" style="max-width:520px;text-align:left;max-height:80vh;display:flex;flex-direction:column;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <h3 style="margin:0;">AI Trainer Assistant</h3>
+      <span onclick="closeAiTrainerChat()" style="cursor:pointer;color:var(--ink-soft);font-size:20px;line-height:1;">&times;</span>
+    </div>
+    <div id="ai-trainer-messages" style="flex:1;overflow-y:auto;max-height:340px;margin-bottom:10px;padding-right:4px;">
+      ${history.length===0 ? `<p style="color:var(--ink-soft);font-size:13px;">Say "Hello Trainer" to start — ask about anything from this day's theory, video, or assignment.</p>` : ''}
+      ${history.map(m=>renderAiTrainerMessage(m)).join('')}
+    </div>
+    <div style="display:flex;gap:8px;">
+      <input class="field-input" id="ai-trainer-input" style="margin-bottom:0;flex:1;" placeholder="Hello Trainer, ..." onkeydown="if(event.key==='Enter') sendAiTrainerMessage(${dayId})" ${aiTrainerBusy?'disabled':''}>
+      <button class="btn amber" onclick="sendAiTrainerMessage(${dayId})" ${aiTrainerBusy?'disabled':''}>${aiTrainerBusy?'...':'Send'}</button>
+    </div>
+    <div style="margin-top:8px;text-align:right;">
+      <button class="btn small secondary" onclick="escalateDoubtToTrainer(${dayId})">Ask Human Trainer</button>
+    </div>
+  </div>`;
+}
+function renderAiTrainerMessage(m){
+  const mine = m.role==='user';
+  return `<div style="display:flex;justify-content:${mine?'flex-end':'flex-start'};margin-bottom:8px;">
+    <div style="max-width:82%;padding:8px 12px;border-radius:12px;font-size:13px;${mine?'background:var(--brand);color:#fff;border-bottom-right-radius:3px;':'background:var(--porcelain);color:var(--ink);border-bottom-left-radius:3px;'}">
+      ${esc(m.content)}
+      ${(!mine && m.doubtId) ? `<div style="margin-top:6px;display:flex;gap:6px;">
+        <button class="btn small secondary" style="font-size:10px;padding:4px 8px;" onclick="markDoubtHelpful('${m.doubtId}', true, this)">This helped</button>
+        <button class="btn small secondary" style="font-size:10px;padding:4px 8px;" onclick="markDoubtHelpful('${m.doubtId}', false, this)">Still confused</button>
+      </div>` : ''}
+    </div>
+  </div>`;
+}
+async function sendAiTrainerMessage(dayId){
+  const input = document.getElementById('ai-trainer-input');
+  const text = input.value.trim();
+  if(!text || aiTrainerBusy) return;
+  input.value = '';
+  if(!aiTrainerHistory[dayId]) aiTrainerHistory[dayId] = [];
+  aiTrainerHistory[dayId].push({ role:'user', content:text });
+  aiTrainerBusy = true;
+  const overlay = document.getElementById('ai-trainer-overlay');
+  if(overlay) overlay.innerHTML = renderAiTrainerChatBox(dayId);
+  const scrollBox = document.getElementById('ai-trainer-messages');
+  if(scrollBox) scrollBox.scrollTop = scrollBox.scrollHeight;
+
+  const result = await askAiTrainer(text, dayId);
+  const doubtRecord = await createDoubtRecord({
+    partnerId: currentUser.id, partnerName: currentUser.name, trainerName: currentUser.trainer, trainerId: currentUser.trainerId,
+    dayId, question:text, aiResponse:result.text, language: currentUser.preferredLanguage||DEFAULT_LANGUAGE, aiFailed: !result.ok
+  });
+  aiTrainerHistory[dayId].push({ role:'assistant', content:result.text, doubtId:doubtRecord?doubtRecord.id:null });
+  aiTrainerBusy = false;
+  const overlay2 = document.getElementById('ai-trainer-overlay');
+  if(overlay2){ overlay2.innerHTML = renderAiTrainerChatBox(dayId); const sb = document.getElementById('ai-trainer-messages'); if(sb) sb.scrollTop = sb.scrollHeight; }
+}
+async function markDoubtHelpful(doubtId, resolved, btnEl){
+  await updateDoubtRecord(doubtId, { resolved });
+  showToast(resolved ? 'Glad that helped!' : "No problem — try 'Ask Human Trainer' below for more help.", 'success');
+  if(btnEl && btnEl.parentElement) btnEl.parentElement.style.display = 'none';
+}
+async function escalateDoubtToTrainer(dayId){
+  const history = aiTrainerHistory[dayId] || [];
+  const lastQuestion = [...history].reverse().find(m=>m.role==='user');
+  const lastDoubt = [...history].reverse().find(m=>m.role==='assistant' && m.doubtId);
+  if(lastDoubt && lastDoubt.doubtId) await updateDoubtRecord(lastDoubt.doubtId, { escalated:true });
+  await createIssue({
+    type:'Other',
+    description: `Escalated doubt from ${currentUser.name} (Day ${dayId}): ${lastQuestion ? lastQuestion.content : 'Requested help from AI Trainer chat.'}`,
+    reporterName: currentUser.name, reporterPhone: '', reporterRole:'Partner'
+  });
+  showToast('Sent to your Trainer — they can see this in Support.', 'success');
+  closeAiTrainerChat();
 }
 async function pollYT(dayId){
   if(!ytPlayer || !ytPlayer.getDuration) return;
@@ -2658,6 +2818,8 @@ function startIssuePolling(){
 }
 function stopIssuePolling(){ if(issuePollTimer){ clearInterval(issuePollTimer); issuePollTimer=null; } }
 let adminMediaCache = [];
+let adminDoubtsCache = [];
+let doubtsFilterStatus = '';
 let adminBatchesCache = [];
 let themeDraft = null;
 let layoutDraft = null;
@@ -2695,6 +2857,7 @@ const ADMIN_TAB_KEYS_DEFAULT = [
   ['history','History','Audit log'],
   ['modules','Modules','Edit course content'],
   ['media','Media Review','Photo & video review'],
+  ['aidoubts','AI Doubts','Student questions & AI answers'],
   ['batches','Batches','Track by batch'],
   ['theme','Theme & Branding','Colors, logo, fonts'],
   ['sessions','Sessions','Check-in windows'],
@@ -2708,6 +2871,7 @@ const TRAINER_TAB_KEYS_DEFAULT = [
   ['partners','Partners','Your partners'],
   ['tracking','Tracking','Your partners\' scores'],
   ['media','Media Review','Photo & video review'],
+  ['aidoubts','AI Doubts','Student questions & AI answers'],
   ['batches','Batches','Your batch history'],
   ['report','Report an Issue','Get help from Admin'],
 ];
@@ -2866,6 +3030,11 @@ async function renderAdminMain(){
     const all = await listAllMedia();
     adminMediaCache = isAdminRole() ? all : all.filter(m=>m.trainerId ? m.trainerId===trainerIdentity.trainerId : m.trainerName===trainerIdentity.name);
     el.innerHTML = renderMediaReviewTab();
+  }
+  else if(adminTab==='aidoubts'){
+    const all = await listDoubts();
+    adminDoubtsCache = isAdminRole() ? all : all.filter(dt=>dt.trainerId===trainerIdentity.trainerId);
+    el.innerHTML = renderAiDoubtsTab();
   }
   else if(adminTab==='batches'){
     if(selectedBatchId){ el.innerHTML = await renderBatchDetailAsync(); }
@@ -3264,7 +3433,7 @@ function renderCategoryManageTab(){
           </div>
         </div>
         <table class="data-table">
-          <tr><th>Course</th><th>Status</th><th>Days</th><th></th></tr>
+          <tr><th>Course</th><th>Status</th><th>Content</th><th></th></tr>
           ${courses.map(([courseId,course])=>{
             const st = effectiveCourseStatus(course);
             const pillClass = st==='Live'?'open':st==='Draft'?'scheduled':st==='Archived'?'closed':'warn';
@@ -3517,6 +3686,63 @@ function renderHistoryTableInner(typeFilter){
 
 /* ---- SUPPORT / ISSUES (admin only) ---- */
 /* ---- MEDIA REVIEW ---- */
+/* ---- AI DOUBTS REVIEW ---- */
+function renderAiDoubtsTab(){
+  const filtered = doubtsFilterStatus==='unresolved' ? adminDoubtsCache.filter(d=>!d.resolved) :
+                    doubtsFilterStatus==='escalated' ? adminDoubtsCache.filter(d=>d.escalated) :
+                    doubtsFilterStatus==='failed' ? adminDoubtsCache.filter(d=>d.aiFailed) : adminDoubtsCache;
+  const dayCounts = {};
+  adminDoubtsCache.forEach(dt=>{ dayCounts[dt.dayId] = (dayCounts[dt.dayId]||0)+1; });
+  const topDays = Object.entries(dayCounts).sort((a,b)=>b[1]-a[1]).slice(0,5);
+  return `
+    <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'}</div>
+    <h1 class="page-title">AI Doubts</h1>
+    <p class="page-sub">Every question a partner asked the AI Trainer Assistant, and how it answered. Use this to spot common confusion points and step in where the AI couldn't help.</p>
+    <div class="stat-mini-grid">
+      <div class="stat-card"><div class="n">${adminDoubtsCache.length}</div><div class="l">Total questions</div></div>
+      <div class="stat-card"><div class="n">${adminDoubtsCache.filter(d=>!d.resolved).length}</div><div class="l">Not marked resolved</div></div>
+      <div class="stat-card"><div class="n">${adminDoubtsCache.filter(d=>d.escalated).length}</div><div class="l">Escalated to Trainer</div></div>
+      <div class="stat-card"><div class="n">${adminDoubtsCache.filter(d=>d.aiFailed).length}</div><div class="l">AI response failed</div></div>
+    </div>
+    ${topDays.length>0 ? `<div class="card"><h3>Most-asked days</h3>${topDays.map(([dayId,count])=>`<div style="display:flex;justify-content:space-between;padding:4px 0;font-size:13px;"><span>Day ${dayId}</span><span class="mono">${count} question${count>1?'s':''}</span></div>`).join('')}</div>` : ''}
+    <div class="filter-row">
+      <select id="doubts-status-filter" onchange="doubtsFilterStatus=this.value; renderAdminMain();">
+        <option value="">All</option>
+        <option value="unresolved" ${doubtsFilterStatus==='unresolved'?'selected':''}>Not resolved</option>
+        <option value="escalated" ${doubtsFilterStatus==='escalated'?'selected':''}>Escalated</option>
+        <option value="failed" ${doubtsFilterStatus==='failed'?'selected':''}>AI failed to respond</option>
+      </select>
+      <button class="btn secondary small" onclick="renderAdminMain()">Refresh</button>
+      <button class="btn amber small" onclick="exportDoubtsExcel()">Export Excel</button>
+    </div>
+    ${filtered.length===0?`<div class="card"><div class="empty-state">No questions match this filter.</div></div>`:
+    filtered.map(dt=>`<div class="card">
+      <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
+        <div><b>${esc(dt.partnerName)}</b> &middot; Day ${dt.dayId} &middot; ${esc(dt.language||DEFAULT_LANGUAGE)}${!isAdminRole()?'':` &middot; ${esc(dt.trainerName||'')}`}</div>
+        <div class="mono" style="font-size:11px;color:var(--ink-soft);">${fmtDateTime(dt.at)}</div>
+      </div>
+      <p style="margin:0 0 6px;"><b>Q:</b> ${esc(dt.question)}</p>
+      <p style="margin:0 0 8px;color:var(--ink-soft);"><b>AI:</b> ${esc(dt.aiResponse)}</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <span class="pill ${dt.resolved?'open':'scheduled'}">${dt.resolved?'Resolved':'Not resolved'}</span>
+        ${dt.escalated?'<span class="pill warn">Escalated</span>':''}
+        ${dt.aiFailed?'<span class="pill closed">AI failed</span>':''}
+      </div>
+    </div>`).join('')}
+  `;
+}
+async function exportDoubtsExcel(){
+  if(typeof XLSX==='undefined'){ showToast('Excel library did not load (no internet access?). Please try again when online.', 'error'); return; }
+  const rows = [['Partner','Trainer','Day','Question','AI Response','Language','Date/Time','Resolved','Escalated','AI Failed']];
+  adminDoubtsCache.forEach(dt=>{
+    rows.push([dt.partnerName, dt.trainerName||'', dt.dayId, dt.question, dt.aiResponse, dt.language||DEFAULT_LANGUAGE, fmtDateTime(dt.at), dt.resolved?'Yes':'No', dt.escalated?'Yes':'No', dt.aiFailed?'Yes':'No']);
+  });
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  XLSX.utils.book_append_sheet(wb, ws, 'AI Doubts');
+  XLSX.writeFile(wb, 'ai_doubts_export.xlsx');
+}
+
 function renderMediaReviewTab(){
   const filtered = mediaFilterStatus ? adminMediaCache.filter(m=>m.status===mediaFilterStatus) : adminMediaCache;
   const pending = filtered.filter(m=>m.status==='Pending');
@@ -3702,9 +3928,13 @@ function renderThemeTab(){
         <input type="checkbox" id="ai-enabled" ${aiDraft.enabled?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
         <span>Enable AI review for upload activities</span>
       </label>
+      <label style="display:flex;gap:10px;align-items:center;margin-bottom:12px;cursor:pointer;">
+        <input type="checkbox" id="ai-chat-enabled" ${aiDraft.chatEnabled?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
+        <span>Enable the AI Trainer Assistant ("Hello Trainer" chat) for partners</span>
+      </label>
       <span class="field-label">Anthropic API key</span>
       <input class="field-input" id="ai-api-key" type="password" value="${esc(aiDraft.apiKey)}" placeholder="sk-ant-...">
-      <p style="font-size:12px;color:var(--ink-soft);margin-top:6px;">Photos are reviewed directly. Videos are reviewed by sampling a few still frames — it can't see motion or technique, so treat video results as a rougher first pass than photos. Either way, this is always a suggestion for your Trainer to confirm, never a final decision on its own.</p>
+      <p style="font-size:12px;color:var(--ink-soft);margin-top:6px;">Photos are reviewed directly. Videos are reviewed by sampling a few still frames — it can't see motion or technique, so treat video results as a rougher first pass than photos. Either way, this is always a suggestion for your Trainer to confirm, never a final decision on its own. The AI Trainer Assistant answers course questions in chat — it can't change scores, unlock content, or mark anything complete, and it always defers assessment answers back to the student. It can still occasionally get something wrong, so treat it as a helpful first line of support, not a replacement for your Trainers.</p>
     </div>
 
     <div class="card" style="display:flex;gap:10px;flex-wrap:wrap;">
@@ -3775,8 +4005,10 @@ function syncThemeDraftFromDOM(){
 async function saveThemeDraft(){
   syncThemeDraftFromDOM();
   const enabledEl = document.getElementById('ai-enabled');
+  const chatEnabledEl = document.getElementById('ai-chat-enabled');
   const keyEl = document.getElementById('ai-api-key');
   if(enabledEl) aiDraft.enabled = enabledEl.checked;
+  if(chatEnabledEl) aiDraft.chatEnabled = chatEnabledEl.checked;
   if(keyEl) aiDraft.apiKey = keyEl.value.trim();
   const ok = await setTheme(themeDraft);
   const layoutOk = await setLayout(layoutDraft);
@@ -4623,6 +4855,7 @@ function syncModuleDraftFromDOM(){
   if(g('draft-sub')) moduleDraft.sub = g('draft-sub').value;
   if(g('draft-assignment-intro')) moduleDraft.assignmentIntro = g('draft-assignment-intro').value;
   if(g('draft-media-upload-enabled')) moduleDraft.mediaUploadEnabled = g('draft-media-upload-enabled').checked;
+  if(g('draft-ai-assistant-disabled')) moduleDraft.aiAssistantDisabled = g('draft-ai-assistant-disabled').checked;
   moduleDraft.content.forEach((item,i)=>{
     if(item.type==='theory'){
       if(g('c-heading-'+i)) item.heading = g('c-heading-'+i).value;
@@ -4968,6 +5201,10 @@ function renderModuleEditorTab(){
       <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
         <input type="checkbox" id="draft-media-upload-enabled" ${d.mediaUploadEnabled!==false?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
         <span>Let partners upload photos/videos of their practical work on this day (for you to review in Media Review)</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-top:12px;">
+        <input type="checkbox" id="draft-ai-assistant-disabled" ${d.aiAssistantDisabled?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
+        <span>Turn OFF the "Hello Trainer" AI Assistant for this day</span>
       </label>
     </div>
 
