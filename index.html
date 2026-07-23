@@ -773,6 +773,7 @@ async function listRoster(){
   return out;
 }
 /* ---- CATEGORIES & COURSES ---- */
+const COURSE_STATUSES = ['Draft','Scheduled','Live','Paused','Archived'];
 const DEFAULT_CATEGORY_SEED = [
   { name:'AC', courses:['Service Course – Split & Window','Gas Charging Course – Split & Window','Installation Course – Split & Window (All Brands)'] },
   { name:'RWM', courses:['Washing Machine','Refrigerator','Microwave'] },
@@ -862,9 +863,9 @@ async function setExtraVideos(dayId, items){ return await kvSet('extraVideos:'+d
 async function getExtraAudios(dayId){ const v = await kvGet('extraAudios:'+dayId); return v ? v.items : []; }
 async function setExtraAudios(dayId, items){ return await kvSet('extraAudios:'+dayId, {items}); }
 
-async function getContentOverride(dayId){ return await kvGet('content:'+dayId); }
-async function setContentOverride(dayId, data){ return await kvSet('content:'+dayId, data); }
-async function deleteContentOverride(dayId){ await kvDelete('content:'+dayId); }
+async function getContentOverride(dayId, courseId){ return await kvGet(courseId ? `courseContent:${courseId}:${dayId}` : 'content:'+dayId); }
+async function setContentOverride(dayId, data, courseId){ return await kvSet(courseId ? `courseContent:${courseId}:${dayId}` : 'content:'+dayId, data); }
+async function deleteContentOverride(dayId, courseId){ await kvDelete(courseId ? `courseContent:${courseId}:${dayId}` : 'content:'+dayId); }
 
 /* ---- THEME & BRANDING ---- */
 const AVAILABLE_FONTS = ['Poppins','Inter','Roboto','Lato','Montserrat','Nunito','Work Sans','Merriweather'];
@@ -1081,11 +1082,12 @@ function renderLogoMark(sizeClass){
 }
 function navLabel(key, fallback){ return (currentTheme.navLabels && currentTheme.navLabels[key]) || fallback; }
 
-async function getDayRegistry(){
-  const v = await kvGet('dayRegistry');
+async function getDayRegistry(courseId){
+  const v = await kvGet(courseId ? 'courseDayRegistry:'+courseId : 'dayRegistry');
+  if(courseId) return v ? v.days : [];
   return v ? v.days : BASE_DAYS.map(d=>d.id);
 }
-async function setDayRegistry(days){ return await kvSet('dayRegistry', {days}); }
+async function setDayRegistry(days, courseId){ return await kvSet(courseId ? 'courseDayRegistry:'+courseId : 'dayRegistry', {days}); }
 async function loadAndApplyDayRegistry(){
   const ids = await getDayRegistry();
   rebuildDaysList(ids);
@@ -2782,6 +2784,12 @@ async function renderAdminMain(){
   else if(adminTab==='report'){ adminIssuesCache = await listIssues(); el.innerHTML = renderReportIssueTab(); }
   else if(adminTab==='modules'){
     if(editingDayId){ el.innerHTML = renderModuleEditorTab(); }
+    else if(editingCourseId){
+      courseEditorDays = await getDayRegistry(editingCourseId);
+      courseEditorOverrideCache = {};
+      await Promise.all(courseEditorDays.map(async dayId=>{ courseEditorOverrideCache[dayId] = await getContentOverride(dayId, editingCourseId); }));
+      el.innerHTML = renderCourseModulesListTab();
+    }
     else{
       adminModuleStatus = {};
       await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id); adminModuleStatus[d.id] = !!ov; adminModuleOverrideCache[d.id] = ov; }));
@@ -3194,16 +3202,24 @@ function renderCategoryManageTab(){
           </div>
         </div>
         <table class="data-table">
-          <tr><th>Course</th><th>Status</th><th></th></tr>
-          ${courses.map(([courseId,course])=>`<tr>
+          <tr><th>Course</th><th>Status</th><th>Days</th><th></th></tr>
+          ${courses.map(([courseId,course])=>{
+            const st = effectiveCourseStatus(course);
+            const pillClass = st==='Live'?'open':st==='Draft'?'scheduled':st==='Archived'?'closed':'warn';
+            return `<tr>
             <td>${esc(course.name)}</td>
-            <td><span class="pill ${course.active!==false?'open':'closed'}">${course.active!==false?'Active':'Disabled'}</span></td>
+            <td>
+              <span class="pill ${pillClass}" style="margin-right:8px;">${st}</span>
+              <select style="display:inline-block;width:auto;padding:4px 8px;font-size:12px;" onchange="setCourseStatus('${courseId}', this.value)">
+                ${COURSE_STATUSES.map(s=>`<option value="${s}" ${st===s?'selected':''}>${s}</option>`).join('')}
+              </select>
+            </td>
+            <td><button class="btn small secondary" onclick="openCourseModuleEditor('${courseId}')">Edit modules</button></td>
             <td style="display:flex;gap:6px;flex-wrap:wrap;">
               <button class="btn small secondary" onclick="renameCourse('${courseId}')">Rename</button>
-              <button class="btn small secondary" onclick="toggleCourseActive('${courseId}')">${course.active!==false?'Disable':'Enable'}</button>
               <button class="btn small danger" onclick="removeCourse('${courseId}')">Remove</button>
             </td>
-          </tr>`).join('')}
+          </tr>`;}).join('')}
         </table>
         <div style="display:flex;gap:10px;margin-top:10px;">
           <input class="field-input" id="new-course-name-${catId}" style="margin-bottom:0;flex:1;" placeholder="New course name">
@@ -3277,10 +3293,10 @@ async function createCourse(categoryId){
   const name = nameEl.value.trim();
   if(!name){ showToast('Enter a course name.', 'error'); return; }
   const courseId = uid();
-  await kvSet('course:'+courseId, { categoryId, name, active:true, createdAt:new Date().toISOString() });
+  await kvSet('course:'+courseId, { categoryId, name, active:true, status:'Draft', createdAt:new Date().toISOString() });
   const cat = adminCategories[categoryId];
   await logHistory('course_created', `Course "${name}" added under ${cat?.name||categoryId} by ${trainerIdentity.name}`, {courseId, categoryId, name});
-  showToast('Course added.', 'success');
+  showToast('Course added as Draft.', 'success');
   renderAdminMain();
 }
 function renameCourse(courseId){
@@ -3310,13 +3326,16 @@ async function saveCourseRename(courseId){
   showToast('Course renamed.', 'success');
   renderAdminMain();
 }
-async function toggleCourseActive(courseId){
+function effectiveCourseStatus(course){
+  if(course.status) return course.status;
+  return course.active!==false ? 'Live' : 'Paused';
+}
+async function setCourseStatus(courseId, newStatus){
   const course = adminCourses[courseId];
   if(!course) return;
-  const newActive = course.active===false;
-  await kvSet('course:'+courseId, { ...course, active:newActive });
-  await logHistory(newActive?'course_enabled':'course_disabled', `Course "${course.name}" ${newActive?'enabled':'disabled'} by ${trainerIdentity.name}`, {courseId});
-  showToast(newActive?'Enabled — this preserves all historical data.':'Disabled — new enrollment blocked, historical data untouched.', 'success');
+  await kvSet('course:'+courseId, { ...course, status:newStatus, active: newStatus==='Live' });
+  await logHistory('course_status_changed', `Course "${course.name}" status changed to ${newStatus} by ${trainerIdentity.name}`, {courseId, newStatus});
+  showToast(`Status set to ${newStatus}.${newStatus!=='Live'?' Trainers and partners can no longer access it. Historical data is untouched.':''}`, 'success');
   renderAdminMain();
 }
 async function removeCourse(courseId){
@@ -4269,7 +4288,63 @@ async function exportExcel(){
 
 /* ---- VIDEOS & AUDIO (admin only in nav, function shared) ---- */
 /* ---- MODULES (CMS) — admin only ---- */
+let courseEditorDays = [];
+let courseEditorOverrideCache = {};
+async function openCourseModuleEditor(courseId){
+  editingCourseId = courseId;
+  editingDayId = null;
+  adminTab = 'modules';
+  renderAdminSidebar();
+  renderAdminMain();
+}
+function renderCourseModulesListTab(){
+  const course = adminCourses[editingCourseId];
+  const cat = course ? adminCategories[course.categoryId] : null;
+  return `
+    <div class="crumb">Admin dashboard &middot; Category Management${cat?' &middot; '+esc(cat.name):''}</div>
+    <h1 class="page-title">${esc(course?.name||'Course')} — Modules</h1>
+    <p class="page-sub">This course's own days, completely separate from any other course. Nothing changes for trainers or partners until you Save &amp; Publish each day.</p>
+    <button class="btn secondary small" onclick="editingCourseId=null; setAdminTab('categories');" style="margin-bottom:14px;">&larr; Back to Category Management</button>
+    ${courseEditorDays.length===0 ? `<div class="card"><div class="empty-state">No days yet for this course — add the first one below.</div></div>` : ''}
+    ${courseEditorDays.map(dayId=>`
+      <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+        <div>
+          <h3 style="margin-bottom:2px;">Day ${dayId} &middot; ${esc(courseEditorOverrideCache[dayId]?.title || 'Untitled')}</h3>
+          <span class="pill ${courseEditorOverrideCache[dayId]?'open':'scheduled'}">${courseEditorOverrideCache[dayId]?'Has content':'Empty'}</span>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn danger small" onclick="deleteCourseDay(${dayId})">Delete</button>
+          <button class="btn amber small" onclick="openModuleEditor(${dayId}, '${editingCourseId}')">Edit &rarr;</button>
+        </div>
+      </div>
+    `).join('')}
+    <button class="btn secondary" onclick="addNewCourseDay()" style="margin-top:6px;">+ Add new day</button>
+  `;
+}
+async function addNewCourseDay(){
+  const newId = Math.max(0, ...courseEditorDays) + 1;
+  const newIds = [...courseEditorDays, newId];
+  const ok = await setDayRegistry(newIds, editingCourseId);
+  if(!ok){ showToast("Couldn't add a day — check your connection.", 'error'); return; }
+  await logHistory('course_day_added', `Day ${newId} added to course ${adminCourses[editingCourseId]?.name||editingCourseId} by ${trainerIdentity.name}`, {dayId:newId, courseId:editingCourseId});
+  showToast(`Day ${newId} added — opening editor.`, 'success');
+  await openModuleEditor(newId, editingCourseId);
+}
+async function deleteCourseDay(dayId){
+  showConfirmModal(`Delete Day ${dayId} from this course? Any existing partner progress for this day is kept in storage, not erased.`, async ()=>{
+    const newIds = courseEditorDays.filter(id=>id!==dayId);
+    const ok = await setDayRegistry(newIds, editingCourseId);
+    if(!ok){ showToast("Couldn't delete — check your connection.", 'error'); return; }
+    await logHistory('course_day_deleted', `Day ${dayId} removed from course ${adminCourses[editingCourseId]?.name||editingCourseId} by ${trainerIdentity.name}`, {dayId, courseId:editingCourseId});
+    showToast(`Day ${dayId} removed.`, 'success');
+    openCourseModuleEditor(editingCourseId);
+  });
+}
 let editingDayId = null;
+let editingCourseId = null;
+function blankCourseModuleDraft(){
+  return { title:'New day', sub:'', content:[], assignmentIntro:'', tasks:[], mediaUploadEnabled:true, quiz:[] };
+}
 let moduleDraft = null;
 let adminModuleStatus = {};
 let adminModuleOverrideCache = {};
@@ -4346,15 +4421,18 @@ function defaultHomeBlocks(){
     assignmentIntro:'', tasks:[], quiz:[]
   };
 }
-async function openModuleEditor(dayId){
+async function openModuleEditor(dayId, courseId){
   editingDayId = dayId;
-  if(dayId!=='home'){
+  editingCourseId = courseId || null;
+  if(!courseId && dayId!=='home'){
     if(videosCache[dayId]===undefined) videosCache[dayId] = await getVideoUrl(dayId);
     if(audiosCache[dayId]===undefined) audiosCache[dayId] = await getAudioUrl(dayId);
   }
-  const ov = await getContentOverride(dayId);
+  const ov = await getContentOverride(dayId, courseId);
   if(ov){
     moduleDraft = migrateOldOverrideToUnified(JSON.parse(JSON.stringify(ov)));
+  } else if(courseId){
+    moduleDraft = blankCourseModuleDraft();
   } else if(dayId==='home'){
     moduleDraft = defaultHomeBlocks();
   } else {
@@ -4364,9 +4442,12 @@ async function openModuleEditor(dayId){
   renderAdminMain();
 }
 function closeModuleEditor(){
+  const wasEditingCourse = editingCourseId;
   editingDayId = null;
   moduleDraft = null;
-  renderAdminMain();
+  editingCourseId = null;
+  if(wasEditingCourse){ openCourseModuleEditor(wasEditingCourse); }
+  else { renderAdminMain(); }
 }
 function refreshModuleEditor(){
   document.getElementById('main').innerHTML = renderModuleEditorTab();
@@ -4578,19 +4659,19 @@ function moveQuizQuestion(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<
 async function saveModuleDraft(){
   syncModuleDraftFromDOM();
   if(!moduleDraft.title.trim()){ showToast('Give it a title.', 'error'); return; }
-  if(editingDayId!=='home' && moduleDraft.quiz.length===0){ showToast('Add at least one assessment question.', 'error'); return; }
-  const ok = await setContentOverride(editingDayId, moduleDraft);
+  if(!editingCourseId && editingDayId!=='home' && moduleDraft.quiz.length===0){ showToast('Add at least one assessment question.', 'error'); return; }
+  const ok = await setContentOverride(editingDayId, moduleDraft, editingCourseId);
   if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
   const label = editingDayId==='home' ? 'Home Page' : 'Day '+editingDayId;
-  await logHistory('module_edited', `${label} content edited and published by ${trainerIdentity.name}`, {dayId:editingDayId});
+  await logHistory('module_edited', `${label} content edited and published by ${trainerIdentity.name}${editingCourseId?` (course ${adminCourses[editingCourseId]?.name||editingCourseId})`:''}`, {dayId:editingDayId, courseId:editingCourseId||null});
   showToast('Saved and published.', 'success');
   closeModuleEditor();
 }
 async function resetModuleToDefault(){
   const label = editingDayId==='home' ? 'the Home Page' : 'Day '+editingDayId;
   showConfirmModal('Revert '+label+' to the original default content? Your customizations will be deleted.', async ()=>{
-    await deleteContentOverride(editingDayId);
-    await logHistory('module_reset', `Day ${editingDayId} reverted to default content by ${trainerIdentity.name}`, {dayId:editingDayId});
+    await deleteContentOverride(editingDayId, editingCourseId);
+    await logHistory('module_reset', `Day ${editingDayId} reverted to default content by ${trainerIdentity.name}`, {dayId:editingDayId, courseId:editingCourseId||null});
     showToast('Reverted to default content.', 'success');
     closeModuleEditor();
   });
