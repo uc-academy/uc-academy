@@ -774,6 +774,26 @@ async function listRoster(){
 }
 /* ---- CATEGORIES & COURSES ---- */
 const COURSE_STATUSES = ['Draft','Scheduled','Live','Paused','Archived'];
+const DEFAULT_LANGUAGE = 'Hinglish';
+async function listLanguages(){
+  const keys = await kvList('language:');
+  const out = {};
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out[k.slice(9)] = v; }));
+  return out;
+}
+async function seedDefaultLanguageIfEmpty(){
+  const existing = await listLanguages();
+  if(Object.keys(existing).length>0) return;
+  await kvSet('language:'+DEFAULT_LANGUAGE, { name:DEFAULT_LANGUAGE, isDefault:true, active:true, createdAt:new Date().toISOString() });
+}
+async function getContentOverrideWithFallback(dayId, courseId, lang){
+  if(lang && lang!==DEFAULT_LANGUAGE){
+    const v = await getContentOverride(dayId, courseId, lang);
+    if(v) return { data:v, lang, usedFallback:false };
+  }
+  const fallback = await getContentOverride(dayId, courseId, DEFAULT_LANGUAGE);
+  return { data:fallback, lang:DEFAULT_LANGUAGE, usedFallback: !!(lang && lang!==DEFAULT_LANGUAGE) };
+}
 const DEFAULT_CATEGORY_SEED = [
   { name:'AC', courses:['Service Course – Split & Window','Gas Charging Course – Split & Window','Installation Course – Split & Window (All Brands)'] },
   { name:'RWM', courses:['Washing Machine','Refrigerator','Microwave'] },
@@ -863,9 +883,13 @@ async function setExtraVideos(dayId, items){ return await kvSet('extraVideos:'+d
 async function getExtraAudios(dayId){ const v = await kvGet('extraAudios:'+dayId); return v ? v.items : []; }
 async function setExtraAudios(dayId, items){ return await kvSet('extraAudios:'+dayId, {items}); }
 
-async function getContentOverride(dayId, courseId){ return await kvGet(courseId ? `courseContent:${courseId}:${dayId}` : 'content:'+dayId); }
-async function setContentOverride(dayId, data, courseId){ return await kvSet(courseId ? `courseContent:${courseId}:${dayId}` : 'content:'+dayId, data); }
-async function deleteContentOverride(dayId, courseId){ await kvDelete(courseId ? `courseContent:${courseId}:${dayId}` : 'content:'+dayId); }
+function contentKey(dayId, courseId, lang){
+  const langSuffix = (lang && lang!==DEFAULT_LANGUAGE) ? ':'+lang : '';
+  return courseId ? `courseContent:${courseId}:${dayId}${langSuffix}` : `content:${dayId}${langSuffix}`;
+}
+async function getContentOverride(dayId, courseId, lang){ return await kvGet(contentKey(dayId, courseId, lang)); }
+async function setContentOverride(dayId, data, courseId, lang){ return await kvSet(contentKey(dayId, courseId, lang), data); }
+async function deleteContentOverride(dayId, courseId, lang){ await kvDelete(contentKey(dayId, courseId, lang)); }
 
 /* ---- THEME & BRANDING ---- */
 const AVAILABLE_FONTS = ['Poppins','Inter','Roboto','Lato','Montserrat','Nunito','Work Sans','Merriweather'];
@@ -1111,6 +1135,8 @@ let extraVideosCache = {};
 let extraAudiosCache = {};
 let audiosCache = {};
 let contentOverrides = {};
+let contentUsedFallbackLanguage = false;
+let partnerAvailableLanguages = [];
 function mergeWatchRanges(ranges){
   if(!ranges || !ranges.length) return [];
   const sorted = ranges.map(r=>[r[0],r[1]]).sort((a,b)=>a[0]-b[0]);
@@ -1364,7 +1390,11 @@ async function loginAsPartner(id, opts){
     return { ok:false, reason:`No class has been scheduled yet for you. Please check with your trainer.` };
   }
   const s = result.session;
-  currentUser = { id, name:r.name, officeId:r.officeId||'', city:r.city, trainer:r.trainer, trainerId:r.trainerId||null, day:s.day, open:s.open, close:s.close };
+  currentUser = { id, name:r.name, officeId:r.officeId||'', city:r.city, trainer:r.trainer, trainerId:r.trainerId||null, courseId:r.courseId||null, preferredLanguage:r.preferredLanguage||DEFAULT_LANGUAGE, day:s.day, open:s.open, close:s.close };
+  await seedDefaultLanguageIfEmpty();
+  const langs = await listLanguages();
+  partnerAvailableLanguages = Object.values(langs).filter(l=>l.active!==false).map(l=>l.name);
+  if(!partnerAvailableLanguages.includes(DEFAULT_LANGUAGE)) partnerAvailableLanguages.unshift(DEFAULT_LANGUAGE);
   currentUserUnlockedDays = await getUnlock(r.city, r.trainer);
   currentUserAssessmentUnlockedDays = await getAssessmentUnlock(r.city, r.trainer);
   currentUserProgress = await getProgress(id);
@@ -1376,8 +1406,8 @@ async function loginAsPartner(id, opts){
     audiosCache[d.id]=await getAudioUrl(d.id);
     extraVideosCache[d.id]=await getExtraVideos(d.id);
     extraAudiosCache[d.id]=await getExtraAudios(d.id);
-    const ov = await getContentOverride(d.id);
-    if(ov) contentOverrides[d.id] = migrateOldOverrideToUnified(ov);
+    const result = await getContentOverrideWithFallback(d.id, currentUser.courseId, currentUser.preferredLanguage);
+    if(result.data) contentOverrides[d.id] = migrateOldOverrideToUnified(result.data);
   }));
   const homeOv = await getContentOverride('home');
   if(homeOv) contentOverrides['home'] = migrateOldOverrideToUnified(homeOv);
@@ -1604,6 +1634,13 @@ function renderSidebar(){
       <div class="who-meta">${esc(currentUser.city)} &middot; Trainer: ${esc(currentUser.trainer)}<br>ID: ${esc(currentUser.id)}</div>
       <div class="who-actions"><span onclick="checkOutNow()">Check out</span><span onclick="switchId()">Switch ID</span></div>
     </div>
+    <div style="margin:0 16px 14px;">
+      <span class="field-label" style="color:rgba(255,255,255,0.6);">Language</span>
+      <select class="field-input" id="partner-lang-select" style="margin-bottom:0;" onchange="changePartnerLanguage(this.value)">
+        ${(partnerAvailableLanguages.length?partnerAvailableLanguages:[DEFAULT_LANGUAGE]).map(l=>`<option value="${esc(l)}" ${currentUser.preferredLanguage===l?'selected':''}>${esc(l)}</option>`).join('')}
+      </select>
+      ${contentUsedFallbackLanguage ? `<div style="font-size:11px;color:rgba(255,255,255,0.55);margin-top:4px;">This day isn't translated yet — showing ${esc(DEFAULT_LANGUAGE)}.</div>` : ''}
+    </div>
     <div class="meter">
       <div class="meter-label">Course progress</div>
       <div class="meter-value">${s.done} / ${s.total} DAYS</div>
@@ -1664,13 +1701,31 @@ function goTo(dayId, tab){
     refreshDayContent(dayId).then(()=>{ if(currentDay===dayId){ cleanupPlayer(); renderMainOnly(); } });
   }
 }
+async function changePartnerLanguage(lang){
+  currentUser.preferredLanguage = lang;
+  const r = await getRosterEntry(currentUser.id);
+  if(r) await setRosterEntry(currentUser.id, { ...r, preferredLanguage:lang });
+  showToast(`Language set to ${lang}.`, 'success');
+  contentOverrides = {};
+  await Promise.all(DAYS.map(async d=>{
+    const result = await getContentOverrideWithFallback(d.id, currentUser.courseId, lang);
+    if(result.data) contentOverrides[d.id] = migrateOldOverrideToUnified(result.data);
+  }));
+  if(currentDay>0 && currentDay<98){
+    const result = await getContentOverrideWithFallback(currentDay, currentUser.courseId, lang);
+    contentUsedFallbackLanguage = result.usedFallback;
+  }
+  renderApp();
+}
 async function refreshDayContent(dayId){
   videosCache[dayId] = await getVideoUrl(dayId);
   audiosCache[dayId] = await getAudioUrl(dayId);
   extraVideosCache[dayId] = await getExtraVideos(dayId);
   extraAudiosCache[dayId] = await getExtraAudios(dayId);
-  const ov = await getContentOverride(dayId);
-  if(ov) contentOverrides[dayId] = migrateOldOverrideToUnified(ov);
+  const lang = (currentUser && currentUser.preferredLanguage) || DEFAULT_LANGUAGE;
+  const result = await getContentOverrideWithFallback(dayId, currentUser?currentUser.courseId:null, lang);
+  contentUsedFallbackLanguage = result.usedFallback;
+  if(result.data) contentOverrides[dayId] = migrateOldOverrideToUnified(result.data);
   else delete contentOverrides[dayId];
   await loadMyMedia(dayId);
 }
@@ -2574,6 +2629,7 @@ function renderResult(){
 let adminRoster = {}; let adminSessions = []; let adminUnlocks = {}; let adminAssessmentUnlocks = {}; let adminTrainers = {};
 let adminCCs = {}; let adminZTs = {}; let lastCCCredential = null; let lastZTCredential = null;
 let adminCategories = {}; let adminCourses = {};
+let adminLanguages = {};
 let adminProgressCache = {}; let adminCheckinsCache = {}; let adminHistoryCache = [];
 let lastPartnerCredential = null;
 let partnersHiddenCompletedCount = 0;
@@ -2634,6 +2690,7 @@ const ADMIN_TAB_KEYS_DEFAULT = [
   ['ccmanage','Content Creators','Manage CC access'],
   ['ztmanage','Zonal Managers','Manage ZT access & zones'],
   ['categories','Category Management','Categories & courses'],
+  ['languages','Languages','Regional language content'],
   ['support','Support','Requests & issues'],
   ['history','History','Audit log'],
   ['modules','Modules','Edit course content'],
@@ -2763,6 +2820,7 @@ async function renderAdminMain(){
   else if(adminTab==='ccmanage'){ adminCCs = await listCCs(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); el.innerHTML = renderCCManageTab(); }
   else if(adminTab==='ztmanage'){ adminZTs = await listZTs(); adminTrainers = await listTrainers(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); el.innerHTML = renderZTManageTab(); }
   else if(adminTab==='categories'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderCategoryManageTab(); }
+  else if(adminTab==='languages'){ await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderLanguagesTab(); }
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
   else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); el.innerHTML = renderSessionsTab(); }
   else if(adminTab==='access'){ const allR = await listRoster(); adminRoster = Object.fromEntries(Object.entries(allR).filter(([,r])=>isRosterEntryVisibleToViewer(r))); adminUnlocks = await listUnlocks(); adminAssessmentUnlocks = await listAssessmentUnlocks(); el.innerHTML = renderAccessTab(); }
@@ -2785,15 +2843,19 @@ async function renderAdminMain(){
   else if(adminTab==='modules'){
     if(editingDayId){ el.innerHTML = renderModuleEditorTab(); }
     else if(editingCourseId){
+      await seedDefaultLanguageIfEmpty();
+      adminLanguages = await listLanguages();
       courseEditorDays = await getDayRegistry(editingCourseId);
       courseEditorOverrideCache = {};
-      await Promise.all(courseEditorDays.map(async dayId=>{ courseEditorOverrideCache[dayId] = await getContentOverride(dayId, editingCourseId); }));
+      await Promise.all(courseEditorDays.map(async dayId=>{ courseEditorOverrideCache[dayId] = await getContentOverride(dayId, editingCourseId, editingLanguage); }));
       el.innerHTML = renderCourseModulesListTab();
     }
     else{
+      await seedDefaultLanguageIfEmpty();
+      adminLanguages = await listLanguages();
       adminModuleStatus = {};
-      await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id); adminModuleStatus[d.id] = !!ov; adminModuleOverrideCache[d.id] = ov; }));
-      const homeOv = await getContentOverride('home');
+      await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id, null, editingLanguage); adminModuleStatus[d.id] = !!ov; adminModuleOverrideCache[d.id] = ov; }));
+      const homeOv = await getContentOverride('home', null, editingLanguage);
       adminModuleStatus['home'] = !!homeOv;
       adminModuleOverrideCache['home'] = homeOv;
       el.innerHTML = renderModulesListTab();
@@ -3345,6 +3407,84 @@ async function removeCourse(courseId){
     await logHistory('course_removed', `Course "${course?.name||courseId}" removed by ${trainerIdentity.name}`, {courseId});
     renderAdminMain();
   });
+}
+
+/* ---- LANGUAGE MANAGEMENT (admin only) ---- */
+function renderLanguagesTab(){
+  const entries = Object.entries(adminLanguages);
+  return `
+    <div class="crumb">Admin dashboard</div>
+    <h1 class="page-title">Languages</h1>
+    <p class="page-sub">${esc(DEFAULT_LANGUAGE)} is the default and always-on fallback — if a day hasn't been translated into a partner's chosen language yet, they automatically see the ${esc(DEFAULT_LANGUAGE)} version. Add languages here, then author each day's content per language from Modules.</p>
+    <div class="card">
+      <h3>Add a language</h3>
+      <div style="display:flex;gap:10px;">
+        <input class="field-input" id="new-language-name" style="margin-bottom:0;flex:1;" placeholder="e.g. Hindi, Tamil, Telugu">
+        <button class="btn amber" onclick="createLanguage()">Add language</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>All languages &middot; ${entries.length}</h3>
+      <table class="data-table">
+        <tr><th>Language</th><th>Status</th><th></th></tr>
+        ${entries.map(([id,l])=>`<tr>
+          <td>${esc(l.name)}${l.isDefault?' <span class="pill scheduled" style="font-size:10px;">Default &amp; fallback</span>':''}</td>
+          <td><span class="pill ${l.active!==false?'open':'closed'}">${l.active!==false?'Enabled':'Disabled'}</span></td>
+          <td>${l.isDefault?'<span style="color:var(--ink-soft);font-size:12px;">Always on</span>':`
+            <button class="btn small secondary" onclick="toggleLanguageActive('${id}')">${l.active!==false?'Disable':'Enable'}</button>
+            <button class="btn small danger" onclick="removeLanguage('${id}')">Remove</button>
+          `}</td>
+        </tr>`).join('')}
+      </table>
+    </div>
+    <div class="card">
+      <h3>Enable languages per category</h3>
+      <p style="margin-bottom:10px;">Leave a category with none checked to allow all enabled languages by default.</p>
+      ${Object.entries(adminCategories).map(([catId,cat])=>{
+        const allowed = cat.enabledLanguages || [];
+        return `<div style="margin-bottom:10px;">
+          <b style="font-size:12.5px;">${esc(cat.name)}:</b>
+          ${entries.filter(([,l])=>l.active!==false).map(([id,l])=>`<label style="display:inline-flex;gap:4px;align-items:center;margin-left:10px;cursor:pointer;"><input type="checkbox" class="cat-lang-${catId}" value="${esc(l.name)}" ${allowed.includes(l.name)?'checked':''} onchange="saveCategoryLanguages('${catId}')">${esc(l.name)}</label>`).join('')}
+        </div>`;
+      }).join('') || '<p style="color:var(--ink-soft);font-size:12.5px;">No categories yet.</p>'}
+    </div>
+  `;
+}
+async function createLanguage(){
+  const nameEl = document.getElementById('new-language-name');
+  const name = nameEl.value.trim();
+  if(!name){ showToast('Enter a language name.', 'error'); return; }
+  const existing = Object.values(adminLanguages).map(l=>l.name.toLowerCase());
+  if(existing.includes(name.toLowerCase())){ showToast('That language already exists.', 'error'); return; }
+  await kvSet('language:'+name, { name, isDefault:false, active:true, createdAt:new Date().toISOString() });
+  await logHistory('language_created', `Language "${name}" added by ${trainerIdentity.name}`, {name});
+  showToast('Language added.', 'success');
+  renderAdminMain();
+}
+async function toggleLanguageActive(id){
+  const l = adminLanguages[id];
+  if(!l || l.isDefault) return;
+  const newActive = l.active===false;
+  await kvSet('language:'+id, { ...l, active:newActive });
+  await logHistory(newActive?'language_enabled':'language_disabled', `Language "${l.name}" ${newActive?'enabled':'disabled'} by ${trainerIdentity.name}`, {id});
+  showToast(newActive?'Enabled.':'Disabled — partners currently using it will see the fallback language.', 'success');
+  renderAdminMain();
+}
+async function removeLanguage(id){
+  const l = adminLanguages[id];
+  if(!l || l.isDefault){ showToast('The default language cannot be removed.', 'error'); return; }
+  showConfirmModal(`Remove "${l.name}"? Any content already written in this language stays saved but becomes unreachable through the selector.`, async ()=>{
+    await kvDelete('language:'+id);
+    await logHistory('language_removed', `Language "${l.name}" removed by ${trainerIdentity.name}`, {id});
+    renderAdminMain();
+  });
+}
+async function saveCategoryLanguages(categoryId){
+  const checked = Array.from(document.querySelectorAll('.cat-lang-'+categoryId+':checked')).map(el=>el.value);
+  const cat = adminCategories[categoryId];
+  await kvSet('category:'+categoryId, { ...cat, enabledLanguages:checked });
+  await logHistory('category_languages_updated', `Enabled languages for "${cat.name}" updated by ${trainerIdentity.name}`, {categoryId, enabledLanguages:checked});
+  showToast('Saved.', 'success');
 }
 
 /* ---- HISTORY (admin only) ---- */
@@ -4305,6 +4445,12 @@ function renderCourseModulesListTab(){
     <h1 class="page-title">${esc(course?.name||'Course')} — Modules</h1>
     <p class="page-sub">This course's own days, completely separate from any other course. Nothing changes for trainers or partners until you Save &amp; Publish each day.</p>
     <button class="btn secondary small" onclick="editingCourseId=null; setAdminTab('categories');" style="margin-bottom:14px;">&larr; Back to Category Management</button>
+    <div class="card">
+      <span class="field-label">Editing language</span>
+      <select class="field-input" id="course-modules-lang-select" onchange="setEditingLanguage(this.value)">
+        ${Object.values(adminLanguages).filter(l=>l.active!==false).map(l=>`<option value="${esc(l.name)}" ${editingLanguage===l.name?'selected':''}>${esc(l.name)}${l.isDefault?' (default)':''}</option>`).join('')}
+      </select>
+    </div>
     ${courseEditorDays.length===0 ? `<div class="card"><div class="empty-state">No days yet for this course — add the first one below.</div></div>` : ''}
     ${courseEditorDays.map(dayId=>`
       <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
@@ -4342,6 +4488,7 @@ async function deleteCourseDay(dayId){
 }
 let editingDayId = null;
 let editingCourseId = null;
+let editingLanguage = DEFAULT_LANGUAGE;
 function blankCourseModuleDraft(){
   return { title:'New day', sub:'', content:[], assignmentIntro:'', tasks:[], mediaUploadEnabled:true, quiz:[] };
 }
@@ -4354,6 +4501,13 @@ function renderModulesListTab(){
     <div class="crumb">Admin dashboard</div>
     <h1 class="page-title">Modules</h1>
     <p class="page-sub">Edit the theory, videos, audio, assignment, and assessment for each day. Nothing changes for partners until you click Save &amp; Publish.</p>
+    <div class="card">
+      <span class="field-label">Editing language</span>
+      <select class="field-input" id="modules-lang-select" onchange="setEditingLanguage(this.value)">
+        ${Object.values(adminLanguages).filter(l=>l.active!==false).map(l=>`<option value="${esc(l.name)}" ${editingLanguage===l.name?'selected':''}>${esc(l.name)}${l.isDefault?' (default)':''}</option>`).join('')}
+      </select>
+      <p style="font-size:12px;color:var(--ink-soft);margin-top:6px;">${editingLanguage===DEFAULT_LANGUAGE ? `This is the fallback version partners see if a day isn't translated into their chosen language.` : `Editing the ${esc(editingLanguage)} version. Days shown here as "Default content" have no ${esc(editingLanguage)} translation yet — partners using ${esc(editingLanguage)} will see ${esc(DEFAULT_LANGUAGE)} instead until you add one.`}</p>
+    </div>
     <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
       <div>
         <h3 style="margin-bottom:2px;">Home Page</h3>
@@ -4375,6 +4529,10 @@ function renderModulesListTab(){
     `).join('')}
     <button class="btn secondary" onclick="addNewDay()" style="margin-top:6px;">+ Add new day</button>
   `;
+}
+function setEditingLanguage(lang){
+  editingLanguage = lang;
+  renderAdminMain();
 }
 async function addNewDay(){
   const ids = await getDayRegistry();
@@ -4428,9 +4586,15 @@ async function openModuleEditor(dayId, courseId){
     if(videosCache[dayId]===undefined) videosCache[dayId] = await getVideoUrl(dayId);
     if(audiosCache[dayId]===undefined) audiosCache[dayId] = await getAudioUrl(dayId);
   }
-  const ov = await getContentOverride(dayId, courseId);
+  const ov = await getContentOverride(dayId, courseId, editingLanguage);
   if(ov){
     moduleDraft = migrateOldOverrideToUnified(JSON.parse(JSON.stringify(ov)));
+  } else if(editingLanguage !== DEFAULT_LANGUAGE){
+    const defaultOv = await getContentOverride(dayId, courseId, DEFAULT_LANGUAGE);
+    if(defaultOv) moduleDraft = migrateOldOverrideToUnified(JSON.parse(JSON.stringify(defaultOv)));
+    else if(courseId) moduleDraft = blankCourseModuleDraft();
+    else if(dayId==='home') moduleDraft = defaultHomeBlocks();
+    else moduleDraft = defaultToBlocks(DAYS.find(d=>d.id===dayId));
   } else if(courseId){
     moduleDraft = blankCourseModuleDraft();
   } else if(dayId==='home'){
@@ -4660,17 +4824,17 @@ async function saveModuleDraft(){
   syncModuleDraftFromDOM();
   if(!moduleDraft.title.trim()){ showToast('Give it a title.', 'error'); return; }
   if(!editingCourseId && editingDayId!=='home' && moduleDraft.quiz.length===0){ showToast('Add at least one assessment question.', 'error'); return; }
-  const ok = await setContentOverride(editingDayId, moduleDraft, editingCourseId);
+  const ok = await setContentOverride(editingDayId, moduleDraft, editingCourseId, editingLanguage);
   if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
   const label = editingDayId==='home' ? 'Home Page' : 'Day '+editingDayId;
-  await logHistory('module_edited', `${label} content edited and published by ${trainerIdentity.name}${editingCourseId?` (course ${adminCourses[editingCourseId]?.name||editingCourseId})`:''}`, {dayId:editingDayId, courseId:editingCourseId||null});
-  showToast('Saved and published.', 'success');
+  await logHistory('module_edited', `${label} content edited and published by ${trainerIdentity.name}${editingCourseId?` (course ${adminCourses[editingCourseId]?.name||editingCourseId})`:''}${editingLanguage!==DEFAULT_LANGUAGE?` [${editingLanguage}]`:''}`, {dayId:editingDayId, courseId:editingCourseId||null, lang:editingLanguage});
+  showToast(`Saved and published${editingLanguage!==DEFAULT_LANGUAGE?' ('+editingLanguage+')':''}.`, 'success');
   closeModuleEditor();
 }
 async function resetModuleToDefault(){
   const label = editingDayId==='home' ? 'the Home Page' : 'Day '+editingDayId;
   showConfirmModal('Revert '+label+' to the original default content? Your customizations will be deleted.', async ()=>{
-    await deleteContentOverride(editingDayId, editingCourseId);
+    await deleteContentOverride(editingDayId, editingCourseId, editingLanguage);
     await logHistory('module_reset', `Day ${editingDayId} reverted to default content by ${trainerIdentity.name}`, {dayId:editingDayId, courseId:editingCourseId||null});
     showToast('Reverted to default content.', 'success');
     closeModuleEditor();
@@ -4769,6 +4933,7 @@ function renderModuleEditorTab(){
     <div class="back-link" onclick="closeModuleEditor()">&larr; Back to Modules</div>
     <h1 class="page-title">${isHome?'Edit Home Page':'Edit Day '+editingDayId}</h1>
     <p class="page-sub">Changes here don't affect partners until you click Save &amp; Publish.</p>
+    ${editingLanguage!==DEFAULT_LANGUAGE ? `<div class="save-note" style="margin-bottom:14px;">Editing the <b>${esc(editingLanguage)}</b> version. This saves separately from ${esc(DEFAULT_LANGUAGE)} — partners using ${esc(DEFAULT_LANGUAGE)} or any other untranslated language won't see these changes.</div>` : `<div class="save-note" style="margin-bottom:14px;">Editing <b>${esc(DEFAULT_LANGUAGE)}</b> — the default fallback every partner sees unless a translation exists for their chosen language.</div>`}
 
     <div class="card">
       <span class="field-label">${isHome?'Page title':'Day title'}</span>
