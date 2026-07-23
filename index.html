@@ -1063,6 +1063,24 @@ let extraVideosCache = {};
 let extraAudiosCache = {};
 let audiosCache = {};
 let contentOverrides = {};
+function mergeWatchRanges(ranges){
+  if(!ranges || !ranges.length) return [];
+  const sorted = ranges.map(r=>[r[0],r[1]]).sort((a,b)=>a[0]-b[0]);
+  const merged = [sorted[0].slice()];
+  for(let i=1;i<sorted.length;i++){
+    const last = merged[merged.length-1];
+    const [s,e] = sorted[i];
+    if(s <= last[1] + 0.75){
+      last[1] = Math.max(last[1], e);
+    } else {
+      merged.push([s,e]);
+    }
+  }
+  return merged;
+}
+function totalWatchedSeconds(ranges){
+  return (ranges||[]).reduce((sum,r)=> sum + Math.max(0, r[1]-r[0]), 0);
+}
 let ytPlayer = null;
 let ytPollTimer = null;
 let ytPlayers = {};
@@ -1073,11 +1091,14 @@ window.onYouTubeIframeAPIReady = function(){ ytApiReady = true; };
 function defaultDayProgress(){
   return { theoryDone:false, audioPlayed:false, videoPct:0, videoDone:false,
     quizSubmitted:false, quizScore:0, quizTotal:0, quizPct:0, quizAnswers:[], quizDate:'',
-    tasksChecked:[], reflection:'', videoItemProgress:{} };
+    tasksChecked:[], reflection:'', videoItemProgress:{}, videoRanges:[], videoLastTime:null, inVideoQuizAnswers:{} };
 }
 function ensureDay(d){
   if(!currentUserProgress[d]) currentUserProgress[d] = defaultDayProgress();
   if(!currentUserProgress[d].videoItemProgress) currentUserProgress[d].videoItemProgress = {};
+  if(!currentUserProgress[d].videoRanges) currentUserProgress[d].videoRanges = [];
+  if(currentUserProgress[d].videoLastTime===undefined) currentUserProgress[d].videoLastTime = null;
+  if(!currentUserProgress[d].inVideoQuizAnswers) currentUserProgress[d].inVideoQuizAnswers = {};
 }
 function dayRating(d){
   ensureDay(d);
@@ -1913,13 +1934,25 @@ async function pollOverrideYT(dayId, idx, key){
     const dur = player.getDuration();
     const cur = player.getCurrentTime();
     if(!dur) return;
-    const pct = Math.min(100, Math.round((cur/dur)*100));
     ensureDay(dayId);
     const dp = currentUserProgress[dayId];
-    const prev = dp.videoItemProgress[idx] || {pct:0, done:false};
-    if(pct > (prev.pct||0)){
-      const done = pct>=90;
-      dp.videoItemProgress[idx] = {pct, done};
+    const prev = dp.videoItemProgress[idx] || {pct:0, done:false, ranges:[], lastTime:null};
+    const ranges = prev.ranges ? prev.ranges.map(r=>[r[0],r[1]]) : [];
+    const POLL_INTERVAL_SEC = 2;
+    if(prev.lastTime !== null && prev.lastTime !== undefined){
+      const delta = cur - prev.lastTime;
+      if(delta > 0 && delta <= POLL_INTERVAL_SEC*2){
+        ranges.push([prev.lastTime, cur]);
+      }
+    }
+    const merged = mergeWatchRanges(ranges);
+    const watchedSec = totalWatchedSeconds(merged);
+    const pct = Math.min(100, Math.round((watchedSec/dur)*100));
+    const done = pct>=90;
+    const changed = pct !== (prev.pct||0) || done !== !!prev.done;
+    dp.videoItemProgress[idx] = { pct, done, ranges: merged, lastTime: cur };
+    checkInVideoQuizTriggers(dayId, idx, key, cur);
+    if(changed){
       const fill = document.getElementById(`ov-progress-fill-${dayId}-${idx}`);
       const label = document.getElementById(`ov-progress-label-${dayId}-${idx}`);
       if(fill) fill.style.width = pct+'%';
@@ -2055,15 +2088,123 @@ function showManualFallback(dayId){
     wrap.after(btn);
   }
 }
+/* ---- IN-VIDEO QUIZ (partner playback) ---- */
+let activeInVideoQuiz = null;
+function checkInVideoQuizTriggers(dayId, idx, key, currentTime){
+  if(idx===null || idx===undefined) return;
+  if(activeInVideoQuiz) return;
+  const ov = contentOverrides[dayId];
+  if(!ov) return;
+  const item = ov.content[idx];
+  if(!item || item.type!=='video' || !item.inVideoQuizzes || !item.inVideoQuizzes.length) return;
+  ensureDay(dayId);
+  const dp = currentUserProgress[dayId];
+  const answered = dp.inVideoQuizAnswers[idx] || {};
+  const due = item.inVideoQuizzes
+    .map((q,qi)=>({q,qi}))
+    .filter(({q,qi}) => q.timestamp<=currentTime && !(answered[qi] && answered[qi].resolved))
+    .sort((a,b)=>a.q.timestamp-b.q.timestamp);
+  if(due.length===0) return;
+  const {q, qi} = due[0];
+  const player = ytPlayers[key];
+  if(player && player.pauseVideo) player.pauseVideo();
+  showInVideoQuizOverlay(dayId, idx, key, qi, q);
+}
+function showInVideoQuizOverlay(dayId, idx, key, qi, q){
+  ensureDay(dayId);
+  const dp = currentUserProgress[dayId];
+  const existing = (dp.inVideoQuizAnswers[idx]||{})[qi];
+  activeInVideoQuiz = { dayId, idx, key, qi, attempts: existing ? existing.attempts.length : 0 };
+  const overlay = document.createElement('div');
+  overlay.id = 'in-video-quiz-overlay';
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = renderInVideoQuizCard(q, null, false, false);
+  document.body.appendChild(overlay);
+}
+function renderInVideoQuizCard(q, feedback, canContinue, mustRetry){
+  const showOptions = !feedback || mustRetry;
+  return `<div class="confirm-box" style="max-width:480px;text-align:left;">
+    <h3 style="margin-top:0;">Quick check</h3>
+    <p style="font-weight:500;">${esc(q.question)}</p>
+    ${showOptions ? `
+      <div id="ivq-options">
+        ${q.options.map((opt,oi)=>`<label style="display:block;margin-bottom:8px;cursor:pointer;"><input type="radio" name="ivq-opt" value="${oi}" style="margin-right:8px;"> ${esc(opt)}</label>`).join('')}
+      </div>
+      <button class="btn amber" onclick="submitInVideoQuizAnswer()">Submit</button>
+    ` : ''}
+    ${feedback ? `<div class="save-note" style="color:${feedback.correct?'var(--success)':'var(--danger)'};margin-top:10px;font-size:13px;">${esc(feedback.text)}</div>` : ''}
+    ${feedback && canContinue ? `<button class="btn amber" onclick="resumeAfterInVideoQuiz()" style="margin-top:10px;">Continue video</button>` : ''}
+  </div>`;
+}
+async function submitInVideoQuizAnswer(){
+  if(!activeInVideoQuiz) return;
+  const { dayId, idx, key, qi } = activeInVideoQuiz;
+  const selected = document.querySelector('input[name="ivq-opt"]:checked');
+  if(!selected){ showToast('Select an answer first.', 'error'); return; }
+  const selectedIdx = parseInt(selected.value);
+  const ov = contentOverrides[dayId];
+  const item = ov.content[idx];
+  const q = item.inVideoQuizzes[qi];
+  const isCorrect = selectedIdx === q.correct;
+  activeInVideoQuiz.attempts++;
+
+  ensureDay(dayId);
+  const dp = currentUserProgress[dayId];
+  if(!dp.inVideoQuizAnswers[idx]) dp.inVideoQuizAnswers[idx] = {};
+  const history = dp.inVideoQuizAnswers[idx][qi] || { attempts:[], resolved:false };
+  history.attempts.push({ selected:selectedIdx, correct:isCorrect, at:new Date().toISOString() });
+
+  const requireCorrect = !!q.requireCorrect;
+  const maxAttempts = q.maxAttempts || 3;
+  const attemptsRemaining = maxAttempts - activeInVideoQuiz.attempts;
+  const exhausted = requireCorrect && !isCorrect && attemptsRemaining<=0;
+  const mustRetry = requireCorrect && !isCorrect && attemptsRemaining>0;
+  const canContinue = !requireCorrect || isCorrect || exhausted;
+
+  history.resolved = canContinue;
+  dp.inVideoQuizAnswers[idx][qi] = history;
+  await setProgress(currentUser.id, currentUserProgress);
+  if(canContinue){
+    await logHistory('in_video_quiz_answered', `${currentUser.name} answered an in-video quiz on Day ${dayId}`, { dayId, idx, qi, correct:isCorrect, attempts:activeInVideoQuiz.attempts });
+  }
+
+  let feedbackText = isCorrect ? (q.correctFeedback||'Correct!') : (q.incorrectFeedback||'Not quite — try again.');
+  if(exhausted) feedbackText += ' No attempts remaining — continuing anyway.';
+  const overlay = document.getElementById('in-video-quiz-overlay');
+  if(overlay) overlay.innerHTML = renderInVideoQuizCard(q, {correct:isCorrect, text:feedbackText}, canContinue, mustRetry);
+}
+function resumeAfterInVideoQuiz(){
+  if(!activeInVideoQuiz) return;
+  const { key } = activeInVideoQuiz;
+  const overlay = document.getElementById('in-video-quiz-overlay');
+  if(overlay) overlay.remove();
+  activeInVideoQuiz = null;
+  const player = ytPlayers[key];
+  if(player && player.playVideo) player.playVideo();
+}
 async function pollYT(dayId){
   if(!ytPlayer || !ytPlayer.getDuration) return;
   try{
     const dur = ytPlayer.getDuration();
     const cur = ytPlayer.getCurrentTime();
     if(!dur) return;
-    const pct = Math.min(100, Math.round((cur/dur)*100));
     const dp = currentUserProgress[dayId];
-    if(pct > (dp.videoPct||0)){
+    const ranges = dp.videoRanges ? dp.videoRanges.map(r=>[r[0],r[1]]) : [];
+    const POLL_INTERVAL_SEC = 2;
+    if(dp.videoLastTime !== null && dp.videoLastTime !== undefined){
+      const delta = cur - dp.videoLastTime;
+      if(delta > 0 && delta <= POLL_INTERVAL_SEC*2){
+        ranges.push([dp.videoLastTime, cur]);
+      }
+    }
+    const merged = mergeWatchRanges(ranges);
+    const watchedSec = totalWatchedSeconds(merged);
+    const pct = Math.min(100, Math.round((watchedSec/dur)*100));
+    const changed = pct !== (dp.videoPct||0);
+    dp.videoRanges = merged;
+    dp.videoLastTime = cur;
+    checkInVideoQuizTriggers(dayId, null, null, cur);
+    if(changed){
       dp.videoPct = pct;
       if(pct>=90 && !dp.videoDone){ dp.videoDone = true; }
       const track = document.querySelector('.video-progress-fill');
@@ -3657,7 +3798,25 @@ function syncModuleDraftFromDOM(){
     if(item.type==='theory'){
       if(g('c-heading-'+i)) item.heading = g('c-heading-'+i).value;
       if(g('c-body-'+i)) item.body = g('c-body-'+i).value;
-    } else if(item.type==='video' || item.type==='audio'){
+    } else if(item.type==='video'){
+      if(g('c-title-'+i)) item.title = g('c-title-'+i).value;
+      if(g('c-url-'+i)) item.url = g('c-url-'+i).value;
+      if(item.inVideoQuizzes){
+        item.inVideoQuizzes.forEach((q,qi)=>{
+          if(g(`ivq-time-${i}-${qi}`)) q.timestamp = parseMinSec(g(`ivq-time-${i}-${qi}`).value);
+          if(g(`ivq-q-${i}-${qi}`)) q.question = g(`ivq-q-${i}-${qi}`).value;
+          if(!q.options) q.options = ['','','',''];
+          q.options.forEach((o,oi)=>{ if(g(`ivq-opt-${i}-${qi}-${oi}`)) q.options[oi] = g(`ivq-opt-${i}-${qi}-${oi}`).value; });
+          const correctEl = document.querySelector(`input[name="ivq-correct-${i}-${qi}"]:checked`);
+          if(correctEl) q.correct = parseInt(correctEl.value);
+          if(g(`ivq-correctfb-${i}-${qi}`)) q.correctFeedback = g(`ivq-correctfb-${i}-${qi}`).value;
+          if(g(`ivq-incorrectfb-${i}-${qi}`)) q.incorrectFeedback = g(`ivq-incorrectfb-${i}-${qi}`).value;
+          if(g(`ivq-attempts-${i}-${qi}`)) q.maxAttempts = Math.max(1, parseInt(g(`ivq-attempts-${i}-${qi}`).value)||3);
+          const reqEl = g(`ivq-requirecorrect-${i}-${qi}`);
+          if(reqEl) q.requireCorrect = reqEl.checked;
+        });
+      }
+    } else if(item.type==='audio'){
       if(g('c-title-'+i)) item.title = g('c-title-'+i).value;
       if(g('c-url-'+i)) item.url = g('c-url-'+i).value;
     } else if(item.type==='photo'){
@@ -3722,6 +3881,112 @@ function onContentDrop(i){
 function addTask(){ syncModuleDraftFromDOM(); moduleDraft.tasks.push('New task'); refreshModuleEditor(); }
 function removeTask(i){ syncModuleDraftFromDOM(); moduleDraft.tasks.splice(i,1); refreshModuleEditor(); }
 function moveTask(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.tasks.length) return; [moduleDraft.tasks[i],moduleDraft.tasks[j]]=[moduleDraft.tasks[j],moduleDraft.tasks[i]]; refreshModuleEditor(); }
+function fmtMinSec(totalSeconds){
+  totalSeconds = Math.max(0, Math.round(totalSeconds||0));
+  const m = Math.floor(totalSeconds/60), s = totalSeconds%60;
+  return m+':'+String(s).padStart(2,'0');
+}
+function parseMinSec(str){
+  if(!str) return 0;
+  const parts = String(str).trim().split(':');
+  if(parts.length===1) return Math.max(0, parseInt(parts[0])||0);
+  const m = parseInt(parts[0])||0, s = parseInt(parts[1])||0;
+  return Math.max(0, m*60+s);
+}
+function addInVideoQuiz(contentIdx){
+  syncModuleDraftFromDOM();
+  const item = moduleDraft.content[contentIdx];
+  if(!item.inVideoQuizzes) item.inVideoQuizzes = [];
+  item.inVideoQuizzes.push({ timestamp:0, question:'New question', options:['Option A','Option B','Option C','Option D'], correct:0, correctFeedback:'', incorrectFeedback:'', maxAttempts:3, requireCorrect:true });
+  refreshModuleEditor();
+}
+function removeInVideoQuiz(contentIdx, qi){
+  syncModuleDraftFromDOM();
+  moduleDraft.content[contentIdx].inVideoQuizzes.splice(qi,1);
+  refreshModuleEditor();
+}
+function moveInVideoQuiz(contentIdx, qi, dir){
+  syncModuleDraftFromDOM();
+  const list = moduleDraft.content[contentIdx].inVideoQuizzes;
+  const j = qi+dir;
+  if(j<0||j>=list.length) return;
+  [list[qi],list[j]] = [list[j],list[qi]];
+  refreshModuleEditor();
+}
+function previewInVideoQuiz(contentIdx, qi){
+  syncModuleDraftFromDOM();
+  const q = moduleDraft.content[contentIdx].inVideoQuizzes[qi];
+  const overlay = document.createElement('div');
+  overlay.id = 'ivq-preview-overlay';
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `<div class="confirm-box" style="max-width:480px;text-align:left;">
+    <div class="save-note" style="margin-bottom:10px;">Preview only — answers here aren't saved to any partner's progress.</div>
+    <h3 style="margin-top:0;">Quick check</h3>
+    <p style="font-weight:500;">${esc(q.question)}</p>
+    <div>
+      ${q.options.map((opt,oi)=>`<label style="display:block;margin-bottom:8px;cursor:pointer;"><input type="radio" name="ivq-preview-opt" value="${oi}" style="margin-right:8px;"> ${esc(opt)}</label>`).join('')}
+    </div>
+    <button class="btn amber" onclick="submitPreviewInVideoQuiz(${contentIdx},${qi})">Submit</button>
+    <button class="btn secondary" onclick="document.getElementById('ivq-preview-overlay').remove()">Close preview</button>
+    <div id="ivq-preview-feedback"></div>
+  </div>`;
+  document.body.appendChild(overlay);
+}
+function submitPreviewInVideoQuiz(contentIdx, qi){
+  const q = moduleDraft.content[contentIdx].inVideoQuizzes[qi];
+  const selected = document.querySelector('input[name="ivq-preview-opt"]:checked');
+  if(!selected){ showToast('Select an answer first.', 'error'); return; }
+  const isCorrect = parseInt(selected.value)===q.correct;
+  const fb = document.getElementById('ivq-preview-feedback');
+  if(fb) fb.innerHTML = `<div class="save-note" style="color:${isCorrect?'var(--success)':'var(--danger)'};margin-top:10px;">${esc(isCorrect?(q.correctFeedback||'Correct!'):(q.incorrectFeedback||'Not quite.'))}</div>`;
+}
+function renderInVideoQuizEditor(contentIdx, item){
+  const quizzes = item.inVideoQuizzes || [];
+  return `
+    <div style="border-top:1px solid var(--line);margin-top:14px;padding-top:12px;">
+      <span class="field-label">In-video quiz questions</span>
+      <p style="font-size:12px;color:var(--ink-soft);margin:0 0 10px;">The video automatically pauses at each timestamp and shows the question. Works for YouTube links.</p>
+      ${quizzes.map((q,qi)=>`
+        <div class="card" style="background:var(--porcelain);">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <span class="field-label" style="margin:0;">Question ${qi+1}</span>
+            <div style="display:flex;gap:6px;">
+              <button class="btn small secondary" onclick="moveInVideoQuiz(${contentIdx},${qi},-1)" ${qi===0?'disabled':''}>&uarr;</button>
+              <button class="btn small secondary" onclick="moveInVideoQuiz(${contentIdx},${qi},1)" ${qi===quizzes.length-1?'disabled':''}>&darr;</button>
+              <button class="btn small secondary" onclick="previewInVideoQuiz(${contentIdx},${qi})">Preview</button>
+              <button class="btn small danger" onclick="removeInVideoQuiz(${contentIdx},${qi})">Delete</button>
+            </div>
+          </div>
+          <span class="field-label">Timestamp (mm:ss)</span>
+          <input class="field-input" id="ivq-time-${contentIdx}-${qi}" value="${fmtMinSec(q.timestamp||0)}" placeholder="1:30" style="width:120px;">
+          <span class="field-label">Question</span>
+          <textarea class="field-input reflect" id="ivq-q-${contentIdx}-${qi}" style="min-height:50px;">${esc(q.question||'')}</textarea>
+          ${(q.options||['','','','']).map((o,oi)=>`
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+              <input type="radio" name="ivq-correct-${contentIdx}-${qi}" value="${oi}" ${q.correct===oi?'checked':''} style="accent-color:var(--brand);width:18px;height:18px;flex-shrink:0;">
+              <input class="field-input" style="margin-bottom:0;flex:1;" id="ivq-opt-${contentIdx}-${qi}-${oi}" value="${esc(o)}" placeholder="Option ${oi+1}">
+            </div>
+          `).join('')}
+          <div class="save-note">Select the radio button next to the correct answer.</div>
+          <span class="field-label">Feedback if correct</span>
+          <input class="field-input" id="ivq-correctfb-${contentIdx}-${qi}" value="${esc(q.correctFeedback||'')}" placeholder="Nice work!">
+          <span class="field-label">Feedback if incorrect</span>
+          <input class="field-input" id="ivq-incorrectfb-${contentIdx}-${qi}" value="${esc(q.incorrectFeedback||'')}" placeholder="Not quite — review the last section and try again.">
+          <div class="form-grid">
+            <div><span class="field-label">Attempts allowed</span><input class="field-input" type="number" min="1" id="ivq-attempts-${contentIdx}-${qi}" value="${q.maxAttempts||3}"></div>
+            <div style="display:flex;align-items:flex-end;">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                <input type="checkbox" id="ivq-requirecorrect-${contentIdx}-${qi}" ${q.requireCorrect?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
+                <span>Only the correct answer can continue</span>
+              </label>
+            </div>
+          </div>
+        </div>
+      `).join('')}
+      <button class="btn secondary small" onclick="addInVideoQuiz(${contentIdx})">+ Add quiz question</button>
+    </div>
+  `;
+}
 function addQuizQuestion(){ syncModuleDraftFromDOM(); moduleDraft.quiz.push({question:'New question', options:['Option A','Option B','Option C','Option D'], correct:0}); refreshModuleEditor(); }
 function removeQuizQuestion(i){ syncModuleDraftFromDOM(); moduleDraft.quiz.splice(i,1); refreshModuleEditor(); }
 function moveQuizQuestion(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.quiz.length) return; [moduleDraft.quiz[i],moduleDraft.quiz[j]]=[moduleDraft.quiz[j],moduleDraft.quiz[i]]; refreshModuleEditor(); }
@@ -3773,6 +4038,7 @@ function renderContentItemCard(item, i, total){
       <input class="field-input" id="c-title-${i}" value="${esc(item.title)}" placeholder="Video title">
       <input class="field-input" id="c-url-${i}" value="${esc(item.url)}" placeholder="YouTube, Vimeo, or Google Drive share link">
       ${!item.url ? `<div class="save-note" style="color:var(--danger);">No link set yet — partners won't see this video at all until you add one, or delete this block.</div>` : ''}
+      ${renderInVideoQuizEditor(i, item)}
     `;
   } else if(item.type==='audio'){
     fields = `
