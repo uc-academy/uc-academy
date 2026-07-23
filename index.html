@@ -1259,6 +1259,7 @@ function saveAdminName(){
 
 function switchId(){
   if(ytPollTimer) clearInterval(ytPollTimer);
+  stopIssuePolling();
   currentUser = null; currentUserProgress={}; currentUserUnlockedDays=[]; trainerIdentity = null;
   gateError=''; gateMode='partner'; showRecovery=false;
   clearSession();
@@ -2092,6 +2093,28 @@ let lastPartnerCredential = null;
 let partnersHiddenCompletedCount = 0;
 let lastTrainerCredential = null;
 let adminIssuesCache = [];
+let issuePollTimer = null;
+function startIssuePolling(){
+  stopIssuePolling();
+  issuePollTimer = setInterval(async ()=>{
+    if(adminTab!=='support' && adminTab!=='report') { stopIssuePolling(); return; }
+    let fresh;
+    try{ fresh = await listIssues(); }catch(e){ return; }
+    const changed = fresh.length !== adminIssuesCache.length || fresh.some(fi=>{
+      const cur = adminIssuesCache.find(ci=>ci.id===fi.id);
+      return !cur || (fi.comments||[]).length !== (cur.comments||[]).length || fi.status !== cur.status;
+    });
+    if(!changed) return;
+    const drafts = {};
+    document.querySelectorAll('input[id^="comment-input-"]').forEach(el=>{ if(el.value) drafts[el.id]=el.value; });
+    adminIssuesCache = fresh;
+    const mainEl = document.getElementById('main');
+    if(mainEl) mainEl.innerHTML = (adminTab==='support') ? renderSupportTab() : renderReportIssueTab();
+    refreshOpenIssueCount().then(renderAdminSidebar);
+    Object.entries(drafts).forEach(([id,val])=>{ const el3=document.getElementById(id); if(el3) el3.value = val; });
+  }, 4000);
+}
+function stopIssuePolling(){ if(issuePollTimer){ clearInterval(issuePollTimer); issuePollTimer=null; } }
 let adminMediaCache = [];
 let adminBatchesCache = [];
 let themeDraft = null;
@@ -2212,6 +2235,9 @@ function setAdminTab(t){
   if(t==='support'||t==='report'){
     refreshOpenIssueCount().then(renderAdminSidebar);
     markVisibleIssuesRead().then(()=>refreshOpenIssueCount().then(renderAdminSidebar));
+    startIssuePolling();
+  } else {
+    stopIssuePolling();
   }
 }
 
@@ -2893,9 +2919,16 @@ function renderIssueCardTrainerView(i){
         <div class="mono" style="font-size:11px;color:var(--ink-soft);">${fmtDateTime(i.createdAt)}</div>
       </div>
       <p style="margin:0 0 10px;color:var(--ink-soft);">${esc(i.description)}</p>
+      ${i.status==='Resolved' ? `<button class="btn small secondary" onclick="reopenIssue('${i.id}')" style="margin-bottom:10px;">Not fixed — reopen this issue</button>` : ''}
       ${renderCommentThread(i)}
     </div>
   `;
+}
+async function reopenIssue(id){
+  await updateIssue(id, {status:'Open'});
+  await logHistory('issue_reopened', `Issue ${id} reopened by ${trainerIdentity.name}`, {issueId:id});
+  showToast('Issue reopened — messaging is unlocked again.', 'success');
+  renderAdminMain();
 }
 async function submitReportedIssue(){
   const type = document.getElementById('ri-type').value;
