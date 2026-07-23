@@ -330,6 +330,9 @@ let COURSE_NAME = "Urban Company Academy";
 let COURSE_SUB = "Professional Expert Courses";
 const CATEGORIES = ["RWM","AC","Native","OA"];
 const CITIES = ["Noida","Delhi","Mumbai","Kolkata","Chennai","Hyderabad","Bangalore","Growth"];
+const ZONES = ["North","South","East","West","Central"];
+const CITY_ZONE = { Noida:"North", Delhi:"North", Mumbai:"West", Kolkata:"East", Chennai:"South", Hyderabad:"South", Bangalore:"South", Growth:"Central" };
+function citiesInZones(zones){ return CITIES.filter(c => (zones||[]).includes(CITY_ZONE[c])); }
 const ADMIN_PASSWORD = "UCA-SADIQ-5055";
 const ISSUE_TYPES = ["Forgot Password","Login Issue","Partner Portal Access","Trainer Account Issue","Module Access Issue","Other"];
 const ISSUE_STATUSES = ["Open","In Progress","Resolved","Rejected"];
@@ -775,6 +778,18 @@ async function listTrainers(){
   await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out[k.slice(8)] = v; }));
   return out;
 }
+async function listCCs(){
+  const keys = await kvList('cc:');
+  const out = {};
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out[k.slice(3)] = v; }));
+  return out;
+}
+async function listZTs(){
+  const keys = await kvList('zt:');
+  const out = {};
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out[k.slice(3)] = v; }));
+  return out;
+}
 async function listSessions(){
   const keys = await kvList('session:');
   const out = [];
@@ -1179,15 +1194,35 @@ function renderGate(){
         <div class="gate-toggle">
           <button class="${gateMode==='partner'?'active':''}" onclick="setGateMode('partner')">Partner</button>
           <button class="${gateMode==='trainer'?'active':''}" onclick="setGateMode('trainer')">Trainer</button>
+          <button class="${gateMode==='cc'?'active':''}" onclick="setGateMode('cc')">Content Creator</button>
+          <button class="${gateMode==='zt'?'active':''}" onclick="setGateMode('zt')">Zonal Manager</button>
         </div>
-        ${gateMode==='partner' ? renderPartnerGateFields() : renderTrainerGateFields()}
+        ${gateMode==='partner' ? renderPartnerGateFields() : gateMode==='trainer' ? renderTrainerGateFields() : gateMode==='cc' ? renderCCGateFields() : renderZTGateFields()}
         ${gateError ? `<div class="gate-msg error">${gateError}</div>` : ''}
         <div class="admin-login-link" onclick="setGateMode('admin')">&#128100; Admin Login</div>
       </div>
     </div>
   `;
   if(gateMode==='partner') attachGateEnter('partner-id-input', submitPartnerId);
-  else attachGateEnter('trainer-pass-input', submitTrainerLogin);
+  else if(gateMode==='trainer') attachGateEnter('trainer-pass-input', submitTrainerLogin);
+  else if(gateMode==='cc') attachGateEnter('cc-pass-input', submitCCLogin);
+  else attachGateEnter('zt-pass-input', submitZTLogin);
+}
+function renderCCGateFields(){
+  return `
+    <span class="field-label">Password</span>
+    <input class="field-input" id="cc-pass-input" type="password">
+    <button class="gate-submit" onclick="submitCCLogin()" ${gateBusy?'disabled':''}>${gateBusy?'Checking...':'Login'}</button>
+    <div class="gate-foot">Content Creator access — module editing only. Contact your Admin for a password.</div>
+  `;
+}
+function renderZTGateFields(){
+  return `
+    <span class="field-label">Password</span>
+    <input class="field-input" id="zt-pass-input" type="password">
+    <button class="gate-submit" onclick="submitZTLogin()" ${gateBusy?'disabled':''}>${gateBusy?'Checking...':'Login'}</button>
+    <div class="gate-foot">Zonal Training Manager access. Contact your Admin for a password.</div>
+  `;
 }
 function renderPartnerGateFields(){
   return `
@@ -1382,6 +1417,52 @@ async function submitTrainerLogin(){
   adminTab='sessions';
   renderAdmin();
 }
+async function loginAsCC(ccId, opts){
+  opts = opts || {};
+  const c = await kvGet('cc:'+ccId);
+  if(!c || c.active===false) return { ok:false };
+  trainerIdentity = { isAdmin:false, isCC:true, ccId, name:c.name, phone:c.phone };
+  if(!opts.silent) await logHistory('cc_login', `${c.name} (Content Creator) logged in`, {ccId});
+  saveSession({ role:'cc', ccId });
+  return { ok:true };
+}
+async function submitCCLogin(){
+  if(gateBusy) return;
+  const password = document.getElementById('cc-pass-input').value.trim().toUpperCase();
+  if(!password){ gateError='Enter your password.'; renderGate(); return; }
+  gateBusy=true; gateError=''; renderGate();
+  const ccs = await listCCs();
+  const match = Object.entries(ccs).find(([id,c])=> c.active!==false && (c.password||'').toUpperCase()===password);
+  gateBusy=false;
+  if(!match){ gateError = 'Incorrect password, or your access has been deactivated. Contact your Admin.'; renderGate(); return; }
+  const [ccId] = match;
+  await loginAsCC(ccId);
+  adminTab='modules';
+  renderAdmin();
+}
+async function loginAsZT(ztId, opts){
+  opts = opts || {};
+  const z = await kvGet('zt:'+ztId);
+  if(!z || z.active===false) return { ok:false };
+  trainerIdentity = { isAdmin:false, isZT:true, ztId, name:z.name, phone:z.phone, assignedZones:z.assignedZones||[], assignedCities:z.assignedCities||[], assignedTrainerIds:z.assignedTrainerIds||[] };
+  if(!opts.silent) await logHistory('zt_login', `${z.name} (Zonal Training Manager) logged in`, {ztId});
+  saveSession({ role:'zt', ztId });
+  return { ok:true };
+}
+async function submitZTLogin(){
+  if(gateBusy) return;
+  const password = document.getElementById('zt-pass-input').value.trim().toUpperCase();
+  if(!password){ gateError='Enter your password.'; renderGate(); return; }
+  gateBusy=true; gateError=''; renderGate();
+  const zts = await listZTs();
+  const match = Object.entries(zts).find(([id,z])=> z.active!==false && (z.password||'').toUpperCase()===password);
+  gateBusy=false;
+  if(!match){ gateError = 'Incorrect password, or your access has been deactivated. Contact your Admin.'; renderGate(); return; }
+  const [ztId] = match;
+  await loginAsZT(ztId);
+  adminTab='partners';
+  renderAdmin();
+}
 
 async function submitAdminLogin(){
   if(gateBusy) return;
@@ -1429,6 +1510,20 @@ async function tryRestoreSession(){
       const result = await loginAsTrainer(saved.trainerId, { silent:true });
       if(!result.ok){ clearSession(); return false; }
       adminTab='sessions';
+      renderAdmin();
+      return true;
+    }
+    if(saved.role==='cc'){
+      const result = await loginAsCC(saved.ccId, { silent:true });
+      if(!result.ok){ clearSession(); return false; }
+      adminTab='modules';
+      renderAdmin();
+      return true;
+    }
+    if(saved.role==='zt'){
+      const result = await loginAsZT(saved.ztId, { silent:true });
+      if(!result.ok){ clearSession(); return false; }
+      adminTab='partners';
       renderAdmin();
       return true;
     }
@@ -2444,6 +2539,7 @@ function renderResult(){
 
 /* ============================= ADMIN / TRAINER DASHBOARD ============================= */
 let adminRoster = {}; let adminSessions = []; let adminUnlocks = {}; let adminAssessmentUnlocks = {}; let adminTrainers = {};
+let adminCCs = {}; let adminZTs = {}; let lastCCCredential = null; let lastZTCredential = null;
 let adminProgressCache = {}; let adminCheckinsCache = {}; let adminHistoryCache = [];
 let lastPartnerCredential = null;
 let partnersHiddenCompletedCount = 0;
@@ -2481,6 +2577,18 @@ let selectedBatchId = null;
 let mediaFilterStatus = '';
 
 function isAdminRole(){ return trainerIdentity && trainerIdentity.isAdmin; }
+function isCCRole(){ return trainerIdentity && trainerIdentity.isCC; }
+function isZTRole(){ return trainerIdentity && trainerIdentity.isZT; }
+function cityVisibleToViewer(city){
+  if(isAdminRole()) return true;
+  if(isZTRole()) return (trainerIdentity.assignedCities||[]).includes(city);
+  return city===trainerIdentity.city;
+}
+function isRosterEntryVisibleToViewer(r){
+  if(isAdminRole()) return true;
+  if(isZTRole()) return (trainerIdentity.assignedCities||[]).includes(r.city);
+  return r.city===trainerIdentity.city && r.trainer===trainerIdentity.name;
+}
 function myScopeFilter(list, cityKey, trainerKey){
   if(isAdminRole()) return list;
   return list.filter(x => x[cityKey]===trainerIdentity.city && x[trainerKey]===trainerIdentity.name);
@@ -2489,6 +2597,8 @@ function myScopeFilter(list, cityKey, trainerKey){
 const ADMIN_TAB_KEYS_DEFAULT = [
   ['overview','Overview','Platform activity'],
   ['trainers','Trainers','Create & manage'],
+  ['ccmanage','Content Creators','Manage CC access'],
+  ['ztmanage','Zonal Managers','Manage ZT access & zones'],
   ['support','Support','Requests & issues'],
   ['history','History','Audit log'],
   ['modules','Modules','Edit course content'],
@@ -2509,9 +2619,19 @@ const TRAINER_TAB_KEYS_DEFAULT = [
   ['batches','Batches','Your batch history'],
   ['report','Report an Issue','Get help from Admin'],
 ];
+const CC_TAB_KEYS_DEFAULT = [
+  ['modules','Modules','Edit course content'],
+];
+const ZT_TAB_KEYS_DEFAULT = [
+  ['partners','Partners','Create & manage'],
+  ['batches','Batches','Track by batch'],
+  ['tracking','Tracking','Scores & attendance'],
+];
 function adminTabDefs(){
-  let tabs = isAdminRole() ? [...ADMIN_TAB_KEYS_DEFAULT] : [...TRAINER_TAB_KEYS_DEFAULT];
-  tabs = applyNavOrder(tabs, isAdminRole() ? currentLayout.navOrderAdmin : currentLayout.navOrderTrainer);
+  let tabs = isAdminRole() ? [...ADMIN_TAB_KEYS_DEFAULT] : isCCRole() ? [...CC_TAB_KEYS_DEFAULT] : isZTRole() ? [...ZT_TAB_KEYS_DEFAULT] : [...TRAINER_TAB_KEYS_DEFAULT];
+  if(isAdminRole() || (!isCCRole() && !isZTRole())){
+    tabs = applyNavOrder(tabs, isAdminRole() ? currentLayout.navOrderAdmin : currentLayout.navOrderTrainer);
+  }
   return tabs.map(([key,title,sub])=>[key, navLabel(key,title), sub]);
 }
 
@@ -2582,6 +2702,8 @@ function renderAdminSidebar(){
 function toggleSidebar(){ const sb=document.getElementById('sidebar'); if(sb) sb.classList.toggle('open'); }
 function closeSidebar(){ const sb=document.getElementById('sidebar'); if(sb) sb.classList.remove('open'); }
 function setAdminTab(t){
+  const allowedKeys = adminTabDefs().map(d=>d[0]);
+  if(!allowedKeys.includes(t)) t = allowedKeys[0];
   if(t!=='partners') lastPartnerCredential=null;
   if(t!=='trainers') lastTrainerCredential=null;
   if(t!=='batches') selectedBatchId=null;
@@ -2603,17 +2725,20 @@ async function renderAdminMain(){
   el.innerHTML = `<div class="spinner-note">Loading...</div>`;
   if(adminTab==='overview'){ el.innerHTML = await renderOverviewTabAsync(); }
   else if(adminTab==='trainers'){ adminTrainers = await listTrainers(); el.innerHTML = renderTrainersTab(); }
+  else if(adminTab==='ccmanage'){ adminCCs = await listCCs(); el.innerHTML = renderCCManageTab(); }
+  else if(adminTab==='ztmanage'){ adminZTs = await listZTs(); adminTrainers = await listTrainers(); el.innerHTML = renderZTManageTab(); }
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
   else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); el.innerHTML = renderSessionsTab(); }
-  else if(adminTab==='access'){ const allR = await listRoster(); adminRoster = isAdminRole()?allR:Object.fromEntries(Object.entries(allR).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name)); adminUnlocks = await listUnlocks(); adminAssessmentUnlocks = await listAssessmentUnlocks(); el.innerHTML = renderAccessTab(); }
+  else if(adminTab==='access'){ const allR = await listRoster(); adminRoster = Object.fromEntries(Object.entries(allR).filter(([,r])=>isRosterEntryVisibleToViewer(r))); adminUnlocks = await listUnlocks(); adminAssessmentUnlocks = await listAssessmentUnlocks(); el.innerHTML = renderAccessTab(); }
   else if(adminTab==='partners'){
     const allR2 = await listRoster();
-    let scoped = isAdminRole()?allR2:Object.fromEntries(Object.entries(allR2).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name));
+    let scoped = Object.fromEntries(Object.entries(allR2).filter(([,r])=>isRosterEntryVisibleToViewer(r)));
     const allBatchesForFilter = await listAllBatches();
     const completedBatchIds = new Set(allBatchesForFilter.filter(b=>b.status==='Completed').map(b=>b.id));
     partnersHiddenCompletedCount = Object.values(scoped).filter(r=>r.batchId && completedBatchIds.has(r.batchId)).length;
     adminRoster = Object.fromEntries(Object.entries(scoped).filter(([,r])=>!(r.batchId && completedBatchIds.has(r.batchId))));
     adminTrainers = await listTrainers();
+    if(isZTRole()) adminTrainers = Object.fromEntries(Object.entries(adminTrainers).filter(([,t])=>cityVisibleToViewer(t.city)));
     el.innerHTML = renderPartnersTab();
   }
   else if(adminTab==='support'){ adminIssuesCache = await listIssues(); adminTrainers = await listTrainers(); el.innerHTML = renderSupportTab(); }
@@ -2639,7 +2764,7 @@ async function renderAdminMain(){
     if(selectedBatchId){ el.innerHTML = await renderBatchDetailAsync(); }
     else{
       const all = await listAllBatches();
-      adminBatchesCache = isAdminRole() ? all : all.filter(b=>b.trainerId===trainerIdentity.trainerId);
+      adminBatchesCache = isAdminRole() ? all : isZTRole() ? all.filter(b=>cityVisibleToViewer(b.city)) : all.filter(b=>b.trainerId===trainerIdentity.trainerId);
       el.innerHTML = renderBatchesListTab();
     }
   }
@@ -2746,6 +2871,234 @@ async function removeTrainer(trainerId){
   showConfirmModal(`Remove ${t?.name||trainerId}? They will no longer be able to log in.`, async ()=>{
     await kvDelete('trainer:'+trainerId);
     await logHistory('trainer_removed', `Trainer ${t?.name||trainerId} removed`, {trainerId});
+    renderAdminMain();
+  });
+}
+
+/* ---- CONTENT CREATOR MANAGEMENT (admin only) ---- */
+function renderCCManageTab(){
+  const entries = Object.entries(adminCCs);
+  const passMsg = lastCCCredential ? encodeURIComponent(`Hi ${lastCCCredential.name}, your Urban Company Academy Content Creator password is: ${lastCCCredential.password}`) : '';
+  return `
+    <div class="crumb">Admin dashboard</div>
+    <h1 class="page-title">Content Creators</h1>
+    <p class="page-sub">Content Creator accounts can only access Module Management — editing course content, videos, quizzes, and upload activities. They cannot see partners, trainers, tracking, or settings.</p>
+    ${lastCCCredential ? `<div class="credential-banner">
+      <div class="cb-label">Content Creator password generated</div>
+      <div class="cb-value">${esc(lastCCCredential.password)}</div>
+      <div class="cb-note">Share this with ${esc(lastCCCredential.name)}. <a onclick="lastCCCredential=null;renderAdminMain();" style="cursor:pointer;">Dismiss</a></div>
+      <div style="margin-top:10px;"><a class="btn small secondary" href="sms:${esc(lastCCCredential.phone)}?body=${passMsg}">Text password to ${esc(lastCCCredential.name)}</a></div>
+    </div>` : ''}
+    <div class="card">
+      <h3>Create a Content Creator account</h3>
+      <div class="form-grid">
+        <div><span class="field-label">Name</span><input class="field-input" id="cc-name"></div>
+        <div><span class="field-label">Phone number</span><input class="field-input" id="cc-phone" type="tel"></div>
+      </div>
+      <button class="btn amber" onclick="createCC()">Generate CC password</button>
+    </div>
+    <div class="card">
+      <h3>All Content Creators &middot; ${entries.length}</h3>
+      ${entries.length===0?`<div class="empty-state">No Content Creator accounts yet.</div>`:`
+      <table class="data-table">
+        <tr><th>Name</th><th>Phone</th><th>Password</th><th>Status</th><th>Created</th><th></th></tr>
+        ${entries.map(([id,c])=>`<tr>
+          <td>${esc(c.name)}</td><td>${esc(c.phone)}</td><td class="mono">${esc(c.password)}</td>
+          <td><span class="pill ${c.active!==false?'open':'closed'}">${c.active!==false?'Active':'Deactivated'}</span></td>
+          <td>${fmtDateTime(c.createdAt)}</td>
+          <td style="display:flex;gap:6px;flex-wrap:wrap;">
+            <button class="btn small secondary" onclick="toggleCCActive('${id}')">${c.active!==false?'Deactivate':'Reactivate'}</button>
+            <button class="btn small secondary" onclick="resetCCPassword('${id}')">Reset password</button>
+            <button class="btn small danger" onclick="removeCC('${id}')">Remove</button>
+          </td>
+        </tr>`).join('')}
+      </table>`}
+    </div>
+  `;
+}
+async function createCC(){
+  const name = document.getElementById('cc-name').value.trim();
+  const phone = document.getElementById('cc-phone').value.trim();
+  if(!name || !phone){ showToast('Fill in name and phone.', 'error'); return; }
+  if(!/^\d{7,15}$/.test(phone.replace(/\D/g,''))){ showToast('Enter a valid phone number.', 'error'); return; }
+  const existing = await listCCs();
+  const existingPasswords = new Set(Object.values(existing).map(c=>c.password));
+  const password = genTrainerPassword(name, phone, existingPasswords);
+  const ccId = uid();
+  const ok = await kvSet('cc:'+ccId, { name, phone, password, active:true, createdAt:new Date().toISOString() });
+  if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
+  await logHistory('cc_created', `Content Creator ${name} created by ${trainerIdentity.name}`, {ccId, name});
+  lastCCCredential = { name, phone, password };
+  showToast(`Content Creator created. Password: ${password}`, 'success');
+  renderAdminMain();
+}
+async function toggleCCActive(ccId){
+  const c = adminCCs[ccId];
+  if(!c) return;
+  const newActive = c.active===false;
+  await kvSet('cc:'+ccId, { ...c, active:newActive });
+  await logHistory(newActive?'cc_reactivated':'cc_deactivated', `Content Creator ${c.name} ${newActive?'reactivated':'deactivated'} by ${trainerIdentity.name}`, {ccId});
+  showToast(newActive?'Reactivated.':'Deactivated — this account can no longer log in.', 'success');
+  renderAdminMain();
+}
+async function resetCCPassword(ccId){
+  const c = adminCCs[ccId];
+  if(!c) return;
+  showConfirmModal(`Reset ${c.name}'s password? Their old password will stop working immediately.`, async ()=>{
+    const existing = await listCCs();
+    const existingPasswords = new Set(Object.values(existing).filter(x=>x!==c).map(x=>x.password));
+    const newPassword = genTrainerPassword(c.name, c.phone, existingPasswords);
+    await kvSet('cc:'+ccId, { ...c, password:newPassword });
+    await logHistory('cc_password_reset', `Content Creator ${c.name}'s password reset by ${trainerIdentity.name}`, {ccId});
+    lastCCCredential = { name:c.name, phone:c.phone, password:newPassword };
+    showToast(`New password: ${newPassword}`, 'success');
+    renderAdminMain();
+  });
+}
+async function removeCC(ccId){
+  const c = adminCCs[ccId];
+  showConfirmModal(`Permanently remove ${c?.name||ccId}? This cannot be undone.`, async ()=>{
+    await kvDelete('cc:'+ccId);
+    await logHistory('cc_removed', `Content Creator ${c?.name||ccId} removed by ${trainerIdentity.name}`, {ccId});
+    renderAdminMain();
+  });
+}
+
+/* ---- ZONAL TRAINING MANAGER MANAGEMENT (admin only) ---- */
+function renderZTManageTab(){
+  const entries = Object.entries(adminZTs);
+  const passMsg = lastZTCredential ? encodeURIComponent(`Hi ${lastZTCredential.name}, your Urban Company Academy Zonal Training Manager password is: ${lastZTCredential.password}`) : '';
+  return `
+    <div class="crumb">Admin dashboard</div>
+    <h1 class="page-title">Zonal Training Managers</h1>
+    <p class="page-sub">ZT accounts can create partners, manage batches, and view tracking — scoped only to the zones and cities you assign them. They cannot edit modules, branding, or manage other accounts.</p>
+    ${lastZTCredential ? `<div class="credential-banner">
+      <div class="cb-label">Zonal Manager password generated</div>
+      <div class="cb-value">${esc(lastZTCredential.password)}</div>
+      <div class="cb-note">Share this with ${esc(lastZTCredential.name)}. <a onclick="lastZTCredential=null;renderAdminMain();" style="cursor:pointer;">Dismiss</a></div>
+      <div style="margin-top:10px;"><a class="btn small secondary" href="sms:${esc(lastZTCredential.phone)}?body=${passMsg}">Text password to ${esc(lastZTCredential.name)}</a></div>
+    </div>` : ''}
+    <div class="card">
+      <h3>Create a Zonal Training Manager account</h3>
+      <div class="form-grid">
+        <div><span class="field-label">Name</span><input class="field-input" id="zt-name"></div>
+        <div><span class="field-label">Phone number</span><input class="field-input" id="zt-phone" type="tel"></div>
+      </div>
+      <span class="field-label">Assign zones (grants every city in that zone)</span>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px;">
+        ${ZONES.map(z=>`<label style="display:flex;gap:6px;align-items:center;cursor:pointer;"><input type="checkbox" class="zt-new-zone" value="${z}" style="accent-color:var(--brand);">${z}</label>`).join('')}
+      </div>
+      <span class="field-label">Or assign individual cities</span>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px;">
+        ${CITIES.map(c=>`<label style="display:flex;gap:6px;align-items:center;cursor:pointer;"><input type="checkbox" class="zt-new-city" value="${c}" style="accent-color:var(--brand);">${c} <span style="color:var(--ink-soft);font-size:11px;">(${CITY_ZONE[c]})</span></label>`).join('')}
+      </div>
+      <button class="btn amber" onclick="createZT()">Generate ZT password</button>
+    </div>
+    <div class="card">
+      <h3>All Zonal Training Managers &middot; ${entries.length}</h3>
+      ${entries.length===0?`<div class="empty-state">No Zonal Training Manager accounts yet.</div>`:`
+      <table class="data-table">
+        <tr><th>Name</th><th>Phone</th><th>Password</th><th>Assigned</th><th>Status</th><th></th></tr>
+        ${entries.map(([id,z])=>{
+          const zones = z.assignedZones||[]; const cities = z.assignedCities||[];
+          const extraCities = cities.filter(c=>!zones.includes(CITY_ZONE[c]));
+          const assignedText = [...zones, ...extraCities].join(', ') || '— none yet —';
+          return `<tr>
+          <td>${esc(z.name)}</td><td>${esc(z.phone)}</td><td class="mono">${esc(z.password)}</td>
+          <td style="max-width:220px;white-space:normal;">${esc(assignedText)}</td>
+          <td><span class="pill ${z.active!==false?'open':'closed'}">${z.active!==false?'Active':'Deactivated'}</span></td>
+          <td style="display:flex;gap:6px;flex-wrap:wrap;">
+            <button class="btn small secondary" onclick="editZTAssignment('${id}')">Edit zones/cities</button>
+            <button class="btn small secondary" onclick="toggleZTActive('${id}')">${z.active!==false?'Deactivate':'Reactivate'}</button>
+            <button class="btn small secondary" onclick="resetZTPassword('${id}')">Reset password</button>
+            <button class="btn small danger" onclick="removeZT('${id}')">Remove</button>
+          </td>
+        </tr>`;}).join('')}
+      </table>`}
+    </div>
+  `;
+}
+async function createZT(){
+  const name = document.getElementById('zt-name').value.trim();
+  const phone = document.getElementById('zt-phone').value.trim();
+  const assignedZones = Array.from(document.querySelectorAll('.zt-new-zone:checked')).map(el=>el.value);
+  const assignedCities = Array.from(document.querySelectorAll('.zt-new-city:checked')).map(el=>el.value);
+  if(!name || !phone){ showToast('Fill in name and phone.', 'error'); return; }
+  if(!/^\d{7,15}$/.test(phone.replace(/\D/g,''))){ showToast('Enter a valid phone number.', 'error'); return; }
+  const existing = await listZTs();
+  const existingPasswords = new Set(Object.values(existing).map(z=>z.password));
+  const password = genTrainerPassword(name, phone, existingPasswords);
+  const ztId = uid();
+  const ok = await kvSet('zt:'+ztId, { name, phone, password, active:true, assignedZones, assignedCities, assignedTrainerIds:[], createdAt:new Date().toISOString() });
+  if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
+  await logHistory('zt_created', `Zonal Training Manager ${name} created by ${trainerIdentity.name}`, {ztId, name, assignedZones, assignedCities});
+  lastZTCredential = { name, phone, password };
+  showToast(`Zonal Training Manager created. Password: ${password}`, 'success');
+  renderAdminMain();
+}
+function editZTAssignment(ztId){
+  const z = adminZTs[ztId];
+  if(!z) return;
+  const zones = z.assignedZones||[]; const cities = z.assignedCities||[];
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `<div class="confirm-box" style="max-width:520px;text-align:left;">
+    <h3 style="margin-top:0;">Zones &amp; cities for ${esc(z.name)}</h3>
+    <span class="field-label">Zones</span>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px;">
+      ${ZONES.map(zn=>`<label style="display:flex;gap:6px;align-items:center;cursor:pointer;"><input type="checkbox" class="zt-edit-zone" value="${zn}" ${zones.includes(zn)?'checked':''} style="accent-color:var(--brand);">${zn}</label>`).join('')}
+    </div>
+    <span class="field-label">Individual cities</span>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px;">
+      ${CITIES.map(c=>`<label style="display:flex;gap:6px;align-items:center;cursor:pointer;"><input type="checkbox" class="zt-edit-city" value="${c}" ${cities.includes(c)?'checked':''} style="accent-color:var(--brand);">${c}</label>`).join('')}
+    </div>
+    <div class="confirm-actions">
+      <button class="btn secondary" id="zt-edit-cancel">Cancel</button>
+      <button class="btn amber" onclick="saveZTAssignment('${ztId}')">Save assignment</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#zt-edit-cancel').addEventListener('click', ()=> overlay.remove());
+}
+async function saveZTAssignment(ztId){
+  const z = adminZTs[ztId];
+  if(!z) return;
+  const assignedZones = Array.from(document.querySelectorAll('.zt-edit-zone:checked')).map(el=>el.value);
+  const assignedCities = Array.from(document.querySelectorAll('.zt-edit-city:checked')).map(el=>el.value);
+  await kvSet('zt:'+ztId, { ...z, assignedZones, assignedCities });
+  await logHistory('zt_assignment_updated', `${z.name}'s zone/city assignment updated by ${trainerIdentity.name}`, {ztId, assignedZones, assignedCities});
+  document.querySelectorAll('.confirm-overlay').forEach(o=>o.remove());
+  showToast('Assignment saved.', 'success');
+  renderAdminMain();
+}
+async function toggleZTActive(ztId){
+  const z = adminZTs[ztId];
+  if(!z) return;
+  const newActive = z.active===false;
+  await kvSet('zt:'+ztId, { ...z, active:newActive });
+  await logHistory(newActive?'zt_reactivated':'zt_deactivated', `Zonal Training Manager ${z.name} ${newActive?'reactivated':'deactivated'} by ${trainerIdentity.name}`, {ztId});
+  showToast(newActive?'Reactivated.':'Deactivated — this account can no longer log in.', 'success');
+  renderAdminMain();
+}
+async function resetZTPassword(ztId){
+  const z = adminZTs[ztId];
+  if(!z) return;
+  showConfirmModal(`Reset ${z.name}'s password? Their old password will stop working immediately.`, async ()=>{
+    const existing = await listZTs();
+    const existingPasswords = new Set(Object.values(existing).filter(x=>x!==z).map(x=>x.password));
+    const newPassword = genTrainerPassword(z.name, z.phone, existingPasswords);
+    await kvSet('zt:'+ztId, { ...z, password:newPassword });
+    await logHistory('zt_password_reset', `Zonal Training Manager ${z.name}'s password reset by ${trainerIdentity.name}`, {ztId});
+    lastZTCredential = { name:z.name, phone:z.phone, password:newPassword };
+    showToast(`New password: ${newPassword}`, 'success');
+    renderAdminMain();
+  });
+}
+async function removeZT(ztId){
+  const z = adminZTs[ztId];
+  showConfirmModal(`Permanently remove ${z?.name||ztId}? This cannot be undone.`, async ()=>{
+    await kvDelete('zt:'+ztId);
+    await logHistory('zt_removed', `Zonal Training Manager ${z?.name||ztId} removed by ${trainerIdentity.name}`, {ztId});
     renderAdminMain();
   });
 }
@@ -3465,7 +3818,7 @@ function renderPartnersTab(){
       <div class="form-grid">
         <div><span class="field-label">Partner name</span><input class="field-input" id="p-name"></div>
         <div><span class="field-label">Partner office ID</span><input class="field-input" id="p-office"></div>
-        ${isAdminRole() ? `<div class="full"><span class="field-label">Trainer name</span><select class="field-input" id="p-trainer-select"><option value="">Select trainer</option>${trainerOptions}</select></div>`
+        ${(isAdminRole()||isZTRole()) ? `<div class="full"><span class="field-label">Trainer name</span><select class="field-input" id="p-trainer-select"><option value="">Select trainer</option>${trainerOptions}</select></div>`
         : `<div class="full"><span class="field-label">Trainer name</span><div class="readonly-chip">${esc(trainerIdentity.name)} — ${esc(trainerIdentity.city)}</div></div>`}
       </div>
       <button class="btn amber" onclick="createPartner()">Generate partner password</button>
@@ -3484,7 +3837,7 @@ async function createPartner(){
   const name = document.getElementById('p-name').value.trim();
   const officeId = document.getElementById('p-office').value.trim();
   let trainerName, city, trainerId;
-  if(isAdminRole()){
+  if(isAdminRole()||isZTRole()){
     const sel = document.getElementById('p-trainer-select').value;
     if(!sel){ showToast('Select which trainer this partner belongs to.', 'error'); return; }
     [trainerId, trainerName, city] = sel.split('|');
@@ -3520,7 +3873,7 @@ let trackingOverridesCache = {};
 let trackingBatchesCache = [];
 async function loadTrackingData(){
   const all = await listRoster();
-  adminRoster = isAdminRole() ? all : Object.fromEntries(Object.entries(all).filter(([,r])=>r.city===trainerIdentity.city && r.trainer===trainerIdentity.name));
+  adminRoster = Object.fromEntries(Object.entries(all).filter(([,r])=>isRosterEntryVisibleToViewer(r)));
   const ids = Object.keys(adminRoster);
   adminProgressCache = {}; adminCheckinsCache = {}; trackingOverridesCache = {};
   await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id); if(ov) trackingOverridesCache[d.id] = ov; }));
@@ -3552,26 +3905,30 @@ function renderTrackingTab(){
   const entries = Object.entries(adminRoster);
   const cities = [...new Set(entries.map(([,r])=>r.city))];
   const trainers = [...new Set(entries.map(([,r])=>r.trainer))];
+  const showFilters = isAdminRole() || isZTRole();
   return `
-    <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'}</div>
+    <div class="crumb">${isAdminRole()?'Admin dashboard':isZTRole()?'Zonal Manager dashboard':'Trainer dashboard'}</div>
     <h1 class="page-title">Tracking</h1>
-    <p class="page-sub">${isAdminRole()?"Every partner's attendance, assessment scores, ratings, and pass/fail status.":"Your partners' attendance, assessment scores, ratings, and pass/fail status."}</p>
+    <p class="page-sub">${isAdminRole()?"Every partner's attendance, assessment scores, ratings, and pass/fail status.":isZTRole()?"Partners' attendance, scores, and pass/fail status across your assigned zones and cities.":"Your partners' attendance, assessment scores, ratings, and pass/fail status."}</p>
     <div class="filter-row">
-      ${isAdminRole()? `<select id="f-city" onchange="applyTrackingFilter()"><option value="">All cities</option>${cities.map(c=>`<option>${esc(c)}</option>`).join('')}</select>
+      ${showFilters ? `<select id="f-zone" onchange="applyTrackingFilter()"><option value="">All zones</option>${ZONES.map(z=>`<option>${esc(z)}</option>`).join('')}</select>
+      <select id="f-city" onchange="applyTrackingFilter()"><option value="">All cities</option>${cities.map(c=>`<option>${esc(c)}</option>`).join('')}</select>
       <select id="f-trainer" onchange="applyTrackingFilter()"><option value="">All trainers</option>${trainers.map(t=>`<option>${esc(t)}</option>`).join('')}</select>` : ''}
       <button class="btn secondary small" onclick="renderAdminMain()">Refresh</button>
       <button class="btn amber small" onclick="exportExcel()">Export Excel</button>
     </div>
-    <div id="tracking-table-wrap">${renderTrackingTableInner('','')}</div>
+    <div id="tracking-table-wrap">${renderTrackingTableInner('','','')}</div>
   `;
 }
 function applyTrackingFilter(){
+  const z = document.getElementById('f-zone')?.value || '';
   const c = document.getElementById('f-city')?.value || '';
   const t = document.getElementById('f-trainer')?.value || '';
-  document.getElementById('tracking-table-wrap').innerHTML = renderTrackingTableInner(c,t);
+  document.getElementById('tracking-table-wrap').innerHTML = renderTrackingTableInner(c,t,z);
 }
-function renderTrackingTableInner(cityFilter, trainerFilter){
+function renderTrackingTableInner(cityFilter, trainerFilter, zoneFilter){
   let entries = Object.entries(adminRoster);
+  if(zoneFilter) entries = entries.filter(([,r])=>CITY_ZONE[r.city]===zoneFilter);
   if(cityFilter) entries = entries.filter(([,r])=>r.city===cityFilter);
   if(trainerFilter) entries = entries.filter(([,r])=>r.trainer===trainerFilter);
   if(entries.length===0) return `<div class="card"><div class="empty-state">No partners match this filter yet.</div></div>`;
