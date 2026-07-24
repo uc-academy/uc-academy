@@ -1695,7 +1695,7 @@ function renderSidebar(){
     <div class="who-card">
       <div class="who-name">${esc(currentUser.name)}</div>
       <div class="who-meta">${esc(currentUser.city)} &middot; Trainer: ${esc(currentUser.trainer)}<br>ID: ${esc(currentUser.id)}</div>
-      <div class="who-actions"><span onclick="checkOutNow()">Check out</span><span onclick="switchId()">Switch ID</span></div>
+      <div class="who-actions"><span onclick="checkOutNow()">Check out</span><span onclick="switchId()">Switch ID</span><span onclick="refreshPartnerData()">Refresh</span></div>
     </div>
     <div style="margin:0 16px 14px;">
       <span class="field-label" style="color:rgba(255,255,255,0.6);">Language</span>
@@ -1754,6 +1754,28 @@ function knobRow(d){
   `;
 }
 function lockedToast(d){ showToast('Day '+d+' has not been unlocked by your trainer yet.', 'error'); }
+async function refreshPartnerData(){
+  if(!currentUser) return;
+  const r = await getRosterEntry(currentUser.id);
+  if(!r){ showToast("Couldn't refresh — check your connection.", 'error'); return; }
+  currentUserUnlockedDays = await getUnlock(r.city, r.trainer);
+  currentUserAssessmentUnlockedDays = await getAssessmentUnlock(r.city, r.trainer);
+  currentUserProgress = await getProgress(currentUser.id);
+  await loadAndApplyDayRegistry();
+  for(const d of DAYS) ensureDay(d.id);
+  await Promise.all(DAYS.map(async d=>{
+    videosCache[d.id]=await getVideoUrl(d.id);
+    audiosCache[d.id]=await getAudioUrl(d.id);
+    extraVideosCache[d.id]=await getExtraVideos(d.id);
+    extraAudiosCache[d.id]=await getExtraAudios(d.id);
+    const result = await getContentOverrideWithFallback(d.id, currentUser.courseId, currentUser.preferredLanguage);
+    if(result.data) contentOverrides[d.id] = migrateOldOverrideToUnified(result.data);
+    else delete contentOverrides[d.id];
+  }));
+  if(currentDay>0 && currentDay<98) cleanupPlayer();
+  showToast('Refreshed with the latest progress and content.', 'success');
+  renderApp();
+}
 function goTo(dayId, tab){
   if(dayId>0 && dayId<98 && !isDayUnlocked(dayId)){ lockedToast(dayId); return; }
   cleanupPlayer();
@@ -1793,6 +1815,29 @@ async function refreshDayContent(dayId){
   await loadMyMedia(dayId);
 }
 let myMediaCache = {};
+function goToNextStep(){
+  const day = DAYS.find(d=>d.id===currentDay);
+  if(!day) return;
+  ensureDay(currentDay);
+  const ov = contentOverrides[currentDay];
+  const sequence = ov ? ['theory','assignment','quiz'] : ['theory','video','assignment','quiz'];
+  const curIdx = sequence.indexOf(currentTab);
+  if(curIdx===-1) return;
+  if(curIdx < sequence.length-1){
+    setTab(sequence[curIdx+1]);
+    return;
+  }
+  const dp = currentUserProgress[currentDay];
+  if(!dp.quizSubmitted){ showToast('Submit the assessment first.', 'error'); return; }
+  const idx = DAYS.findIndex(d=>d.id===currentDay);
+  const nextDay = DAYS[idx+1];
+  if(nextDay){
+    if(isDayUnlocked(nextDay.id)) goTo(nextDay.id, 'theory');
+    else showToast("Your next day isn't unlocked yet — check with your Trainer.", 'error');
+  } else {
+    goTo(99, 'theory');
+  }
+}
 function setTab(tab){
   const day = DAYS.find(d=>d.id===currentDay);
   ensureDay(day.id);
@@ -1900,6 +1945,9 @@ function renderDayShell(day){
     <p class="page-sub">${esc(displaySub)}</p>
     <div class="tabs">${tabsHtml}</div>
     <div id="tab-content">${renderTab(day)}</div>
+    <div style="display:flex;justify-content:flex-end;margin-top:18px;">
+      <button class="btn amber" onclick="goToNextStep()">Next &rarr;</button>
+    </div>
     ${showAiButton ? `<button class="btn amber" onclick="openAiTrainerChat(${day.id})" style="position:fixed;bottom:20px;right:20px;border-radius:24px;padding:12px 18px;box-shadow:0 4px 14px rgba(0,0,0,0.25);z-index:50;">&#128172; Hello Trainer</button>` : ''}
   `;
 }
@@ -2185,7 +2233,12 @@ async function pollOverrideYT(dayId, idx, key){
     ensureDay(dayId);
     const dp = currentUserProgress[dayId];
     const prev = dp.videoItemProgress[idx] || {pct:0, done:false, ranges:[], lastTime:null};
-    const ranges = prev.ranges ? prev.ranges.map(r=>[r[0],r[1]]) : [];
+    let ranges = prev.ranges ? prev.ranges.map(r=>[r[0],r[1]]) : [];
+    if(prev.done && ranges.length===0){
+      // Migration safety: this video was already completed under data saved before range-tracking existed
+      // (or via a path that didn't record ranges). Treat it as fully covered rather than losing that progress.
+      ranges = [[0, dur]];
+    }
     const POLL_INTERVAL_SEC = 2;
     if(prev.lastTime !== null && prev.lastTime !== undefined){
       const delta = cur - prev.lastTime;
@@ -2195,8 +2248,8 @@ async function pollOverrideYT(dayId, idx, key){
     }
     const merged = mergeWatchRanges(ranges);
     const watchedSec = totalWatchedSeconds(merged);
-    const pct = Math.min(100, Math.round((watchedSec/dur)*100));
-    const done = pct>=90;
+    const pct = Math.max(prev.done?100:0, Math.min(100, Math.round((watchedSec/dur)*100)));
+    const done = pct>=90 || !!prev.done;
     const changed = pct !== (prev.pct||0) || done !== !!prev.done;
     dp.videoItemProgress[idx] = { pct, done, ranges: merged, lastTime: cur };
     checkInVideoQuizTriggers(dayId, idx, key, cur);
@@ -2532,7 +2585,10 @@ async function pollYT(dayId){
     const cur = ytPlayer.getCurrentTime();
     if(!dur) return;
     const dp = currentUserProgress[dayId];
-    const ranges = dp.videoRanges ? dp.videoRanges.map(r=>[r[0],r[1]]) : [];
+    let ranges = dp.videoRanges ? dp.videoRanges.map(r=>[r[0],r[1]]) : [];
+    if(dp.videoDone && ranges.length===0){
+      ranges = [[0, dur]];
+    }
     const POLL_INTERVAL_SEC = 2;
     if(dp.videoLastTime !== null && dp.videoLastTime !== undefined){
       const delta = cur - dp.videoLastTime;
@@ -2542,7 +2598,7 @@ async function pollYT(dayId){
     }
     const merged = mergeWatchRanges(ranges);
     const watchedSec = totalWatchedSeconds(merged);
-    const pct = Math.min(100, Math.round((watchedSec/dur)*100));
+    const pct = Math.max(dp.videoDone?100:0, Math.min(100, Math.round((watchedSec/dur)*100)));
     const changed = pct !== (dp.videoPct||0);
     dp.videoRanges = merged;
     dp.videoLastTime = cur;
@@ -2753,6 +2809,28 @@ function renderKeyLearningPoints(){
     ${sections}
   `;
 }
+function downloadReportCard(){
+  const s = overallStats();
+  const rows = DAYS.map(d=>{
+    const dp = currentUserProgress[d.id]||defaultDayProgress();
+    const r = dayRating(d.id);
+    return `<tr><td>Day ${d.id}</td><td>${esc(d.title)}</td><td>${dp.quizSubmitted?dp.quizScore+'/'+dp.quizTotal+' ('+dp.quizPct+'%)':'—'}</td><td>${dp.quizSubmitted?ratingOutOf5(dp.quizScore,dp.quizTotal)+'/5':'—'}</td><td>${esc(ratingLabel(r))}</td><td>${r.pass===null?'—':(r.pass?'Pass':'Fail')}</td></tr>`;
+  }).join('');
+  const html = `<html><head><title>Report Card - ${esc(currentUser.name)}</title>
+    <style>body{font-family:Arial,sans-serif;padding:30px;color:#222;} table{width:100%;border-collapse:collapse;margin-top:16px;} th,td{border:1px solid #ccc;padding:8px;text-align:left;font-size:13px;} th{background:#f4f4f4;} h1{margin-bottom:4px;}</style>
+    </head><body>
+    <h1>${esc(COURSE_NAME)} — Report Card</h1>
+    <p>${esc(currentUser.name)} &middot; ${esc(currentUser.city)} &middot; Trainer: ${esc(currentUser.trainer)}</p>
+    <table><tr><th>Day</th><th>Topic</th><th>Score</th><th>Rating /5</th><th>Level</th><th>Status</th></tr>${rows}</table>
+    ${s.overall ? `<p style="margin-top:16px;"><b>Overall score:</b> ${s.overall.pct}% &middot; <b>Rating:</b> ${esc(s.overall.rating)} &middot; <b>Result:</b> ${s.overall.pass?'PASS':'FAIL'}</p>` : ''}
+    <p style="margin-top:20px;color:#888;font-size:12px;">Issued ${new Date().toLocaleDateString('en-IN',{year:'numeric',month:'long',day:'numeric'})}</p>
+    </body></html>`;
+  const w = window.open('', '_blank');
+  if(!w){ showToast('Please allow pop-ups to download the report card.', 'error'); return; }
+  w.document.write(html);
+  w.document.close();
+  w.print();
+}
 function renderResult(){
   const s = overallStats();
   const ready = s.done===s.total && !!(s.overall && s.overall.pass);
@@ -2774,6 +2852,7 @@ function renderResult(){
       <h3>Final result</h3>
       <p>Overall score: <b class="mono">${s.overall.pct}%</b> &middot; Rating: <span class="rating-pill ${s.overall.ratingKey}">${s.overall.rating}</span> &middot; ${s.overall.pass?'<b style="color:var(--success);">PASS</b>':'<b style="color:var(--danger);">FAIL</b>'}</p>
       <p style="font-size:12.5px;color:var(--ink-soft);">This reflects your online knowledge checks only. Your trainer's hands-on practical assessment on Day 7 is scored separately and offline.</p>
+      <button class="btn amber small" onclick="downloadReportCard()" style="margin-top:8px;">Download Report Card</button>
     </div>` : `<div class="lock-banner">Complete and submit all 7 assessments to see your final rating.</div>`}
     <div class="cert-page"><div class="cert-box">
       <div class="eyebrow">${esc(COURSE_NAME)} certifies that</div>
