@@ -3020,12 +3020,16 @@ async function renderAdminMain(){
       await seedDefaultCategoriesIfEmpty();
       adminCategories = await listCategories();
       adminCourses = await listCourses();
-      adminModuleStatus = {};
-      await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id, null, editingLanguage); adminModuleStatus[d.id] = !!ov; adminModuleOverrideCache[d.id] = ov; }));
-      const homeOv = await getContentOverride('home', null, editingLanguage);
-      adminModuleStatus['home'] = !!homeOv;
-      adminModuleOverrideCache['home'] = homeOv;
-      el.innerHTML = renderModulesListTab();
+      if(isCCRole()){
+        el.innerHTML = renderCCModulesLandingTab();
+      } else {
+        adminModuleStatus = {};
+        await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id, null, editingLanguage); adminModuleStatus[d.id] = !!ov; adminModuleOverrideCache[d.id] = ov; }));
+        const homeOv = await getContentOverride('home', null, editingLanguage);
+        adminModuleStatus['home'] = !!homeOv;
+        adminModuleOverrideCache['home'] = homeOv;
+        el.innerHTML = renderModulesListTab();
+      }
     }
   }
   else if(adminTab==='tracking'){ await loadTrackingData(); el.innerHTML = renderTrackingTab(); }
@@ -4665,6 +4669,128 @@ async function exportExcel(){
 /* ---- MODULES (CMS) — admin only ---- */
 let courseEditorDays = [];
 let courseEditorOverrideCache = {};
+function renderCCModulesLandingTab(){
+  const assigned = trainerIdentity.assignedCategories || [];
+  const myCategories = Object.entries(adminCategories).filter(([id])=>assigned.includes(id));
+  const lastCatId = localStorage.getItem('uca_last_cc_category') || '';
+  const catStillValid = lastCatId && myCategories.some(([id])=>id===lastCatId);
+  const coursesInLastCat = catStillValid ? Object.entries(adminCourses).filter(([,c])=>c.categoryId===lastCatId) : [];
+  const lastCourseId = localStorage.getItem('uca_last_cc_course') || '';
+  return `
+    <div class="crumb">Content Creator</div>
+    <h1 class="page-title">Modules</h1>
+    <p class="page-sub">Pick a category and course to edit. You can only see categories your Admin has assigned to you.</p>
+    ${myCategories.length===0 ? `<div class="card"><div class="empty-state">No categories assigned to you yet — ask your Admin to assign one, or add a new one below.</div></div>` : ''}
+    <div class="card">
+      <h3>Select what to edit</h3>
+      <div class="form-grid">
+        <div>
+          <span class="field-label">Category</span>
+          <select class="field-input" id="cc-select-category" onchange="onCcCategoryChange()">
+            <option value="">— Select category —</option>
+            ${myCategories.map(([id,cat])=>`<option value="${id}" ${catStillValid && lastCatId===id?'selected':''}>${esc(cat.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <span class="field-label">Course</span>
+          <select class="field-input" id="cc-select-course">
+            <option value="">— Select course —</option>
+            ${coursesInLastCat.map(([id,course])=>`<option value="${id}" ${lastCourseId===id?'selected':''}>${esc(course.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <span class="field-label">Language</span>
+          <select class="field-input" id="cc-select-language">
+            ${Object.values(adminLanguages).filter(l=>l.active!==false).map(l=>`<option value="${esc(l.name)}" ${editingLanguage===l.name?'selected':''}>${esc(l.name)}${l.isDefault?' (default)':''}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <button class="btn amber" onclick="ccJumpToCourseModules()">Edit this course's modules &rarr;</button>
+    </div>
+    <div class="card">
+      <h3>Add new</h3>
+      <div class="form-grid">
+        <div>
+          <span class="field-label">+ Add new category</span>
+          <div style="display:flex;gap:8px;">
+            <input class="field-input" id="cc-new-category-name" style="margin-bottom:0;" placeholder="Category name">
+            <button class="btn secondary small" onclick="ccCreateCategory()">Add</button>
+          </div>
+        </div>
+        <div>
+          <span class="field-label">+ Add new course (in selected category)</span>
+          <div style="display:flex;gap:8px;">
+            <input class="field-input" id="cc-new-course-name" style="margin-bottom:0;" placeholder="Course name">
+            <button class="btn secondary small" onclick="ccCreateCourse()">Add</button>
+          </div>
+        </div>
+        <div>
+          <span class="field-label">+ Add new language</span>
+          <div style="display:flex;gap:8px;">
+            <input class="field-input" id="cc-new-language-name" style="margin-bottom:0;" placeholder="e.g. Tamil">
+            <button class="btn secondary small" onclick="ccCreateLanguage()">Add</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+function onCcCategoryChange(){
+  const catSelect = document.getElementById('cc-select-category');
+  const courseSelect = document.getElementById('cc-select-course');
+  const catId = catSelect.value;
+  const courses = catId ? Object.entries(adminCourses).filter(([,c])=>c.categoryId===catId) : [];
+  courseSelect.innerHTML = `<option value="">— Select course —</option>` + courses.map(([id,course])=>`<option value="${id}">${esc(course.name)}</option>`).join('');
+}
+function ccJumpToCourseModules(){
+  const catId = document.getElementById('cc-select-category').value;
+  const courseId = document.getElementById('cc-select-course').value;
+  const lang = document.getElementById('cc-select-language').value;
+  if(!courseId){ showToast('Select a course first.', 'error'); return; }
+  localStorage.setItem('uca_last_cc_category', catId);
+  localStorage.setItem('uca_last_cc_course', courseId);
+  editingLanguage = lang || DEFAULT_LANGUAGE;
+  openCourseModuleEditor(courseId);
+}
+async function ccCreateCategory(){
+  const nameEl = document.getElementById('cc-new-category-name');
+  const name = nameEl.value.trim();
+  if(!name){ showToast('Enter a category name.', 'error'); return; }
+  const existing = Object.values(adminCategories).map(c=>c.name.toLowerCase());
+  if(existing.includes(name.toLowerCase())){ showToast('A category with that name already exists.', 'error'); return; }
+  const categoryId = uid();
+  await kvSet('category:'+categoryId, { name, active:true, createdAt:new Date().toISOString() });
+  const c = await kvGet('cc:'+trainerIdentity.ccId);
+  const updatedAssigned = [...(c.assignedCategories||[]), categoryId];
+  await kvSet('cc:'+trainerIdentity.ccId, { ...c, assignedCategories:updatedAssigned });
+  trainerIdentity.assignedCategories = updatedAssigned;
+  await logHistory('category_created', `Category "${name}" created by Content Creator ${trainerIdentity.name}`, {categoryId, name});
+  showToast('Category added — you can select it now.', 'success');
+  renderAdminMain();
+}
+async function ccCreateCourse(){
+  const catId = document.getElementById('cc-select-category').value;
+  if(!catId){ showToast('Select a category first.', 'error'); return; }
+  const nameEl = document.getElementById('cc-new-course-name');
+  const name = nameEl.value.trim();
+  if(!name){ showToast('Enter a course name.', 'error'); return; }
+  const courseId = uid();
+  await kvSet('course:'+courseId, { categoryId:catId, name, active:true, status:'Draft', createdAt:new Date().toISOString() });
+  await logHistory('course_created', `Course "${name}" added by Content Creator ${trainerIdentity.name}`, {courseId, categoryId:catId, name});
+  showToast('Course added as Draft — you can select it now.', 'success');
+  renderAdminMain();
+}
+async function ccCreateLanguage(){
+  const nameEl = document.getElementById('cc-new-language-name');
+  const name = nameEl.value.trim();
+  if(!name){ showToast('Enter a language name.', 'error'); return; }
+  const existing = Object.values(adminLanguages).map(l=>l.name.toLowerCase());
+  if(existing.includes(name.toLowerCase())){ showToast('That language already exists.', 'error'); return; }
+  await kvSet('language:'+name, { name, isDefault:false, active:true, createdAt:new Date().toISOString() });
+  await logHistory('language_created', `Language "${name}" added by Content Creator ${trainerIdentity.name}`, {name});
+  showToast('Language added.', 'success');
+  renderAdminMain();
+}
 function onQuickCategoryChange(){
   const catSelect = document.getElementById('quick-select-category');
   const courseSelect = document.getElementById('quick-select-course');
