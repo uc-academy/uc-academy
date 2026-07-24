@@ -643,6 +643,39 @@ function storageWarningBanner(){
 async function logHistory(type, text, meta){
   await kvSet('history:'+String(Date.now()).padStart(14,'0')+'_'+uid(), { type, text, meta: meta||{}, at: new Date().toISOString() });
 }
+const MAX_FAILED_ATTEMPTS = 5;
+function isAccountLocked(acct){ return !!(acct && acct.locked); }
+function newSessionToken(){ return uid()+'_'+Date.now(); }
+function sessionTokenKey(type, id){ return 'sessionToken:'+type+':'+id; }
+async function getStoredSessionToken(type, id){ const v = await kvGet(sessionTokenKey(type,id)); return v ? v.token : null; }
+async function setStoredSessionToken(type, id, token){ return await kvSet(sessionTokenKey(type,id), { token }); }
+async function clearStoredSessionToken(type, id){ await kvDelete(sessionTokenKey(type,id)); }
+function detectDeviceBrowser(){
+  const ua = navigator.userAgent || '';
+  let device = 'Desktop';
+  if(/Tablet|iPad/i.test(ua)) device = 'Tablet';
+  else if(/Mobi|Android/i.test(ua)) device = 'Mobile';
+  let browser = 'Other';
+  if(/Edg\//.test(ua)) browser = 'Edge';
+  else if(/OPR\//.test(ua)) browser = 'Opera';
+  else if(/Chrome\//.test(ua) && !/Edg\//.test(ua)) browser = 'Chrome';
+  else if(/Firefox\//.test(ua)) browser = 'Firefox';
+  else if(/Safari\//.test(ua) && !/Chrome/.test(ua)) browser = 'Safari';
+  return { device, browser };
+}
+async function logLoginEvent(accountType, accountId, accountName, event, extra){
+  const { device, browser } = detectDeviceBrowser();
+  const id = String(Date.now()).padStart(14,'0')+'_'+uid();
+  await kvSet('loginLog:'+id, { id, accountType, accountId, accountName, event, device, browser, at:new Date().toISOString(), ...(extra||{}) });
+  return id;
+}
+async function listLoginLogs(limit){
+  const keys = (await kvList('loginLog:')).sort().reverse();
+  const capped = keys.slice(0, limit||500);
+  const out = [];
+  await Promise.all(capped.map(async k=>{ const v = await kvGet(k); if(v) out.push(v); }));
+  return out.sort((a,b)=> new Date(b.at)-new Date(a.at));
+}
 async function listHistory(limit){
   const keys = (await kvList('history:')).sort().reverse();
   const capped = keys.slice(0, limit||300);
@@ -1224,6 +1257,10 @@ let trainerIdentity = null;
 let gateMode = 'partner';
 let gateError = '';
 let gateBusy = false;
+let currentSessionToken = null;
+let currentSessionRole = null;
+let currentSessionAccountId = null;
+let sessionCheckTimer = null;
 let showRecovery = false;
 let currentDay = 0;
 let currentTab = 'theory';
@@ -1367,6 +1404,8 @@ function renderGate(){
 }
 function renderCCGateFields(){
   return `
+    <span class="field-label">Name</span>
+    <input class="field-input" id="cc-name-input">
     <span class="field-label">Password</span>
     <input class="field-input" id="cc-pass-input" type="password">
     <button class="gate-submit" onclick="submitCCLogin()" ${gateBusy?'disabled':''}>${gateBusy?'Checking...':'Login'}</button>
@@ -1375,6 +1414,8 @@ function renderCCGateFields(){
 }
 function renderZTGateFields(){
   return `
+    <span class="field-label">Name</span>
+    <input class="field-input" id="zt-name-input">
     <span class="field-label">Password</span>
     <input class="field-input" id="zt-pass-input" type="password">
     <button class="gate-submit" onclick="submitZTLogin()" ${gateBusy?'disabled':''}>${gateBusy?'Checking...':'Login'}</button>
@@ -1476,6 +1517,13 @@ async function loginAsPartner(id, opts){
   opts = opts || {};
   const r = await getRosterEntry(id);
   if(!r) return { ok:false, reason:"That ID wasn't recognised. Double check with your trainer." };
+  if(isAccountLocked(r)) return { ok:false, reason:'This ID has been locked. Ask your trainer or Admin to unlock it.' };
+  if(opts.silent){
+    if(opts.sessionToken){
+      const stored = await getStoredSessionToken('partner', id);
+      if(stored && opts.sessionToken!==stored) return { ok:false, reason:'session_replaced' };
+    }
+  }
   const allSessions = await listSessions();
   const result = findSessionForRoster(r, allSessions);
   if(result.status!=='active'){
@@ -1510,8 +1558,16 @@ async function loginAsPartner(id, opts){
   const homeOv = await getContentOverride('home');
   if(homeOv) contentOverrides['home'] = migrateOldOverrideToUnified(homeOv);
   await logCheckin(s);
-  if(!opts.silent) await logHistory('partner_login', `${r.name} (${id}) checked in for Day ${s.day}`, {partnerId:id, city:r.city, trainer:r.trainer, day:s.day});
-  saveSession({ role:'partner', partnerId:id });
+  let sessionToken = opts.sessionToken;
+  if(!opts.silent){
+    sessionToken = newSessionToken();
+    await setStoredSessionToken('partner', id, sessionToken);
+    await logHistory('partner_login', `${r.name} (${id}) checked in for Day ${s.day}`, {partnerId:id, city:r.city, trainer:r.trainer, day:s.day});
+    await logLoginEvent('partner', id, r.name, 'success');
+  }
+  saveSession({ role:'partner', partnerId:id, sessionToken });
+  currentSessionRole = 'partner'; currentSessionAccountId = id;
+  currentSessionToken = sessionToken;
   return { ok:true };
 }
 
@@ -1551,9 +1607,24 @@ async function loginAsTrainer(trainerId, opts){
   opts = opts || {};
   const t = await kvGet('trainer:'+trainerId);
   if(!t) return { ok:false };
+  if(isAccountLocked(t)) return { ok:false, reason:'locked' };
+  if(opts.silent){
+    if(opts.sessionToken){
+      const stored = await getStoredSessionToken('trainer', trainerId);
+      if(stored && opts.sessionToken!==stored) return { ok:false, reason:'session_replaced' };
+    }
+  }
   trainerIdentity = { isAdmin:false, trainerId, name:t.name, phone:t.phone, category:t.category, city:t.city };
-  if(!opts.silent) await logHistory('trainer_login', `${t.name} logged in (${t.category} · ${t.city})`, {trainerId, category:t.category, city:t.city});
-  saveSession({ role:'trainer', trainerId });
+  let sessionToken = opts.sessionToken;
+  if(!opts.silent){
+    sessionToken = newSessionToken();
+    await setStoredSessionToken('trainer', trainerId, sessionToken);
+    await logHistory('trainer_login', `${t.name} logged in (${t.category} · ${t.city})`, {trainerId, category:t.category, city:t.city});
+    await logLoginEvent('trainer', trainerId, t.name, 'success');
+  }
+  saveSession({ role:'trainer', trainerId, sessionToken });
+  currentSessionRole = 'trainer'; currentSessionAccountId = trainerId;
+  currentSessionToken = sessionToken;
   return { ok:true };
 }
 
@@ -1566,14 +1637,36 @@ async function submitTrainerLogin(){
   if(!password){ gateError='Enter your password.'; renderGate(); return; }
   gateBusy=true; gateError=''; renderGate();
   const trainers = await listTrainers();
-  const match = Object.entries(trainers).find(([tid,t])=> t.category===category && t.city===city && (t.password||'').toUpperCase()===password);
+  const candidate = Object.entries(trainers).find(([tid,t])=> t.category===category && t.city===city);
+  if(candidate && isAccountLocked(candidate[1])){
+    gateBusy=false;
+    gateError = 'This account is locked after too many failed attempts. Ask your Admin to unlock it.';
+    renderGate();
+    return;
+  }
+  const match = candidate && (candidate[1].password||'').toUpperCase()===password ? candidate : null;
   gateBusy=false;
   if(!match){
+    if(candidate){
+      const [tid, t] = candidate;
+      const attempts = (t.failedAttempts||0)+1;
+      const patch = { failedAttempts: attempts };
+      if(attempts>=MAX_FAILED_ATTEMPTS) patch.locked = true;
+      await kvSet('trainer:'+tid, { ...t, ...patch });
+      await logLoginEvent('trainer', tid, t.name, 'failed', { attempts });
+      if(patch.locked){
+        await logHistory('account_locked', `Trainer ${t.name} locked after ${attempts} failed login attempts`, {trainerId:tid});
+        gateError = 'Too many failed attempts — this account is now locked. Ask your Admin to unlock it.';
+        renderGate();
+        return;
+      }
+    }
     gateError = "Incorrect category, city, or password. If you've forgotten your password, use the link below.";
     renderGate();
     return;
   }
-  const [trainerId] = match;
+  const [trainerId, t] = match;
+  if(t.failedAttempts) await kvSet('trainer:'+trainerId, { ...t, failedAttempts:0 });
   await loginAsTrainer(trainerId);
   adminTab='sessions';
   renderAdmin();
@@ -1582,21 +1675,64 @@ async function loginAsCC(ccId, opts){
   opts = opts || {};
   const c = await kvGet('cc:'+ccId);
   if(!c || c.active===false) return { ok:false };
+  if(isAccountLocked(c)) return { ok:false, reason:'locked' };
+  if(opts.silent){
+    if(opts.sessionToken){
+      const stored = await getStoredSessionToken('cc', ccId);
+      if(stored && opts.sessionToken!==stored) return { ok:false, reason:'session_replaced' };
+    }
+  }
   trainerIdentity = { isAdmin:false, isCC:true, ccId, name:c.name, phone:c.phone, assignedCategories:c.assignedCategories||[], assignedCourses:c.assignedCourses||[], assignedLanguages:c.assignedLanguages||[], permissions: effectiveCCPermissions(c) };
-  if(!opts.silent) await logHistory('cc_login', `${c.name} (Content Creator) logged in`, {ccId});
-  saveSession({ role:'cc', ccId });
+  let sessionToken = opts.sessionToken;
+  if(!opts.silent){
+    sessionToken = newSessionToken();
+    await setStoredSessionToken('cc', ccId, sessionToken);
+    await logHistory('cc_login', `${c.name} (Content Creator) logged in`, {ccId});
+    await logLoginEvent('cc', ccId, c.name, 'success');
+  }
+  saveSession({ role:'cc', ccId, sessionToken });
+  currentSessionRole = 'cc'; currentSessionAccountId = ccId;
+  currentSessionToken = sessionToken;
   return { ok:true };
 }
 async function submitCCLogin(){
   if(gateBusy) return;
+  const name = document.getElementById('cc-name-input').value.trim();
   const password = document.getElementById('cc-pass-input').value.trim().toUpperCase();
+  if(!name){ gateError='Enter your name.'; renderGate(); return; }
   if(!password){ gateError='Enter your password.'; renderGate(); return; }
   gateBusy=true; gateError=''; renderGate();
   const ccs = await listCCs();
-  const match = Object.entries(ccs).find(([id,c])=> c.active!==false && (c.password||'').toUpperCase()===password);
+  const candidate = Object.entries(ccs).find(([id,c])=> c.active!==false && c.name.toLowerCase()===name.toLowerCase());
+  if(candidate && isAccountLocked(candidate[1])){
+    gateBusy=false;
+    gateError = 'This account is locked after too many failed attempts. Ask your Admin to unlock it.';
+    renderGate();
+    return;
+  }
+  const match = candidate && (candidate[1].password||'').toUpperCase()===password ? candidate : null;
   gateBusy=false;
-  if(!match){ gateError = 'Incorrect password, or your access has been deactivated. Contact your Admin.'; renderGate(); return; }
-  const [ccId] = match;
+  if(!match){
+    if(candidate){
+      const [id, c] = candidate;
+      const attempts = (c.failedAttempts||0)+1;
+      const patch = { failedAttempts: attempts };
+      if(attempts>=MAX_FAILED_ATTEMPTS) patch.locked = true;
+      await kvSet('cc:'+id, { ...c, ...patch });
+      await logLoginEvent('cc', id, c.name, 'failed', { attempts });
+      if(patch.locked){
+        await logHistory('account_locked', `Content Creator ${c.name} locked after ${attempts} failed login attempts`, {ccId:id});
+        gateError = 'Too many failed attempts — this account is now locked. Ask your Admin to unlock it.';
+        renderGate();
+        return;
+      }
+    }
+    gateError = 'Incorrect name or password, or your access has been deactivated. Contact your Admin.';
+    renderGate();
+    return;
+  }
+  const [ccId, c] = match;
+  if(c.failedAttempts) await kvSet('cc:'+ccId, { ...c, failedAttempts:0 });
   await loginAsCC(ccId);
   adminTab='modules';
   renderAdmin();
@@ -1605,23 +1741,66 @@ async function loginAsZT(ztId, opts){
   opts = opts || {};
   const z = await kvGet('zt:'+ztId);
   if(!z || z.active===false) return { ok:false };
+  if(isAccountLocked(z)) return { ok:false, reason:'locked' };
+  if(opts.silent){
+    if(opts.sessionToken){
+      const stored = await getStoredSessionToken('zt', ztId);
+      if(stored && opts.sessionToken!==stored) return { ok:false, reason:'session_replaced' };
+    }
+  }
   trainerIdentity = { isAdmin:false, isZT:true, ztId, name:z.name, phone:z.phone, assignedZones:z.assignedZones||[], assignedCities:z.assignedCities||[], assignedCategories:z.assignedCategories||[], assignedTrainerIds:z.assignedTrainerIds||[] };
-  if(!opts.silent) await logHistory('zt_login', `${z.name} (Zonal Training Manager) logged in`, {ztId});
-  saveSession({ role:'zt', ztId });
+  let sessionToken = opts.sessionToken;
+  if(!opts.silent){
+    sessionToken = newSessionToken();
+    await setStoredSessionToken('zt', ztId, sessionToken);
+    await logHistory('zt_login', `${z.name} (Zonal Training Manager) logged in`, {ztId});
+    await logLoginEvent('zt', ztId, z.name, 'success');
+  }
+  saveSession({ role:'zt', ztId, sessionToken });
+  currentSessionRole = 'zt'; currentSessionAccountId = ztId;
+  currentSessionToken = sessionToken;
   return { ok:true };
 }
 let ztSessionCategory = '';
 let ztSessionCluster = '';
 async function submitZTLogin(){
   if(gateBusy) return;
+  const name = document.getElementById('zt-name-input').value.trim();
   const password = document.getElementById('zt-pass-input').value.trim().toUpperCase();
+  if(!name){ gateError='Enter your name.'; renderGate(); return; }
   if(!password){ gateError='Enter your password.'; renderGate(); return; }
   gateBusy=true; gateError=''; renderGate();
   const zts = await listZTs();
-  const match = Object.entries(zts).find(([id,z])=> z.active!==false && (z.password||'').toUpperCase()===password);
+  const candidate = Object.entries(zts).find(([id,z])=> z.active!==false && z.name.toLowerCase()===name.toLowerCase());
+  if(candidate && isAccountLocked(candidate[1])){
+    gateBusy=false;
+    gateError = 'This account is locked after too many failed attempts. Ask your Admin to unlock it.';
+    renderGate();
+    return;
+  }
+  const match = candidate && (candidate[1].password||'').toUpperCase()===password ? candidate : null;
   gateBusy=false;
-  if(!match){ gateError = 'Incorrect password, or your access has been deactivated. Contact your Admin.'; renderGate(); return; }
-  const [ztId] = match;
+  if(!match){
+    if(candidate){
+      const [id, z] = candidate;
+      const attempts = (z.failedAttempts||0)+1;
+      const patch = { failedAttempts: attempts };
+      if(attempts>=MAX_FAILED_ATTEMPTS) patch.locked = true;
+      await kvSet('zt:'+id, { ...z, ...patch });
+      await logLoginEvent('zt', id, z.name, 'failed', { attempts });
+      if(patch.locked){
+        await logHistory('account_locked', `Zonal Training Manager ${z.name} locked after ${attempts} failed login attempts`, {ztId:id});
+        gateError = 'Too many failed attempts — this account is now locked. Ask your Admin to unlock it.';
+        renderGate();
+        return;
+      }
+    }
+    gateError = 'Incorrect name or password, or your access has been deactivated. Contact your Admin.';
+    renderGate();
+    return;
+  }
+  const [ztId, z] = match;
+  if(z.failedAttempts) await kvSet('zt:'+ztId, { ...z, failedAttempts:0 });
   await loginAsZT(ztId);
   ztSessionCategory = ''; ztSessionCluster = '';
   const needsCategoryPick = (trainerIdentity.assignedCategories||[]).length > 1;
@@ -1681,12 +1860,33 @@ function changeZTScope(){
 async function submitAdminLogin(){
   if(gateBusy) return;
   const pass = document.getElementById('admin-pass-input').value.trim();
-  if(pass !== ADMIN_PASSWORD){ gateError='Incorrect admin password.'; renderGate(); return; }
+  const sec = (await kvGet('adminSecurity:global')) || { failedAttempts:0, locked:false };
+  if(sec.locked){ gateError = 'The Admin account is locked after too many failed attempts. Reset it from a trusted device, or wait for the lock to be cleared.'; renderGate(); return; }
+  if(pass !== ADMIN_PASSWORD){
+    const attempts = (sec.failedAttempts||0)+1;
+    const patch = { failedAttempts: attempts, locked: attempts>=MAX_FAILED_ATTEMPTS };
+    await kvSet('adminSecurity:global', { ...sec, ...patch });
+    await logLoginEvent('admin', 'admin', 'Admin', 'failed', { attempts });
+    if(patch.locked){
+      await logHistory('account_locked', `Admin account locked after ${attempts} failed login attempts`, {});
+      gateError = 'Too many failed attempts — the Admin account is now locked.';
+      renderGate();
+      return;
+    }
+    gateError='Incorrect admin password.'; renderGate(); return;
+  }
+  if(sec.failedAttempts) await kvSet('adminSecurity:global', { ...sec, failedAttempts:0 });
+  const sessionToken = newSessionToken();
+  await setStoredSessionToken('admin', 'global', sessionToken);
   trainerIdentity = { isAdmin:true, name: getSavedAdminName() };
   await logHistory('admin_login', 'Admin logged in', {});
-  saveSession({ role:'admin' });
+  await logLoginEvent('admin', 'admin', trainerIdentity.name, 'success');
+  saveSession({ role:'admin', sessionToken });
+  currentSessionRole = 'admin'; currentSessionAccountId = 'global';
+  currentSessionToken = sessionToken;
   adminTab='overview';
   renderAdmin();
+  startSessionWatch();
 }
 function getSavedAdminName(){
   try{ return localStorage.getItem('uca_admin_name') || 'Admin'; }catch(e){ return 'Admin'; }
@@ -1716,41 +1916,66 @@ async function tryRestoreSession(){
   try{
     if(saved.role==='admin'){
       trainerIdentity = { isAdmin:true, name: getSavedAdminName() };
+      currentSessionToken = saved.sessionToken;
+      currentSessionRole = 'admin'; currentSessionAccountId = 'global';
       adminTab='overview';
       renderAdmin();
+      startSessionWatch();
       return true;
     }
     if(saved.role==='trainer'){
-      const result = await loginAsTrainer(saved.trainerId, { silent:true });
-      if(!result.ok){ clearSession(); return false; }
+      const result = await loginAsTrainer(saved.trainerId, { silent:true, sessionToken: saved.sessionToken });
+      if(!result.ok){ clearSession(); sessionReplacedNotice = result.reason==='session_replaced'; return false; }
       adminTab='sessions';
       renderAdmin();
+      startSessionWatch();
       return true;
     }
     if(saved.role==='cc'){
-      const result = await loginAsCC(saved.ccId, { silent:true });
-      if(!result.ok){ clearSession(); return false; }
+      const result = await loginAsCC(saved.ccId, { silent:true, sessionToken: saved.sessionToken });
+      if(!result.ok){ clearSession(); sessionReplacedNotice = result.reason==='session_replaced'; return false; }
       adminTab='modules';
       renderAdmin();
+      startSessionWatch();
       return true;
     }
     if(saved.role==='zt'){
-      const result = await loginAsZT(saved.ztId, { silent:true });
-      if(!result.ok){ clearSession(); return false; }
+      const result = await loginAsZT(saved.ztId, { silent:true, sessionToken: saved.sessionToken });
+      if(!result.ok){ clearSession(); sessionReplacedNotice = result.reason==='session_replaced'; return false; }
       adminTab='partners';
       renderAdmin();
+      startSessionWatch();
       return true;
     }
     if(saved.role==='partner'){
-      const result = await loginAsPartner(saved.partnerId, { silent:true });
-      if(!result.ok){ clearSession(); return false; }
+      const result = await loginAsPartner(saved.partnerId, { silent:true, sessionToken: saved.sessionToken });
+      if(!result.ok){ clearSession(); sessionReplacedNotice = result.reason==='session_replaced'; return false; }
       currentDay = currentUserUnlockedDays.length ? Math.max(...currentUserUnlockedDays) : 0;
       currentTab='theory';
       renderApp();
+      startSessionWatch();
       return true;
     }
   }catch(e){ clearSession(); return false; }
   return false;
+}
+let sessionReplacedNotice = false;
+function startSessionWatch(){
+  if(sessionCheckTimer) clearInterval(sessionCheckTimer);
+  sessionCheckTimer = setInterval(checkSessionStillActive, 15000);
+}
+function stopSessionWatch(){
+  if(sessionCheckTimer){ clearInterval(sessionCheckTimer); sessionCheckTimer = null; }
+}
+async function checkSessionStillActive(){
+  if(!currentSessionRole || !currentSessionAccountId || !currentSessionToken) return;
+  const stored = await getStoredSessionToken(currentSessionRole, currentSessionAccountId);
+  if(stored && stored!==currentSessionToken){
+    stopSessionWatch();
+    clearSession();
+    showToast('You were signed out because this account logged in on another device.', 'error');
+    setTimeout(()=>{ location.reload(); }, 2000);
+  }
 }
 function overallStats(){
   const total = DAYS.length;
@@ -3005,6 +3230,10 @@ function startIssuePolling(){
 function stopIssuePolling(){ if(issuePollTimer){ clearInterval(issuePollTimer); issuePollTimer=null; } }
 let adminMediaCache = [];
 let adminDoubtsCache = [];
+let adminLoginLogs = [];
+let adminSecurityAccounts = [];
+let securityFilterType = '';
+let securityFilterStatus = '';
 let doubtsFilterStatus = '';
 let adminBatchesCache = [];
 let themeDraft = null;
@@ -3050,6 +3279,7 @@ const ADMIN_TAB_KEYS_DEFAULT = [
   ['ccmanage','Content Creators','Manage CC access'],
   ['ztmanage','Zonal Managers','Manage ZT access & zones'],
   ['categories','Category Management','Categories & courses'],
+  ['security','Security & Alerts','Sessions, lockouts & login activity'],
   ['languages','Languages','Regional language content'],
   ['support','Support','Requests & issues'],
   ['history','History','Audit log'],
@@ -3187,6 +3417,16 @@ async function renderAdminMain(){
   else if(adminTab==='ccmanage'){ adminCCs = await listCCs(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); el.innerHTML = renderCCManageTab(); }
   else if(adminTab==='ztmanage'){ adminZTs = await listZTs(); adminTrainers = await listTrainers(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); el.innerHTML = renderZTManageTab(); }
   else if(adminTab==='categories'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderCategoryManageTab(); }
+  else if(adminTab==='security'){
+    adminLoginLogs = await listLoginLogs(500);
+    adminTrainers = await listTrainers();
+    adminCCs = await listCCs();
+    adminZTs = await listZTs();
+    const allRoster = await listRoster();
+    adminRoster = allRoster;
+    adminSecurityAccounts = await allAccountsForSecurity();
+    el.innerHTML = renderSecurityTab();
+  }
   else if(adminTab==='languages'){ await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderLanguagesTab(); }
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
   else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderSessionsTab(); }
@@ -3369,6 +3609,21 @@ async function removeTrainer(trainerId){
     renderAdminMain();
   });
 }
+async function resetTrainerPassword(trainerId){
+  const t = adminTrainers[trainerId];
+  if(!t) return;
+  showConfirmModal(`Reset ${t.name}'s password? Their old password will stop working immediately. Batches, tracking, and history are untouched.`, async ()=>{
+    const existing = await listTrainers();
+    const existingPasswords = new Set(Object.values(existing).filter(x=>x!==t).map(x=>x.password));
+    const newPassword = genTrainerPassword(t.name, t.phone, existingPasswords);
+    await kvSet('trainer:'+trainerId, { ...t, password:newPassword, failedAttempts:0, locked:false });
+    await clearStoredSessionToken('trainer', trainerId);
+    await logHistory('trainer_password_reset', `Trainer ${t.name}'s password reset by ${trainerIdentity.name}`, {trainerId});
+    lastTrainerCredential = { name:t.name, phone:t.phone, password:newPassword };
+    showToast(`New password: ${newPassword}`, 'success');
+    renderAdminMain();
+  });
+}
 
 /* ---- CONTENT CREATOR MANAGEMENT (admin only) ---- */
 function renderCCManageTab(){
@@ -3451,6 +3706,7 @@ async function resetCCPassword(ccId){
     const existingPasswords = new Set(Object.values(existing).filter(x=>x!==c).map(x=>x.password));
     const newPassword = genTrainerPassword(c.name, c.phone, existingPasswords);
     await kvSet('cc:'+ccId, { ...c, password:newPassword });
+    await clearStoredSessionToken('cc', ccId);
     await logHistory('cc_password_reset', `Content Creator ${c.name}'s password reset by ${trainerIdentity.name}`, {ccId});
     lastCCCredential = { name:c.name, phone:c.phone, password:newPassword };
     showToast(`New password: ${newPassword}`, 'success');
@@ -3677,6 +3933,7 @@ async function resetZTPassword(ztId){
     const existingPasswords = new Set(Object.values(existing).filter(x=>x!==z).map(x=>x.password));
     const newPassword = genTrainerPassword(z.name, z.phone, existingPasswords);
     await kvSet('zt:'+ztId, { ...z, password:newPassword });
+    await clearStoredSessionToken('zt', ztId);
     await logHistory('zt_password_reset', `Zonal Training Manager ${z.name}'s password reset by ${trainerIdentity.name}`, {ztId});
     lastZTCredential = { name:z.name, phone:z.phone, password:newPassword };
     showToast(`New password: ${newPassword}`, 'success');
@@ -4027,6 +4284,150 @@ async function exportDoubtsExcel(){
   const ws = XLSX.utils.aoa_to_sheet(rows);
   XLSX.utils.book_append_sheet(wb, ws, 'AI Doubts');
   XLSX.writeFile(wb, 'ai_doubts_export.xlsx');
+}
+
+/* ---- SECURITY & ALERTS (admin only) ---- */
+async function allAccountsForSecurity(){
+  const list = [];
+  Object.entries(adminTrainers).forEach(([id,t])=> list.push({ type:'trainer', id, name:t.name, active:true, locked:!!t.locked, failedAttempts:t.failedAttempts||0, record:t }));
+  Object.entries(adminCCs).forEach(([id,c])=> list.push({ type:'cc', id, name:c.name, active:c.active!==false, locked:!!c.locked, failedAttempts:c.failedAttempts||0, record:c }));
+  Object.entries(adminZTs).forEach(([id,z])=> list.push({ type:'zt', id, name:z.name, active:z.active!==false, locked:!!z.locked, failedAttempts:z.failedAttempts||0, record:z }));
+  Object.entries(adminRoster).forEach(([id,r])=> list.push({ type:'partner', id, name:r.name, active:true, locked:!!r.locked, failedAttempts:r.failedAttempts||0, record:r }));
+  await Promise.all(list.map(async a=>{ a.activeSessionToken = await getStoredSessionToken(a.type, a.id); }));
+  return list;
+}
+function renderSecurityTab(){
+  const accounts = adminSecurityAccounts;
+  const activeSessions = accounts.filter(a=>a.activeSessionToken);
+  const lockedAccounts = accounts.filter(a=>a.locked);
+  const failedLogs = adminLoginLogs.filter(l=>l.event==='failed');
+  let filteredLogs = adminLoginLogs;
+  if(securityFilterType) filteredLogs = filteredLogs.filter(l=>l.accountType===securityFilterType);
+  if(securityFilterStatus) filteredLogs = filteredLogs.filter(l=>l.event===securityFilterStatus);
+  return `
+    <div class="crumb">Admin dashboard</div>
+    <h1 class="page-title">Security &amp; Alerts</h1>
+    <p class="page-sub">Sessions, account lockouts, and login activity across every role. See the note below on what this platform's current architecture can and can't guarantee.</p>
+    <div class="save-note" style="margin-bottom:16px;">This app has no backend server — it's a browser page talking directly to the database, with the database currently open to anyone holding its API key. What's here (lockouts, session tracking, activity logs) is real and useful, but it is not a substitute for server-side authentication. True "prevent unauthorized access" guarantees require Firebase Authentication and locked security rules — a separate infrastructure project, not a setting to toggle here.</div>
+    ${lastTrainerCredential ? `<div class="credential-banner"><div class="cb-label">Trainer password reset</div><div class="cb-value">${esc(lastTrainerCredential.password)}</div><div class="cb-note">Share this with ${esc(lastTrainerCredential.name)}. <a onclick="lastTrainerCredential=null;renderAdminMain();" style="cursor:pointer;">Dismiss</a></div></div>` : ''}
+    ${lastCCCredential ? `<div class="credential-banner"><div class="cb-label">Content Creator password reset</div><div class="cb-value">${esc(lastCCCredential.password)}</div><div class="cb-note">Share this with ${esc(lastCCCredential.name)}. <a onclick="lastCCCredential=null;renderAdminMain();" style="cursor:pointer;">Dismiss</a></div></div>` : ''}
+    ${lastZTCredential ? `<div class="credential-banner"><div class="cb-label">Zonal Manager password reset</div><div class="cb-value">${esc(lastZTCredential.password)}</div><div class="cb-note">Share this with ${esc(lastZTCredential.name)}. <a onclick="lastZTCredential=null;renderAdminMain();" style="cursor:pointer;">Dismiss</a></div></div>` : ''}
+    ${lastPartnerCredential ? `<div class="credential-banner"><div class="cb-label">Partner ID reset</div><div class="cb-value">${esc(lastPartnerCredential.password)}</div><div class="cb-note">Share this new ID with ${esc(lastPartnerCredential.name)} — all their progress and history moved with it. <a onclick="lastPartnerCredential=null;renderAdminMain();" style="cursor:pointer;">Dismiss</a></div></div>` : ''}
+    <div class="stat-mini-grid">
+      <div class="stat-card"><div class="n">${activeSessions.length}</div><div class="l">Active sessions</div></div>
+      <div class="stat-card"><div class="n">${lockedAccounts.length}</div><div class="l">Locked accounts</div></div>
+      <div class="stat-card"><div class="n">${failedLogs.length}</div><div class="l">Failed attempts logged</div></div>
+      <div class="stat-card"><div class="n">${accounts.length}</div><div class="l">Total accounts</div></div>
+    </div>
+
+    <div class="card">
+      <h3>Active sessions</h3>
+      ${activeSessions.length===0?`<div class="empty-state">No active sessions right now.</div>`:`
+      <table class="data-table">
+        <tr><th>Name</th><th>Role</th><th></th></tr>
+        ${activeSessions.map(a=>`<tr><td>${esc(a.name)}</td><td>${esc(securityRoleLabel(a.type))}</td><td><button class="btn small danger" onclick="forceLogoutAccount('${a.type}','${esc(a.id)}')">Force logout</button></td></tr>`).join('')}
+      </table>`}
+    </div>
+
+    <div class="card">
+      <h3>Locked accounts</h3>
+      ${lockedAccounts.length===0?`<div class="empty-state">No accounts are currently locked.</div>`:`
+      <table class="data-table">
+        <tr><th>Name</th><th>Role</th><th>Failed attempts</th><th></th></tr>
+        ${lockedAccounts.map(a=>`<tr><td>${esc(a.name)}</td><td>${esc(securityRoleLabel(a.type))}</td><td class="mono">${a.failedAttempts}</td><td><button class="btn small amber" onclick="unlockAccount('${a.type}','${esc(a.id)}')">Unlock</button></td></tr>`).join('')}
+      </table>`}
+    </div>
+
+    <div class="card">
+      <h3>Reset a password</h3>
+      <p style="margin-bottom:10px;">Resetting a password never touches batch history, tracking, progress, or reports — only the credential itself changes.</p>
+      <div class="form-grid">
+        <div>
+          <span class="field-label">Account</span>
+          <select class="field-input" id="security-reset-account">
+            <option value="">— Select an account —</option>
+            ${Object.entries(adminTrainers).map(([id,t])=>`<option value="trainer|${id}">Trainer — ${esc(t.name)}</option>`).join('')}
+            ${Object.entries(adminCCs).map(([id,c])=>`<option value="cc|${id}">Content Creator — ${esc(c.name)}</option>`).join('')}
+            ${Object.entries(adminZTs).map(([id,z])=>`<option value="zt|${id}">Zonal Manager — ${esc(z.name)}</option>`).join('')}
+            ${Object.entries(adminRoster).map(([id,r])=>`<option value="partner|${id}">Partner — ${esc(r.name)}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <button class="btn amber" onclick="securityResetPassword()">Reset password</button>
+    </div>
+
+    <div class="card">
+      <h3>Login activity</h3>
+      <div class="filter-row">
+        <select id="security-log-type" onchange="securityFilterType=this.value; renderAdminMain();">
+          <option value="">All roles</option>
+          <option value="admin" ${securityFilterType==='admin'?'selected':''}>Admin</option>
+          <option value="trainer" ${securityFilterType==='trainer'?'selected':''}>Trainer</option>
+          <option value="cc" ${securityFilterType==='cc'?'selected':''}>Content Creator</option>
+          <option value="zt" ${securityFilterType==='zt'?'selected':''}>Zonal Manager</option>
+          <option value="partner" ${securityFilterType==='partner'?'selected':''}>Partner</option>
+        </select>
+        <select id="security-log-status" onchange="securityFilterStatus=this.value; renderAdminMain();">
+          <option value="">Success &amp; failed</option>
+          <option value="success" ${securityFilterStatus==='success'?'selected':''}>Success only</option>
+          <option value="failed" ${securityFilterStatus==='failed'?'selected':''}>Failed only</option>
+        </select>
+        <button class="btn secondary small" onclick="renderAdminMain()">Refresh</button>
+        <button class="btn amber small" onclick="exportSecurityLogsExcel()">Export Excel</button>
+      </div>
+      ${filteredLogs.length===0?`<div class="empty-state">No login activity matches this filter.</div>`:`
+      <table class="data-table">
+        <tr><th>Date &amp; time</th><th>Name</th><th>Role</th><th>Status</th><th>Device</th><th>Browser</th></tr>
+        ${filteredLogs.slice(0,200).map(l=>`<tr>
+          <td class="mono">${fmtDateTime(l.at)}</td>
+          <td>${esc(l.accountName||'')}</td>
+          <td>${esc(securityRoleLabel(l.accountType))}</td>
+          <td><span class="pill ${l.event==='success'?'open':'closed'}">${l.event==='success'?'Success':'Failed'}</span></td>
+          <td>${esc(l.device||'—')}</td>
+          <td>${esc(l.browser||'—')}</td>
+        </tr>`).join('')}
+      </table>
+      ${filteredLogs.length>200?`<p style="font-size:12px;color:var(--ink-soft);margin-top:8px;">Showing the most recent 200 of ${filteredLogs.length} matching entries — export for the full list.</p>`:''}`}
+    </div>
+  `;
+}
+function securityRoleLabel(type){
+  return { admin:'Admin', trainer:'Trainer', cc:'Content Creator', zt:'Zonal Manager', partner:'Partner' }[type] || type;
+}
+async function forceLogoutAccount(type, id){
+  showConfirmModal('Force this account to log out on all devices?', async ()=>{
+    await clearStoredSessionToken(type, id);
+    await logHistory('force_logout', `${securityRoleLabel(type)} account force-logged-out by ${trainerIdentity.name}`, {type, id});
+    showToast('Signed out on their next check.', 'success');
+    renderAdminMain();
+  });
+}
+async function unlockAccount(type, id){
+  if(type==='trainer'){ const t = adminTrainers[id]; await kvSet('trainer:'+id, { ...t, locked:false, failedAttempts:0 }); }
+  else if(type==='cc'){ const c = adminCCs[id]; await kvSet('cc:'+id, { ...c, locked:false, failedAttempts:0 }); }
+  else if(type==='zt'){ const z = adminZTs[id]; await kvSet('zt:'+id, { ...z, locked:false, failedAttempts:0 }); }
+  else if(type==='partner'){ const r = adminRoster[id]; await setRosterEntry(id, { ...r, locked:false, failedAttempts:0 }); }
+  await logHistory('account_unlocked', `${securityRoleLabel(type)} account unlocked by ${trainerIdentity.name}`, {type, id});
+  showToast('Account unlocked.', 'success');
+  renderAdminMain();
+}
+async function securityResetPassword(){
+  const sel = document.getElementById('security-reset-account').value;
+  if(!sel){ showToast('Select an account first.', 'error'); return; }
+  const [type, id] = sel.split('|');
+  if(type==='trainer') return resetTrainerPassword(id);
+  if(type==='cc') return resetCCPassword(id);
+  if(type==='zt') return resetZTPassword(id);
+  if(type==='partner') return resetPartnerCredential(id);
+}
+async function exportSecurityLogsExcel(){
+  if(typeof XLSX==='undefined'){ showToast('Excel library did not load (no internet access?). Please try again when online.', 'error'); return; }
+  const rows = [['Date/Time','Name','Role','Status','Device','Browser']];
+  adminLoginLogs.forEach(l=>{ rows.push([fmtDateTime(l.at), l.accountName||'', securityRoleLabel(l.accountType), l.event, l.device||'', l.browser||'']); });
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  XLSX.utils.book_append_sheet(wb, ws, 'Login Activity');
+  XLSX.writeFile(wb, 'security-login-activity-'+todayStr()+'.xlsx');
 }
 
 function renderMediaReviewTab(){
@@ -4537,6 +4938,7 @@ async function approveForgotPassword(id){
     existingPasswords.add(t.password);
     const newPassword = genTrainerPassword(t.name, t.phone, existingPasswords);
     await kvSet('trainer:'+trainerId, { ...t, password:newPassword });
+    await clearStoredSessionToken('trainer', trainerId);
     const freshIssue = await kvGet('issue:'+id);
     const comments = (freshIssue && freshIssue.comments) || [];
     comments.push({ author:trainerIdentity.name, role:'Admin', text:`Password reset and approved. New password generated.`, at:new Date().toISOString() });
@@ -4770,6 +5172,48 @@ async function deletePartnerRow(id){
   showConfirmModal(`Remove ${name} from the roster? Their progress data is kept in storage.`, async ()=>{
     await kvDelete('roster:'+id);
     await logHistory('partner_removed', `Partner ${name} removed`, {partnerId:id});
+    renderAdminMain();
+  });
+}
+async function resetPartnerCredential(oldId){
+  const r = adminRoster[oldId];
+  if(!r){ showToast('Could not find that partner.', 'error'); return; }
+  showConfirmModal(`Reset ${r.name}'s login ID? Their old ID (${oldId}) will stop working immediately. Progress, batch history, and tracking all move with them to the new ID.`, async ()=>{
+    const existingRoster = await listRoster();
+    const existingIds = new Set(Object.keys(existingRoster));
+    const newId = genPartnerPassword(r.name, r.officeId||'', existingIds);
+
+    const ok = await setRosterEntry(newId, { ...r, locked:false, failedAttempts:0 });
+    if(!ok){ showToast("Couldn't create the new ID — check your connection and try again.", 'error'); return; }
+
+    const progress = await getProgress(oldId);
+    if(progress && Object.keys(progress).length>0) await setProgress(newId, progress);
+
+    const checkinKeys = await kvList('checkin:'+oldId+'__');
+    await Promise.all(checkinKeys.map(async k=>{
+      const date = k.slice(('checkin:'+oldId+'__').length);
+      const data = await kvGet(k);
+      if(data) await setCheckin(newId, date, data);
+      await kvDelete(k);
+    }));
+
+    const allMedia = await listAllMedia();
+    await Promise.all(allMedia.filter(m=>m.partnerId===oldId).map(async m=>{
+      await kvSet('media:'+m.id, { ...m, partnerId:newId });
+    }));
+
+    const allDoubts = await listDoubts();
+    await Promise.all(allDoubts.filter(d=>d.partnerId===oldId).map(async d=>{
+      await kvSet('doubt:'+d.id, { ...d, partnerId:newId });
+    }));
+
+    await kvDelete('roster:'+oldId);
+    await clearStoredSessionToken('partner', oldId);
+    await kvDelete('progress:'+oldId);
+
+    await logHistory('partner_credential_reset', `${r.name}'s login ID reset from ${oldId} to ${newId} by ${trainerIdentity.name} — all progress and history preserved`, {oldId, newId});
+    lastPartnerCredential = { name:r.name, password:newId };
+    showToast(`New ID: ${newId} — share this with ${r.name}.`, 'success');
     renderAdminMain();
   });
 }
@@ -5952,7 +6396,10 @@ function maybeShowIOSInstallHint(){
   currentLayout = await getLayout();
   currentAiSettings = await getAiSettings();
   const restored = await tryRestoreSession();
-  if(!restored) renderGate();
+  if(!restored){
+    if(sessionReplacedNotice) gateError = 'You were signed out because this account was used to log in on another device.';
+    renderGate();
+  }
 })();
 </script>
 </body>
