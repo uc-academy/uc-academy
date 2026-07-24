@@ -3017,6 +3017,9 @@ async function renderAdminMain(){
     else{
       await seedDefaultLanguageIfEmpty();
       adminLanguages = await listLanguages();
+      await seedDefaultCategoriesIfEmpty();
+      adminCategories = await listCategories();
+      adminCourses = await listCourses();
       adminModuleStatus = {};
       await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id, null, editingLanguage); adminModuleStatus[d.id] = !!ov; adminModuleOverrideCache[d.id] = ov; }));
       const homeOv = await getContentOverride('home', null, editingLanguage);
@@ -4662,6 +4665,21 @@ async function exportExcel(){
 /* ---- MODULES (CMS) — admin only ---- */
 let courseEditorDays = [];
 let courseEditorOverrideCache = {};
+function onQuickCategoryChange(){
+  const catSelect = document.getElementById('quick-select-category');
+  const courseSelect = document.getElementById('quick-select-course');
+  const catId = catSelect.value;
+  const courses = catId ? Object.entries(adminCourses).filter(([,c])=>c.categoryId===catId) : [];
+  courseSelect.innerHTML = `<option value="">— Select course —</option>` + courses.map(([id,course])=>`<option value="${id}">${esc(course.name)}</option>`).join('');
+}
+function jumpToCourseModules(){
+  const catId = document.getElementById('quick-select-category').value;
+  const courseId = document.getElementById('quick-select-course').value;
+  if(!courseId) return;
+  localStorage.setItem('uca_last_admin_category', catId);
+  localStorage.setItem('uca_last_admin_course', courseId);
+  openCourseModuleEditor(courseId);
+}
 async function openCourseModuleEditor(courseId){
   editingCourseId = courseId;
   editingDayId = null;
@@ -4676,7 +4694,7 @@ function renderCourseModulesListTab(){
     <div class="crumb">Admin dashboard &middot; Category Management${cat?' &middot; '+esc(cat.name):''}</div>
     <h1 class="page-title">${esc(course?.name||'Course')} — Modules</h1>
     <p class="page-sub">This course's own days, completely separate from any other course. Nothing changes for trainers or partners until you Save &amp; Publish each day.</p>
-    <button class="btn secondary small" onclick="editingCourseId=null; setAdminTab('categories');" style="margin-bottom:14px;">&larr; Back to Category Management</button>
+    <button class="btn secondary small" onclick="editingCourseId=null; setAdminTab('modules');" style="margin-bottom:14px;">&larr; Back to Modules</button>
     <div class="card">
       <span class="field-label">Editing language</span>
       <select class="field-input" id="course-modules-lang-select" onchange="setEditingLanguage(this.value)">
@@ -4729,10 +4747,35 @@ let adminModuleStatus = {};
 let adminModuleOverrideCache = {};
 
 function renderModulesListTab(){
+  const lastCatId = localStorage.getItem('uca_last_admin_category') || '';
+  const lastCourseId = localStorage.getItem('uca_last_admin_course') || '';
+  const catStillValid = lastCatId && adminCategories[lastCatId];
+  const coursesInLastCat = catStillValid ? Object.entries(adminCourses).filter(([,c])=>c.categoryId===lastCatId) : [];
   return `
     <div class="crumb">Admin dashboard</div>
     <h1 class="page-title">Modules</h1>
     <p class="page-sub">Edit the theory, videos, audio, assignment, and assessment for each day. Nothing changes for partners until you click Save &amp; Publish.</p>
+    <div class="card">
+      <h3>Jump to a course</h3>
+      <p style="margin-bottom:10px;">Pick a category and course to edit its own modules. Leave both blank to keep editing the original Washing Machine course below.</p>
+      <div class="form-grid">
+        <div>
+          <span class="field-label">Category</span>
+          <select class="field-input" id="quick-select-category" onchange="onQuickCategoryChange()">
+            <option value="">— Select category —</option>
+            ${Object.entries(adminCategories).map(([id,cat])=>`<option value="${id}" ${catStillValid && lastCatId===id?'selected':''}>${esc(cat.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <span class="field-label">Course</span>
+          <select class="field-input" id="quick-select-course" onchange="jumpToCourseModules()">
+            <option value="">— Select course —</option>
+            ${coursesInLastCat.map(([id,course])=>`<option value="${id}" ${lastCourseId===id?'selected':''}>${esc(course.name)}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <p style="font-size:12px;color:var(--ink-soft);margin-top:8px;">Selecting a course opens its Modules editor right away.</p>
+    </div>
     <div class="card">
       <span class="field-label">Editing language</span>
       <select class="field-input" id="modules-lang-select" onchange="setEditingLanguage(this.value)">
@@ -4740,6 +4783,7 @@ function renderModulesListTab(){
       </select>
       <p style="font-size:12px;color:var(--ink-soft);margin-top:6px;">${editingLanguage===DEFAULT_LANGUAGE ? `This is the fallback version partners see if a day isn't translated into their chosen language.` : `Editing the ${esc(editingLanguage)} version. Days shown here as "Default content" have no ${esc(editingLanguage)} translation yet — partners using ${esc(editingLanguage)} will see ${esc(DEFAULT_LANGUAGE)} instead until you add one.`}</p>
     </div>
+    <h2 class="page-title" style="font-size:20px;">Original Washing Machine course</h2>
     <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
       <div>
         <h3 style="margin-bottom:2px;">Home Page</h3>
