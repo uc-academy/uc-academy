@@ -591,6 +591,28 @@ function showConfirmModal(msg, onYes, onNo){
   overlay.querySelector('#confirm-no-btn').addEventListener('click', ()=>{ cleanup(); if(onNo) onNo(); });
   overlay.addEventListener('click', (e)=>{ if(e.target===overlay){ cleanup(); if(onNo) onNo(); } });
 }
+function promptForResetReason(msg, onConfirm){
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `<div class="confirm-box" style="text-align:left;">
+    <p>${esc(msg)}</p>
+    <span class="field-label">Reason for reset (kept in the audit log)</span>
+    <textarea class="field-input reflect" id="reset-reason-input" style="min-height:60px;" placeholder="e.g. Partner reported a leaked password"></textarea>
+    <div class="confirm-actions">
+      <button class="btn secondary" id="reset-reason-cancel">Cancel</button>
+      <button class="btn amber" id="reset-reason-confirm">Confirm reset</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  const cleanup = ()=>{ if(overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+  overlay.querySelector('#reset-reason-confirm').addEventListener('click', ()=>{
+    const reason = document.getElementById('reset-reason-input').value.trim();
+    cleanup();
+    if(onConfirm) onConfirm(reason);
+  });
+  overlay.querySelector('#reset-reason-cancel').addEventListener('click', cleanup);
+  overlay.addEventListener('click', (e)=>{ if(e.target===overlay) cleanup(); });
+}
 
 /* ---- credential generation ---- */
 function genTrainerPassword(name, phone, existing){
@@ -671,6 +693,20 @@ async function logLoginEvent(accountType, accountId, accountName, event, extra){
 }
 async function listLoginLogs(limit){
   const keys = (await kvList('loginLog:')).sort().reverse();
+  const capped = keys.slice(0, limit||500);
+  const out = [];
+  await Promise.all(capped.map(async k=>{ const v = await kvGet(k); if(v) out.push(v); }));
+  return out.sort((a,b)=> new Date(b.at)-new Date(a.at));
+}
+const DEFAULT_SECURITY_SETTINGS = { partnerLoginPolicy: 'auto' };
+async function getSecuritySettings(){ const v = await kvGet('securitySettings:global'); return v ? { ...DEFAULT_SECURITY_SETTINGS, ...v } : { ...DEFAULT_SECURITY_SETTINGS }; }
+async function setSecuritySettings(data){ return await kvSet('securitySettings:global', data); }
+async function logPasswordReset(accountType, accountId, accountName, reason){
+  const id = String(Date.now()).padStart(14,'0')+'_'+uid();
+  await kvSet('pwResetLog:'+id, { id, accountType, accountId, accountName, reason: reason||'Not specified', resetBy: trainerIdentity.name, at: new Date().toISOString() });
+}
+async function listPasswordResetLogs(limit){
+  const keys = (await kvList('pwResetLog:')).sort().reverse();
   const capped = keys.slice(0, limit||500);
   const out = [];
   await Promise.all(capped.map(async k=>{ const v = await kvGet(k); if(v) out.push(v); }));
@@ -1522,6 +1558,15 @@ async function loginAsPartner(id, opts){
     if(opts.sessionToken){
       const stored = await getStoredSessionToken('partner', id);
       if(stored && opts.sessionToken!==stored) return { ok:false, reason:'session_replaced' };
+    }
+  } else {
+    const existingToken = await getStoredSessionToken('partner', id);
+    if(existingToken){
+      const sec = await getSecuritySettings();
+      if(sec.partnerLoginPolicy==='block'){
+        await logLoginEvent('partner', id, r.name, 'failed', { note:'blocked - already logged in elsewhere' });
+        return { ok:false, reason:'This Partner ID is already logged in on another device. Please log out from the existing device before logging in again.' };
+      }
     }
   }
   const allSessions = await listSessions();
@@ -3232,6 +3277,13 @@ let adminMediaCache = [];
 let adminDoubtsCache = [];
 let adminLoginLogs = [];
 let adminSecurityAccounts = [];
+let adminPwResetLogs = [];
+let adminSecuritySettings = { partnerLoginPolicy:'auto' };
+let securityResetCategory = 'partner';
+let securityPartnerFilterTrainer = '';
+let securityPartnerFilterCity = '';
+let securityPartnerFilterCategory = '';
+let securityPartnerFilterSearch = '';
 let securityFilterType = '';
 let securityFilterStatus = '';
 let doubtsFilterStatus = '';
@@ -3419,12 +3471,17 @@ async function renderAdminMain(){
   else if(adminTab==='categories'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderCategoryManageTab(); }
   else if(adminTab==='security'){
     adminLoginLogs = await listLoginLogs(500);
+    adminPwResetLogs = await listPasswordResetLogs(500);
     adminTrainers = await listTrainers();
     adminCCs = await listCCs();
     adminZTs = await listZTs();
     const allRoster = await listRoster();
     adminRoster = allRoster;
+    await seedDefaultCategoriesIfEmpty();
+    adminCategories = await listCategories();
+    adminCourses = await listCourses();
     adminSecurityAccounts = await allAccountsForSecurity();
+    adminSecuritySettings = await getSecuritySettings();
     el.innerHTML = renderSecurityTab();
   }
   else if(adminTab==='languages'){ await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderLanguagesTab(); }
@@ -3612,13 +3669,14 @@ async function removeTrainer(trainerId){
 async function resetTrainerPassword(trainerId){
   const t = adminTrainers[trainerId];
   if(!t) return;
-  showConfirmModal(`Reset ${t.name}'s password? Their old password will stop working immediately. Batches, tracking, and history are untouched.`, async ()=>{
+  promptForResetReason(`Reset ${t.name}'s password? Their old password will stop working immediately. Batches, tracking, and history are untouched.`, async (reason)=>{
     const existing = await listTrainers();
     const existingPasswords = new Set(Object.values(existing).filter(x=>x!==t).map(x=>x.password));
     const newPassword = genTrainerPassword(t.name, t.phone, existingPasswords);
     await kvSet('trainer:'+trainerId, { ...t, password:newPassword, failedAttempts:0, locked:false });
     await clearStoredSessionToken('trainer', trainerId);
     await logHistory('trainer_password_reset', `Trainer ${t.name}'s password reset by ${trainerIdentity.name}`, {trainerId});
+    await logPasswordReset('trainer', trainerId, t.name, reason);
     lastTrainerCredential = { name:t.name, phone:t.phone, password:newPassword };
     showToast(`New password: ${newPassword}`, 'success');
     renderAdminMain();
@@ -3701,13 +3759,14 @@ async function toggleCCActive(ccId){
 async function resetCCPassword(ccId){
   const c = adminCCs[ccId];
   if(!c) return;
-  showConfirmModal(`Reset ${c.name}'s password? Their old password will stop working immediately.`, async ()=>{
+  promptForResetReason(`Reset ${c.name}'s password? Their old password will stop working immediately.`, async (reason)=>{
     const existing = await listCCs();
     const existingPasswords = new Set(Object.values(existing).filter(x=>x!==c).map(x=>x.password));
     const newPassword = genTrainerPassword(c.name, c.phone, existingPasswords);
     await kvSet('cc:'+ccId, { ...c, password:newPassword });
     await clearStoredSessionToken('cc', ccId);
     await logHistory('cc_password_reset', `Content Creator ${c.name}'s password reset by ${trainerIdentity.name}`, {ccId});
+    await logPasswordReset('cc', ccId, c.name, reason);
     lastCCCredential = { name:c.name, phone:c.phone, password:newPassword };
     showToast(`New password: ${newPassword}`, 'success');
     renderAdminMain();
@@ -3928,13 +3987,14 @@ async function toggleZTActive(ztId){
 async function resetZTPassword(ztId){
   const z = adminZTs[ztId];
   if(!z) return;
-  showConfirmModal(`Reset ${z.name}'s password? Their old password will stop working immediately.`, async ()=>{
+  promptForResetReason(`Reset ${z.name}'s password? Their old password will stop working immediately.`, async (reason)=>{
     const existing = await listZTs();
     const existingPasswords = new Set(Object.values(existing).filter(x=>x!==z).map(x=>x.password));
     const newPassword = genTrainerPassword(z.name, z.phone, existingPasswords);
     await kvSet('zt:'+ztId, { ...z, password:newPassword });
     await clearStoredSessionToken('zt', ztId);
     await logHistory('zt_password_reset', `Zonal Training Manager ${z.name}'s password reset by ${trainerIdentity.name}`, {ztId});
+    await logPasswordReset('zt', ztId, z.name, reason);
     lastZTCredential = { name:z.name, phone:z.phone, password:newPassword };
     showToast(`New password: ${newPassword}`, 'success');
     renderAdminMain();
@@ -4309,6 +4369,21 @@ function renderSecurityTab(){
     <h1 class="page-title">Security &amp; Alerts</h1>
     <p class="page-sub">Sessions, account lockouts, and login activity across every role. See the note below on what this platform's current architecture can and can't guarantee.</p>
     <div class="save-note" style="margin-bottom:16px;">This app has no backend server — it's a browser page talking directly to the database, with the database currently open to anyone holding its API key. What's here (lockouts, session tracking, activity logs) is real and useful, but it is not a substitute for server-side authentication. True "prevent unauthorized access" guarantees require Firebase Authentication and locked security rules — a separate infrastructure project, not a setting to toggle here.</div>
+
+    <div class="card">
+      <h3>Partner single-device login</h3>
+      <p style="margin-bottom:10px;">Controls what happens when a Partner ID tries to log in while already active elsewhere.</p>
+      <div class="form-grid">
+        <div>
+          <span class="field-label">When already logged in on another device</span>
+          <select class="field-input" id="security-partner-policy" onchange="updatePartnerLoginPolicy(this.value)">
+            <option value="auto" ${adminSecuritySettings.partnerLoginPolicy==='auto'?'selected':''}>Auto-logout the old device, allow the new login</option>
+            <option value="block" ${adminSecuritySettings.partnerLoginPolicy==='block'?'selected':''}>Block the new login until they log out elsewhere</option>
+          </select>
+        </div>
+      </div>
+      <p style="font-size:12px;color:var(--ink-soft);">"Block" shows: "This Partner ID is already logged in on another device. Please log out from the existing device before logging in again."</p>
+    </div>
     ${lastTrainerCredential ? `<div class="credential-banner"><div class="cb-label">Trainer password reset</div><div class="cb-value">${esc(lastTrainerCredential.password)}</div><div class="cb-note">Share this with ${esc(lastTrainerCredential.name)}. <a onclick="lastTrainerCredential=null;renderAdminMain();" style="cursor:pointer;">Dismiss</a></div></div>` : ''}
     ${lastCCCredential ? `<div class="credential-banner"><div class="cb-label">Content Creator password reset</div><div class="cb-value">${esc(lastCCCredential.password)}</div><div class="cb-note">Share this with ${esc(lastCCCredential.name)}. <a onclick="lastCCCredential=null;renderAdminMain();" style="cursor:pointer;">Dismiss</a></div></div>` : ''}
     ${lastZTCredential ? `<div class="credential-banner"><div class="cb-label">Zonal Manager password reset</div><div class="cb-value">${esc(lastZTCredential.password)}</div><div class="cb-note">Share this with ${esc(lastZTCredential.name)}. <a onclick="lastZTCredential=null;renderAdminMain();" style="cursor:pointer;">Dismiss</a></div></div>` : ''}
@@ -4340,20 +4415,27 @@ function renderSecurityTab(){
 
     <div class="card">
       <h3>Reset a password</h3>
-      <p style="margin-bottom:10px;">Resetting a password never touches batch history, tracking, progress, or reports — only the credential itself changes.</p>
-      <div class="form-grid">
-        <div>
-          <span class="field-label">Account</span>
-          <select class="field-input" id="security-reset-account">
-            <option value="">— Select an account —</option>
-            ${Object.entries(adminTrainers).map(([id,t])=>`<option value="trainer|${id}">Trainer — ${esc(t.name)}</option>`).join('')}
-            ${Object.entries(adminCCs).map(([id,c])=>`<option value="cc|${id}">Content Creator — ${esc(c.name)}</option>`).join('')}
-            ${Object.entries(adminZTs).map(([id,z])=>`<option value="zt|${id}">Zonal Manager — ${esc(z.name)}</option>`).join('')}
-            ${Object.entries(adminRoster).map(([id,r])=>`<option value="partner|${id}">Partner — ${esc(r.name)}</option>`).join('')}
-          </select>
-        </div>
+      <p style="margin-bottom:10px;">Resetting a password never touches batch history, tracking, progress, or reports — only the credential itself changes. Every reset asks for a reason and is kept in the history below.</p>
+      <div class="filter-row" style="margin-bottom:14px;">
+        ${['partner','trainer','zt','cc','admin'].map(t=>`<button class="btn ${securityResetCategory===t?'amber':'secondary'} small" onclick="securityResetCategory='${t}'; renderAdminMain();">${esc(securityRoleLabel(t))}</button>`).join('')}
       </div>
-      <button class="btn amber" onclick="securityResetPassword()">Reset password</button>
+      ${renderResetCategoryPanel()}
+    </div>
+
+    <div class="card">
+      <h3>Password Reset History</h3>
+      ${adminPwResetLogs.length===0?`<div class="empty-state">No password resets recorded yet.</div>`:`
+      <table class="data-table">
+        <tr><th>Date &amp; time</th><th>Account</th><th>Role</th><th>Reset by</th><th>Reason</th></tr>
+        ${adminPwResetLogs.slice(0,100).map(l=>`<tr>
+          <td class="mono">${fmtDateTime(l.at)}</td>
+          <td>${esc(l.accountName)}</td>
+          <td>${esc(securityRoleLabel(l.accountType))}</td>
+          <td>${esc(l.resetBy)}</td>
+          <td>${esc(l.reason)}</td>
+        </tr>`).join('')}
+      </table>`}
+    </div>
     </div>
 
     <div class="card">
@@ -4391,6 +4473,100 @@ function renderSecurityTab(){
     </div>
   `;
 }
+function renderResetCategoryPanel(){
+  if(securityResetCategory==='partner') return renderPartnerResetPanel();
+  if(securityResetCategory==='admin') return renderAdminResetPanel();
+  const map = { trainer: adminTrainers, cc: adminCCs, zt: adminZTs };
+  const list = map[securityResetCategory] || {};
+  return `
+    <div class="form-grid">
+      <div>
+        <span class="field-label">${esc(securityRoleLabel(securityResetCategory))}</span>
+        <select class="field-input" id="security-reset-simple-account">
+          <option value="">— Select an account —</option>
+          ${Object.entries(list).map(([id,a])=>`<option value="${id}">${esc(a.name)}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <button class="btn amber" onclick="securityResetSimple('${securityResetCategory}')">Reset password</button>
+  `;
+}
+function securityResetSimple(type){
+  const id = document.getElementById('security-reset-simple-account').value;
+  if(!id){ showToast('Select an account first.', 'error'); return; }
+  if(type==='trainer') return resetTrainerPassword(id);
+  if(type==='cc') return resetCCPassword(id);
+  if(type==='zt') return resetZTPassword(id);
+}
+function renderAdminResetPanel(){
+  return `
+    <div class="save-note" style="margin-bottom:12px;">The Admin password is set directly in this file's source code, not stored in the database — it can only be changed by editing that value and redeploying. There's no "generate a new one" button to offer honestly here. What I can do is end every current Admin session immediately.</div>
+    <button class="btn danger" onclick="forceLogoutAllAdmin()">Force logout all Admin sessions</button>
+  `;
+}
+async function forceLogoutAllAdmin(){
+  showConfirmModal('End every currently signed-in Admin session? Anyone logged in as Admin will be signed out on their next check.', async ()=>{
+    await clearStoredSessionToken('admin', 'global');
+    await logHistory('force_logout', `All Admin sessions force-logged-out by ${trainerIdentity.name}`, {type:'admin'});
+    showToast('All Admin sessions will be signed out shortly.', 'success');
+    renderAdminMain();
+  });
+}
+function renderPartnerResetPanel(){
+  const cities = [...new Set(Object.values(adminRoster).map(r=>r.city))];
+  const trainerNames = [...new Set(Object.values(adminRoster).map(r=>r.trainer))];
+  let entries = Object.entries(adminRoster);
+  if(securityPartnerFilterTrainer) entries = entries.filter(([,r])=>r.trainer===securityPartnerFilterTrainer);
+  if(securityPartnerFilterCity) entries = entries.filter(([,r])=>r.city===securityPartnerFilterCity);
+  if(securityPartnerFilterCategory) entries = entries.filter(([,r])=>r.courseId && adminCourses[r.courseId] && adminCourses[r.courseId].categoryId===securityPartnerFilterCategory);
+  if(securityPartnerFilterSearch){
+    const q = securityPartnerFilterSearch.toLowerCase();
+    entries = entries.filter(([id,r])=> r.name.toLowerCase().includes(q) || id.toLowerCase().includes(q));
+  }
+  return `
+    <div class="form-grid">
+      <div>
+        <span class="field-label">Trainer</span>
+        <select class="field-input" id="security-pf-trainer" onchange="securityPartnerFilterTrainer=this.value; renderAdminMain();">
+          <option value="">All trainers</option>
+          ${trainerNames.map(t=>`<option value="${esc(t)}" ${securityPartnerFilterTrainer===t?'selected':''}>${esc(t)}</option>`).join('')}
+        </select>
+      </div>
+      <div>
+        <span class="field-label">City</span>
+        <select class="field-input" id="security-pf-city" onchange="securityPartnerFilterCity=this.value; renderAdminMain();">
+          <option value="">All cities</option>
+          ${cities.map(c=>`<option value="${esc(c)}" ${securityPartnerFilterCity===c?'selected':''}>${esc(c)}</option>`).join('')}
+        </select>
+      </div>
+      <div>
+        <span class="field-label">Category</span>
+        <select class="field-input" id="security-pf-category" onchange="securityPartnerFilterCategory=this.value; renderAdminMain();">
+          <option value="">All categories</option>
+          ${Object.entries(adminCategories).map(([id,cat])=>`<option value="${id}" ${securityPartnerFilterCategory===id?'selected':''}>${esc(cat.name)}</option>`).join('')}
+        </select>
+      </div>
+      <div>
+        <span class="field-label">Partner name / ID</span>
+        <input class="field-input" id="security-pf-search" value="${esc(securityPartnerFilterSearch)}" placeholder="Search..." oninput="securityPartnerFilterSearch=this.value; renderAdminMain();">
+      </div>
+    </div>
+    ${entries.length===0?`<div class="empty-state">No partners match this filter.</div>`:`
+    <table class="data-table">
+      <tr><th>Name</th><th>ID</th><th>City</th><th>Trainer</th><th></th></tr>
+      ${entries.map(([id,r])=>`<tr>
+        <td>${esc(r.name)}</td><td class="mono">${esc(id)}</td><td>${esc(r.city)}</td><td>${esc(r.trainer)}</td>
+        <td><button class="btn small amber" onclick="resetPartnerCredential('${id}')">Reset Password</button></td>
+      </tr>`).join('')}
+    </table>`}
+  `;
+}
+async function updatePartnerLoginPolicy(value){
+  adminSecuritySettings = { ...adminSecuritySettings, partnerLoginPolicy: value };
+  await setSecuritySettings(adminSecuritySettings);
+  await logHistory('security_policy_changed', `Partner single-device login policy set to "${value==='block'?'Block new login':'Auto-logout old device'}" by ${trainerIdentity.name}`, {value});
+  showToast('Policy saved.', 'success');
+}
 function securityRoleLabel(type){
   return { admin:'Admin', trainer:'Trainer', cc:'Content Creator', zt:'Zonal Manager', partner:'Partner' }[type] || type;
 }
@@ -4410,15 +4586,6 @@ async function unlockAccount(type, id){
   await logHistory('account_unlocked', `${securityRoleLabel(type)} account unlocked by ${trainerIdentity.name}`, {type, id});
   showToast('Account unlocked.', 'success');
   renderAdminMain();
-}
-async function securityResetPassword(){
-  const sel = document.getElementById('security-reset-account').value;
-  if(!sel){ showToast('Select an account first.', 'error'); return; }
-  const [type, id] = sel.split('|');
-  if(type==='trainer') return resetTrainerPassword(id);
-  if(type==='cc') return resetCCPassword(id);
-  if(type==='zt') return resetZTPassword(id);
-  if(type==='partner') return resetPartnerCredential(id);
 }
 async function exportSecurityLogsExcel(){
   if(typeof XLSX==='undefined'){ showToast('Excel library did not load (no internet access?). Please try again when online.', 'error'); return; }
@@ -5178,7 +5345,7 @@ async function deletePartnerRow(id){
 async function resetPartnerCredential(oldId){
   const r = adminRoster[oldId];
   if(!r){ showToast('Could not find that partner.', 'error'); return; }
-  showConfirmModal(`Reset ${r.name}'s login ID? Their old ID (${oldId}) will stop working immediately. Progress, batch history, and tracking all move with them to the new ID.`, async ()=>{
+  promptForResetReason(`Reset ${r.name}'s login ID? Their old ID (${oldId}) will stop working immediately. Progress, batch history, and tracking all move with them to the new ID.`, async (reason)=>{
     const existingRoster = await listRoster();
     const existingIds = new Set(Object.keys(existingRoster));
     const newId = genPartnerPassword(r.name, r.officeId||'', existingIds);
@@ -5212,6 +5379,7 @@ async function resetPartnerCredential(oldId){
     await kvDelete('progress:'+oldId);
 
     await logHistory('partner_credential_reset', `${r.name}'s login ID reset from ${oldId} to ${newId} by ${trainerIdentity.name} — all progress and history preserved`, {oldId, newId});
+    await logPasswordReset('partner', newId, r.name, reason);
     lastPartnerCredential = { name:r.name, password:newId };
     showToast(`New ID: ${newId} — share this with ${r.name}.`, 'success');
     renderAdminMain();
