@@ -742,7 +742,7 @@ async function listAllBatches(){
   await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out.push(v); }));
   return out.sort((a,b)=>b.startDate.localeCompare(a.startDate));
 }
-async function getOrCreateActiveBatch(trainerId, trainerName, city){
+async function getOrCreateActiveBatch(trainerId, trainerName, city, courseId){
   const batches = await listBatchesForTrainer(trainerId);
   let active = batches.find(b=>b.status==='Active');
   const today = todayStr();
@@ -756,8 +756,11 @@ async function getOrCreateActiveBatch(trainerId, trainerName, city){
   }
   if(!active){
     const batchNumber = batches.length + 1;
-    active = await createBatch({ batchNumber, trainerId, trainerName, city, startDate: today, status:'Active' });
-    if(active) await logHistory('batch_started', `Batch ${batchNumber} started for ${trainerName} (${city})`, {batchId:active.id, trainerId});
+    active = await createBatch({ batchNumber, trainerId, trainerName, city, courseId: courseId||null, startDate: today, status:'Active' });
+    if(active) await logHistory('batch_started', `Batch ${batchNumber} started for ${trainerName} (${city})`, {batchId:active.id, trainerId, courseId:courseId||null});
+  } else if(courseId && !active.courseId){
+    await updateBatch(active.id, { courseId });
+    active.courseId = courseId;
   }
   return active;
 }
@@ -1607,6 +1610,8 @@ async function loginAsZT(ztId, opts){
   saveSession({ role:'zt', ztId });
   return { ok:true };
 }
+let ztSessionCategory = '';
+let ztSessionCluster = '';
 async function submitZTLogin(){
   if(gateBusy) return;
   const password = document.getElementById('zt-pass-input').value.trim().toUpperCase();
@@ -1618,8 +1623,59 @@ async function submitZTLogin(){
   if(!match){ gateError = 'Incorrect password, or your access has been deactivated. Contact your Admin.'; renderGate(); return; }
   const [ztId] = match;
   await loginAsZT(ztId);
+  ztSessionCategory = ''; ztSessionCluster = '';
+  const needsCategoryPick = (trainerIdentity.assignedCategories||[]).length > 1;
+  const needsClusterPick = (trainerIdentity.assignedZones||[]).length > 1;
+  if(needsCategoryPick || needsClusterPick){
+    await seedDefaultCategoriesIfEmpty();
+    adminCategories = await listCategories();
+    renderZTScopePicker();
+    return;
+  }
+  if((trainerIdentity.assignedCategories||[]).length===1) ztSessionCategory = trainerIdentity.assignedCategories[0];
+  if((trainerIdentity.assignedZones||[]).length===1) ztSessionCluster = trainerIdentity.assignedZones[0];
   adminTab='partners';
   renderAdmin();
+}
+function renderZTScopePicker(){
+  const root = document.getElementById('root');
+  document.getElementById('hamburger').style.display='none';
+  const myCategories = (trainerIdentity.assignedCategories||[]).map(id=>[id, adminCategories[id]]).filter(([,c])=>c);
+  const myClusters = trainerIdentity.assignedZones||[];
+  root.innerHTML = `
+    <div class="gate-wrap">
+      <div class="gate-card">
+        <div class="gate-brand">
+          ${renderLogoMark('gate-mark')}
+          <div class="gate-brand-text"><div class="t1">${esc(COURSE_NAME)}</div><div class="t2">${esc(COURSE_SUB)}</div></div>
+        </div>
+        <h3 style="margin-top:6px;">Welcome, ${esc(trainerIdentity.name)}</h3>
+        <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">Pick what you're focused on this session. You can switch anytime from the sidebar.</p>
+        ${myCategories.length>1 ? `<span class="field-label">Category</span>
+        <select class="field-input" id="zt-scope-category">
+          <option value="">All my assigned categories</option>
+          ${myCategories.map(([id,cat])=>`<option value="${id}">${esc(cat.name)}</option>`).join('')}
+        </select>` : ''}
+        ${myClusters.length>1 ? `<span class="field-label">Cluster</span>
+        <select class="field-input" id="zt-scope-cluster">
+          <option value="">All my assigned clusters</option>
+          ${myClusters.map(z=>`<option value="${esc(z)}">${esc(z)}</option>`).join('')}
+        </select>` : ''}
+        <button class="gate-submit" onclick="confirmZTScope()">Continue</button>
+      </div>
+    </div>
+  `;
+}
+function confirmZTScope(){
+  const catEl = document.getElementById('zt-scope-category');
+  const clusterEl = document.getElementById('zt-scope-cluster');
+  ztSessionCategory = catEl ? catEl.value : (trainerIdentity.assignedCategories||[])[0] || '';
+  ztSessionCluster = clusterEl ? clusterEl.value : (trainerIdentity.assignedZones||[])[0] || '';
+  adminTab='partners';
+  renderAdmin();
+}
+function changeZTScope(){
+  renderZTScopePicker();
 }
 
 async function submitAdminLogin(){
@@ -2222,7 +2278,16 @@ function initOverrideVideoPlayers(day){
         ytPlayers[key] = new YT.Player(elId, {
           videoId,
           events:{
-            onReady:()=>{},
+            onReady:(e)=>{
+              const savedRanges = dp.videoItemProgress[idx]?.ranges;
+              if(savedRanges && savedRanges.length>0 && !alreadyDone){
+                const lastRange = savedRanges[savedRanges.length-1];
+                const resumeTime = lastRange ? lastRange[1] : 0;
+                if(resumeTime > 3){
+                  try{ e.target.seekTo(resumeTime, true); }catch(err){}
+                }
+              }
+            },
             onError:()=>{ fail('This video link could not be played.'); },
             onStateChange:(e)=>{
               if(alreadyDone) return;
@@ -2391,7 +2456,17 @@ function initVideoTab(day){
       ytPlayer = new YT.Player(elId, {
         videoId,
         events:{
-          onReady:()=>{},
+          onReady:(e)=>{
+            const dp = currentUserProgress[day.id];
+            const savedRanges = dp && dp.videoRanges;
+            if(savedRanges && savedRanges.length>0 && !(dp && dp.videoDone)){
+              const lastRange = savedRanges[savedRanges.length-1];
+              const resumeTime = lastRange ? lastRange[1] : 0;
+              if(resumeTime > 3){
+                try{ e.target.seekTo(resumeTime, true); }catch(err){}
+              }
+            }
+          },
           onError:()=>{ fail('This video link could not be played.'); },
           onStateChange:(e)=>{
             if(e.data===YT.PlayerState.PLAYING){
@@ -2944,12 +3019,24 @@ function isCCRole(){ return trainerIdentity && trainerIdentity.isCC; }
 function isZTRole(){ return trainerIdentity && trainerIdentity.isZT; }
 function cityVisibleToViewer(city){
   if(isAdminRole()) return true;
-  if(isZTRole()) return (trainerIdentity.assignedCities||[]).includes(city);
+  if(isZTRole()){
+    if(ztSessionCluster && CITY_ZONE[city]!==ztSessionCluster) return false;
+    const directCities = trainerIdentity.assignedCities||[];
+    const zoneCities = citiesInZones(trainerIdentity.assignedZones||[]);
+    return directCities.includes(city) || zoneCities.includes(city);
+  }
   return city===trainerIdentity.city;
 }
 function isRosterEntryVisibleToViewer(r){
   if(isAdminRole()) return true;
-  if(isZTRole()) return (trainerIdentity.assignedCities||[]).includes(r.city);
+  if(isZTRole()){
+    if(!cityVisibleToViewer(r.city)) return false;
+    if(ztSessionCategory && Object.keys(adminCourses).length>0){
+      const course = r.courseId ? adminCourses[r.courseId] : null;
+      if(!course || course.categoryId!==ztSessionCategory) return false;
+    }
+    return true;
+  }
   return r.city===trainerIdentity.city && r.trainer===trainerIdentity.name;
 }
 function myScopeFilter(list, cityKey, trainerKey){
@@ -3054,7 +3141,8 @@ function renderAdminSidebar(){
       <div class="who-role">${isAdminRole()?'Welcome':'Trainer'}</div>
       ${nameBlock}
       <div class="who-meta">${roleLabel}</div>
-      <div class="who-actions"><span onclick="switchId()">Exit &rarr;</span></div>
+      <div class="who-actions"><span onclick="switchId()">Exit &rarr;</span><span onclick="refreshAdminData()">Refresh</span>${isZTRole()?'<span onclick="changeZTScope()">Change Scope</span>':''}</div>
+      ${isZTRole() && (ztSessionCategory || ztSessionCluster) ? `<div style="padding:0 16px 10px;font-size:11px;color:rgba(255,255,255,0.55);">${ztSessionCategory && adminCategories[ztSessionCategory] ? esc(adminCategories[ztSessionCategory].name) : 'All categories'} &middot; ${ztSessionCluster ? esc(ztSessionCluster) : 'All clusters'}</div>` : ''}
     </div>
     ${storageAvailable===false ? `<div class="gate-msg error" style="margin-bottom:10px;font-size:11px;"><b>Can't reach the database.</b> Check your connection and reload.</div>` : ''}
   `;
@@ -3068,6 +3156,10 @@ function renderAdminSidebar(){
 }
 function toggleSidebar(){ const sb=document.getElementById('sidebar'); if(sb) sb.classList.toggle('open'); }
 function closeSidebar(){ const sb=document.getElementById('sidebar'); if(sb) sb.classList.remove('open'); }
+async function refreshAdminData(){
+  await renderAdminMain();
+  showToast('Refreshed with the latest data.', 'success');
+}
 function setAdminTab(t){
   const allowedKeys = adminTabDefs().map(d=>d[0]);
   if(!allowedKeys.includes(t)) t = allowedKeys[0];
@@ -3097,9 +3189,12 @@ async function renderAdminMain(){
   else if(adminTab==='categories'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderCategoryManageTab(); }
   else if(adminTab==='languages'){ await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderLanguagesTab(); }
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
-  else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); el.innerHTML = renderSessionsTab(); }
-  else if(adminTab==='access'){ const allR = await listRoster(); adminRoster = Object.fromEntries(Object.entries(allR).filter(([,r])=>isRosterEntryVisibleToViewer(r))); adminUnlocks = await listUnlocks(); adminAssessmentUnlocks = await listAssessmentUnlocks(); el.innerHTML = renderAccessTab(); }
+  else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderSessionsTab(); }
+  else if(adminTab==='access'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); const allR = await listRoster(); adminRoster = Object.fromEntries(Object.entries(allR).filter(([,r])=>isRosterEntryVisibleToViewer(r))); adminUnlocks = await listUnlocks(); adminAssessmentUnlocks = await listAssessmentUnlocks(); el.innerHTML = renderAccessTab(); }
   else if(adminTab==='partners'){
+    await seedDefaultCategoriesIfEmpty();
+    adminCategories = await listCategories();
+    adminCourses = await listCourses();
     const allR2 = await listRoster();
     let scoped = Object.fromEntries(Object.entries(allR2).filter(([,r])=>isRosterEntryVisibleToViewer(r)));
     const allBatchesForFilter = await listAllBatches();
@@ -3108,9 +3203,6 @@ async function renderAdminMain(){
     adminRoster = Object.fromEntries(Object.entries(scoped).filter(([,r])=>!(r.batchId && completedBatchIds.has(r.batchId))));
     adminTrainers = await listTrainers();
     if(isZTRole()) adminTrainers = Object.fromEntries(Object.entries(adminTrainers).filter(([,t])=>cityVisibleToViewer(t.city)));
-    await seedDefaultCategoriesIfEmpty();
-    adminCategories = await listCategories();
-    adminCourses = await listCourses();
     el.innerHTML = renderPartnersTab();
   }
   else if(adminTab==='support'){ adminIssuesCache = await listIssues(); adminTrainers = await listTrainers(); el.innerHTML = renderSupportTab(); }
@@ -3143,7 +3235,7 @@ async function renderAdminMain(){
       }
     }
   }
-  else if(adminTab==='tracking'){ await loadTrackingData(); el.innerHTML = renderTrackingTab(); }
+  else if(adminTab==='tracking'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); await loadTrackingData(); el.innerHTML = renderTrackingTab(); }
   else if(adminTab==='media'){
     const all = await listAllMedia();
     adminMediaCache = isAdminRole() ? all : all.filter(m=>m.trainerId ? m.trainerId===trainerIdentity.trainerId : m.trainerName===trainerIdentity.name);
@@ -4517,6 +4609,7 @@ function renderSessionsTab(){
         <div><span class="field-label">City</span>${lockedFields ? `<div class="readonly-chip">${esc(trainerIdentity.city)}</div>` : `<select class="field-input" id="s-city">${CITIES.map(c=>`<option>${c}</option>`).join('')}</select>`}</div>
         <div><span class="field-label">Trainer name</span>${lockedFields ? `<div class="readonly-chip">${esc(trainerIdentity.name)}</div>` : `<input class="field-input" id="s-trainer">`}</div>
         <div><span class="field-label">Day</span><select class="field-input" id="s-day">${DAYS.map(d=>`<option value="${d.id}">Day ${d.id} — ${d.title}</option>`).join('')}</select></div>
+        <div><span class="field-label">Course</span><select class="field-input" id="s-course"><option value="">— No specific course —</option>${Object.entries(adminCategories).flatMap(([catId,cat])=>Object.entries(adminCourses).filter(([,c])=>c.categoryId===catId).map(([courseId,course])=>`<option value="${courseId}">${esc(cat.name)} — ${esc(course.name)}</option>`)).join('')}</select></div>
         <div><span class="field-label">Date</span><input class="field-input" id="s-date" type="date" value="${todayStr()}"></div>
         <div><span class="field-label">Opens at</span><input class="field-input" id="s-open" type="time" value="09:00"></div>
         <div><span class="field-label">Closes at</span><input class="field-input" id="s-close" type="time" value="19:00"></div>
@@ -4527,12 +4620,12 @@ function renderSessionsTab(){
       <h3>All sessions</h3>
       ${rows.length===0?`<div class="empty-state">No sessions yet. Open one above to let partners check in.</div>`:`
       <table class="data-table">
-        <tr><th>Status</th><th>City</th><th>Trainer</th><th>Day</th><th>Date</th><th>Hours</th><th></th></tr>
+        <tr><th>Status</th><th>City</th><th>Trainer</th><th>Day</th><th>Course</th><th>Date</th><th>Hours</th><th></th></tr>
         ${rows.map(s=>{
           const active = isSessionActive(s);
           const status = s.override==='closed' ? '<span class="pill closed">Force closed</span>' : s.override==='open' ? '<span class="pill open">Force open</span>' : active ? '<span class="pill open">Open now</span>' : '<span class="pill scheduled">Scheduled</span>';
           return `<tr>
-            <td>${status}</td><td>${esc(s.city)}</td><td>${esc(s.trainer)}</td><td>Day ${s.day}</td><td>${fmtDate(s.date)}</td><td class="mono">${s.open}&ndash;${s.close}</td>
+            <td>${status}</td><td>${esc(s.city)}</td><td>${esc(s.trainer)}</td><td>Day ${s.day}</td><td>${s.courseId && adminCourses[s.courseId] ? esc(adminCourses[s.courseId].name) : '—'}</td><td>${fmtDate(s.date)}</td><td class="mono">${s.open}&ndash;${s.close}</td>
             <td><button class="btn small secondary" onclick="toggleOverride('${s.id}','open')">Force open</button> <button class="btn small secondary" onclick="toggleOverride('${s.id}','closed')">Force close</button> <button class="btn small danger" onclick="deleteSessionRow('${s.id}')">Delete</button></td>
           </tr>`;
         }).join('')}
@@ -4544,14 +4637,15 @@ async function addSession(){
   const city = isAdminRole() ? document.getElementById('s-city').value : trainerIdentity.city;
   const trainer = isAdminRole() ? document.getElementById('s-trainer').value.trim() : trainerIdentity.name;
   const day = parseInt(document.getElementById('s-day').value);
+  const courseId = document.getElementById('s-course').value || null;
   const date = document.getElementById('s-date').value || todayStr();
   const open = document.getElementById('s-open').value || '09:00';
   const close = document.getElementById('s-close').value || '19:00';
   if(!city || !trainer){ showToast('Enter both city and trainer name.', 'error'); return; }
   const id = uid();
-  const ok = await kvSet('session:'+id, { id, city, trainer, day, date, open, close, override:null });
+  const ok = await kvSet('session:'+id, { id, city, trainer, day, courseId, date, open, close, override:null });
   if(!ok){ showToast("Couldn't open this session — can't reach the database right now. Check your connection and try again.", 'error'); return; }
-  await logHistory('session_opened', `Session opened: ${city} · ${trainer} · Day ${day} (${open}-${close})`, {city, trainer, day});
+  await logHistory('session_opened', `Session opened: ${city} · ${trainer} · Day ${day}${courseId && adminCourses[courseId]?' · '+adminCourses[courseId].name:''} (${open}-${close})`, {city, trainer, day, courseId});
   showToast('Session opened.', 'success');
   renderAdminMain();
 }
@@ -4657,7 +4751,7 @@ async function createPartner(){
     trainerName = trainerIdentity.name; city = trainerIdentity.city; trainerId = trainerIdentity.trainerId;
   }
   if(!name || !officeId){ showToast('Enter the partner name and office ID.', 'error'); return; }
-  const batch = await getOrCreateActiveBatch(trainerId, trainerName, city);
+  const batch = await getOrCreateActiveBatch(trainerId, trainerName, city, courseId);
   const existingRoster = await listRoster();
   const existingIds = new Set(Object.keys(existingRoster));
   const password = genPartnerPassword(name, officeId, existingIds);
@@ -4717,32 +4811,49 @@ function renderTrackingTab(){
   const entries = Object.entries(adminRoster);
   const cities = [...new Set(entries.map(([,r])=>r.city))];
   const trainers = [...new Set(entries.map(([,r])=>r.trainer))];
+  const batches = [...new Set(entries.map(([,r])=>r.batchNumber).filter(Boolean))].sort((a,b)=>a-b);
   const showFilters = isAdminRole() || isZTRole();
   return `
     <div class="crumb">${isAdminRole()?'Admin dashboard':isZTRole()?'Zonal Manager dashboard':'Trainer dashboard'}</div>
     <h1 class="page-title">Tracking</h1>
-    <p class="page-sub">${isAdminRole()?"Every partner's attendance, assessment scores, ratings, and pass/fail status.":isZTRole()?"Partners' attendance, scores, and pass/fail status across your assigned zones and cities.":"Your partners' attendance, assessment scores, ratings, and pass/fail status."}</p>
+    <p class="page-sub">${isAdminRole()?"Every partner's attendance, assessment scores, ratings, and pass/fail status.":isZTRole()?"Partners' attendance, scores, and pass/fail status across your assigned categories, clusters, and cities.":"Your partners' attendance, assessment scores, ratings, and pass/fail status."}</p>
     <div class="filter-row">
-      ${showFilters ? `<select id="f-zone" onchange="applyTrackingFilter()"><option value="">All zones</option>${ZONES.map(z=>`<option>${esc(z)}</option>`).join('')}</select>
+      ${showFilters ? `<select id="f-zone" onchange="applyTrackingFilter()"><option value="">All clusters</option>${ZONES.map(z=>`<option>${esc(z)}</option>`).join('')}</select>
       <select id="f-city" onchange="applyTrackingFilter()"><option value="">All cities</option>${cities.map(c=>`<option>${esc(c)}</option>`).join('')}</select>
-      <select id="f-trainer" onchange="applyTrackingFilter()"><option value="">All trainers</option>${trainers.map(t=>`<option>${esc(t)}</option>`).join('')}</select>` : ''}
+      <select id="f-category" onchange="onTrackingCategoryChange()"><option value="">All categories</option>${Object.entries(adminCategories).map(([id,cat])=>`<option value="${id}">${esc(cat.name)}</option>`).join('')}</select>
+      <select id="f-course" onchange="applyTrackingFilter()"><option value="">All courses</option></select>
+      <select id="f-trainer" onchange="applyTrackingFilter()"><option value="">All trainers</option>${trainers.map(t=>`<option>${esc(t)}</option>`).join('')}</select>
+      <select id="f-batch" onchange="applyTrackingFilter()"><option value="">All batches</option>${batches.map(b=>`<option value="${b}">Batch ${b}</option>`).join('')}</select>` : ''}
       <button class="btn secondary small" onclick="renderAdminMain()">Refresh</button>
       <button class="btn amber small" onclick="exportExcel()">Export Excel</button>
     </div>
-    <div id="tracking-table-wrap">${renderTrackingTableInner('','','')}</div>
+    <div id="tracking-table-wrap">${renderTrackingTableInner('','','','','','')}</div>
   `;
+}
+function onTrackingCategoryChange(){
+  const catId = document.getElementById('f-category').value;
+  const courseSelect = document.getElementById('f-course');
+  const courses = catId ? Object.entries(adminCourses).filter(([,c])=>c.categoryId===catId) : Object.entries(adminCourses);
+  courseSelect.innerHTML = `<option value="">All courses</option>` + courses.map(([id,course])=>`<option value="${id}">${esc(course.name)}</option>`).join('');
+  applyTrackingFilter();
 }
 function applyTrackingFilter(){
   const z = document.getElementById('f-zone')?.value || '';
   const c = document.getElementById('f-city')?.value || '';
   const t = document.getElementById('f-trainer')?.value || '';
-  document.getElementById('tracking-table-wrap').innerHTML = renderTrackingTableInner(c,t,z);
+  const cat = document.getElementById('f-category')?.value || '';
+  const course = document.getElementById('f-course')?.value || '';
+  const batch = document.getElementById('f-batch')?.value || '';
+  document.getElementById('tracking-table-wrap').innerHTML = renderTrackingTableInner(c,t,z,cat,course,batch);
 }
-function renderTrackingTableInner(cityFilter, trainerFilter, zoneFilter){
+function renderTrackingTableInner(cityFilter, trainerFilter, zoneFilter, categoryFilter, courseFilter, batchFilter){
   let entries = Object.entries(adminRoster);
   if(zoneFilter) entries = entries.filter(([,r])=>CITY_ZONE[r.city]===zoneFilter);
   if(cityFilter) entries = entries.filter(([,r])=>r.city===cityFilter);
   if(trainerFilter) entries = entries.filter(([,r])=>r.trainer===trainerFilter);
+  if(categoryFilter) entries = entries.filter(([,r])=>r.courseId && adminCourses[r.courseId] && adminCourses[r.courseId].categoryId===categoryFilter);
+  if(courseFilter) entries = entries.filter(([,r])=>r.courseId===courseFilter);
+  if(batchFilter) entries = entries.filter(([,r])=>String(r.batchNumber)===String(batchFilter));
   if(entries.length===0) return `<div class="card"><div class="empty-state">No partners match this filter yet.</div></div>`;
   const rows = entries.map(([id,r])=>{
     const prog = adminProgressCache[id] || {};
