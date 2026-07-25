@@ -683,12 +683,18 @@ function detectDeviceBrowser(){
   else if(/Chrome\//.test(ua) && !/Edg\//.test(ua)) browser = 'Chrome';
   else if(/Firefox\//.test(ua)) browser = 'Firefox';
   else if(/Safari\//.test(ua) && !/Chrome/.test(ua)) browser = 'Safari';
-  return { device, browser };
+  let os = 'Other';
+  if(/Windows/i.test(ua)) os = 'Windows';
+  else if(/Android/i.test(ua)) os = 'Android';
+  else if(/iPhone|iPad|iPod/i.test(ua)) os = 'iOS';
+  else if(/Mac OS X/i.test(ua)) os = 'macOS';
+  else if(/Linux/i.test(ua)) os = 'Linux';
+  return { device, browser, os };
 }
 async function logLoginEvent(accountType, accountId, accountName, event, extra){
-  const { device, browser } = detectDeviceBrowser();
+  const { device, browser, os } = detectDeviceBrowser();
   const id = String(Date.now()).padStart(14,'0')+'_'+uid();
-  await kvSet('loginLog:'+id, { id, accountType, accountId, accountName, event, device, browser, at:new Date().toISOString(), ...(extra||{}) });
+  await kvSet('loginLog:'+id, { id, accountType, accountId, accountName, event, device, browser, os, at:new Date().toISOString(), ...(extra||{}) });
   return id;
 }
 async function listLoginLogs(limit){
@@ -1552,8 +1558,14 @@ function clearSession(){
 async function loginAsPartner(id, opts){
   opts = opts || {};
   const r = await getRosterEntry(id);
-  if(!r) return { ok:false, reason:"That ID wasn't recognised. Double check with your trainer." };
-  if(isAccountLocked(r)) return { ok:false, reason:'This ID has been locked. Ask your trainer or Admin to unlock it.' };
+  if(!r){
+    if(!opts.silent) await logLoginEvent('partner', id, id, 'failed', { enteredIdentifier:id, failureReason:'User Not Found' });
+    return { ok:false, reason:"That ID wasn't recognised. Double check with your trainer." };
+  }
+  if(isAccountLocked(r)){
+    if(!opts.silent) await logLoginEvent('partner', id, r.name, 'failed', { enteredIdentifier:id, failureReason:'Account Locked' });
+    return { ok:false, reason:'This ID has been locked. Ask your trainer or Admin to unlock it.' };
+  }
   if(opts.silent){
     if(opts.sessionToken){
       const stored = await getStoredSessionToken('partner', id);
@@ -1564,7 +1576,7 @@ async function loginAsPartner(id, opts){
     if(existingToken){
       const sec = await getSecuritySettings();
       if(sec.partnerLoginPolicy==='block'){
-        await logLoginEvent('partner', id, r.name, 'failed', { note:'blocked - already logged in elsewhere' });
+        await logLoginEvent('partner', id, r.name, 'failed', { enteredIdentifier:id, failureReason:'Already logged in on another device', note:'blocked - already logged in elsewhere' });
         return { ok:false, reason:'This Partner ID is already logged in on another device. Please log out from the existing device before logging in again.' };
       }
     }
@@ -1608,7 +1620,7 @@ async function loginAsPartner(id, opts){
     sessionToken = newSessionToken();
     await setStoredSessionToken('partner', id, sessionToken);
     await logHistory('partner_login', `${r.name} (${id}) checked in for Day ${s.day}`, {partnerId:id, city:r.city, trainer:r.trainer, day:s.day});
-    await logLoginEvent('partner', id, r.name, 'success');
+    await logLoginEvent('partner', id, r.name, 'success', { enteredIdentifier:id });
   }
   saveSession({ role:'partner', partnerId:id, sessionToken });
   currentSessionRole = 'partner'; currentSessionAccountId = id;
@@ -1665,7 +1677,7 @@ async function loginAsTrainer(trainerId, opts){
     sessionToken = newSessionToken();
     await setStoredSessionToken('trainer', trainerId, sessionToken);
     await logHistory('trainer_login', `${t.name} logged in (${t.category} · ${t.city})`, {trainerId, category:t.category, city:t.city});
-    await logLoginEvent('trainer', trainerId, t.name, 'success');
+    await logLoginEvent('trainer', trainerId, t.name, 'success', { enteredIdentifier:`${t.category}/${t.city}` });
   }
   saveSession({ role:'trainer', trainerId, sessionToken });
   currentSessionRole = 'trainer'; currentSessionAccountId = trainerId;
@@ -1685,6 +1697,7 @@ async function submitTrainerLogin(){
   const candidate = Object.entries(trainers).find(([tid,t])=> t.category===category && t.city===city);
   if(candidate && isAccountLocked(candidate[1])){
     gateBusy=false;
+    await logLoginEvent('trainer', candidate[0], candidate[1].name, 'failed', { enteredIdentifier:`${category}/${city}`, failureReason:'Account Locked' });
     gateError = 'This account is locked after too many failed attempts. Ask your Admin to unlock it.';
     renderGate();
     return;
@@ -1698,13 +1711,15 @@ async function submitTrainerLogin(){
       const patch = { failedAttempts: attempts };
       if(attempts>=MAX_FAILED_ATTEMPTS) patch.locked = true;
       await kvSet('trainer:'+tid, { ...t, ...patch });
-      await logLoginEvent('trainer', tid, t.name, 'failed', { attempts });
+      await logLoginEvent('trainer', tid, t.name, 'failed', { attempts, enteredIdentifier:`${category}/${city}`, failureReason:'Incorrect Password' });
       if(patch.locked){
         await logHistory('account_locked', `Trainer ${t.name} locked after ${attempts} failed login attempts`, {trainerId:tid});
         gateError = 'Too many failed attempts — this account is now locked. Ask your Admin to unlock it.';
         renderGate();
         return;
       }
+    } else {
+      await logLoginEvent('trainer', null, null, 'failed', { enteredIdentifier:`${category}/${city}`, failureReason:'User Not Found' });
     }
     gateError = "Incorrect category, city, or password. If you've forgotten your password, use the link below.";
     renderGate();
@@ -1733,7 +1748,7 @@ async function loginAsCC(ccId, opts){
     sessionToken = newSessionToken();
     await setStoredSessionToken('cc', ccId, sessionToken);
     await logHistory('cc_login', `${c.name} (Content Creator) logged in`, {ccId});
-    await logLoginEvent('cc', ccId, c.name, 'success');
+    await logLoginEvent('cc', ccId, c.name, 'success', { enteredIdentifier:c.name });
   }
   saveSession({ role:'cc', ccId, sessionToken });
   currentSessionRole = 'cc'; currentSessionAccountId = ccId;
@@ -1751,6 +1766,7 @@ async function submitCCLogin(){
   const candidate = Object.entries(ccs).find(([id,c])=> c.active!==false && c.name.toLowerCase()===name.toLowerCase());
   if(candidate && isAccountLocked(candidate[1])){
     gateBusy=false;
+    await logLoginEvent('cc', candidate[0], candidate[1].name, 'failed', { enteredIdentifier:name, failureReason:'Account Locked' });
     gateError = 'This account is locked after too many failed attempts. Ask your Admin to unlock it.';
     renderGate();
     return;
@@ -1764,13 +1780,15 @@ async function submitCCLogin(){
       const patch = { failedAttempts: attempts };
       if(attempts>=MAX_FAILED_ATTEMPTS) patch.locked = true;
       await kvSet('cc:'+id, { ...c, ...patch });
-      await logLoginEvent('cc', id, c.name, 'failed', { attempts });
+      await logLoginEvent('cc', id, c.name, 'failed', { attempts, enteredIdentifier:name, failureReason:'Incorrect Password' });
       if(patch.locked){
         await logHistory('account_locked', `Content Creator ${c.name} locked after ${attempts} failed login attempts`, {ccId:id});
         gateError = 'Too many failed attempts — this account is now locked. Ask your Admin to unlock it.';
         renderGate();
         return;
       }
+    } else {
+      await logLoginEvent('cc', null, null, 'failed', { enteredIdentifier:name, failureReason:'User Not Found' });
     }
     gateError = 'Incorrect name or password, or your access has been deactivated. Contact your Admin.';
     renderGate();
@@ -1799,7 +1817,7 @@ async function loginAsZT(ztId, opts){
     sessionToken = newSessionToken();
     await setStoredSessionToken('zt', ztId, sessionToken);
     await logHistory('zt_login', `${z.name} (Zonal Training Manager) logged in`, {ztId});
-    await logLoginEvent('zt', ztId, z.name, 'success');
+    await logLoginEvent('zt', ztId, z.name, 'success', { enteredIdentifier:z.name });
   }
   saveSession({ role:'zt', ztId, sessionToken });
   currentSessionRole = 'zt'; currentSessionAccountId = ztId;
@@ -1819,6 +1837,7 @@ async function submitZTLogin(){
   const candidate = Object.entries(zts).find(([id,z])=> z.active!==false && z.name.toLowerCase()===name.toLowerCase());
   if(candidate && isAccountLocked(candidate[1])){
     gateBusy=false;
+    await logLoginEvent('zt', candidate[0], candidate[1].name, 'failed', { enteredIdentifier:name, failureReason:'Account Locked' });
     gateError = 'This account is locked after too many failed attempts. Ask your Admin to unlock it.';
     renderGate();
     return;
@@ -1832,13 +1851,15 @@ async function submitZTLogin(){
       const patch = { failedAttempts: attempts };
       if(attempts>=MAX_FAILED_ATTEMPTS) patch.locked = true;
       await kvSet('zt:'+id, { ...z, ...patch });
-      await logLoginEvent('zt', id, z.name, 'failed', { attempts });
+      await logLoginEvent('zt', id, z.name, 'failed', { attempts, enteredIdentifier:name, failureReason:'Incorrect Password' });
       if(patch.locked){
         await logHistory('account_locked', `Zonal Training Manager ${z.name} locked after ${attempts} failed login attempts`, {ztId:id});
         gateError = 'Too many failed attempts — this account is now locked. Ask your Admin to unlock it.';
         renderGate();
         return;
       }
+    } else {
+      await logLoginEvent('zt', null, null, 'failed', { enteredIdentifier:name, failureReason:'User Not Found' });
     }
     gateError = 'Incorrect name or password, or your access has been deactivated. Contact your Admin.';
     renderGate();
@@ -1906,12 +1927,15 @@ async function submitAdminLogin(){
   if(gateBusy) return;
   const pass = document.getElementById('admin-pass-input').value.trim();
   const sec = (await kvGet('adminSecurity:global')) || { failedAttempts:0, locked:false };
-  if(sec.locked){ gateError = 'The Admin account is locked after too many failed attempts. Reset it from a trusted device, or wait for the lock to be cleared.'; renderGate(); return; }
+  if(sec.locked){
+    await logLoginEvent('admin', 'admin', 'Admin', 'failed', { enteredIdentifier:'admin', failureReason:'Account Locked' });
+    gateError = 'The Admin account is locked after too many failed attempts. Reset it from a trusted device, or wait for the lock to be cleared.'; renderGate(); return;
+  }
   if(pass !== ADMIN_PASSWORD){
     const attempts = (sec.failedAttempts||0)+1;
     const patch = { failedAttempts: attempts, locked: attempts>=MAX_FAILED_ATTEMPTS };
     await kvSet('adminSecurity:global', { ...sec, ...patch });
-    await logLoginEvent('admin', 'admin', 'Admin', 'failed', { attempts });
+    await logLoginEvent('admin', 'admin', 'Admin', 'failed', { attempts, enteredIdentifier:'admin', failureReason:'Incorrect Password' });
     if(patch.locked){
       await logHistory('account_locked', `Admin account locked after ${attempts} failed login attempts`, {});
       gateError = 'Too many failed attempts — the Admin account is now locked.';
@@ -1925,7 +1949,7 @@ async function submitAdminLogin(){
   await setStoredSessionToken('admin', 'global', sessionToken);
   trainerIdentity = { isAdmin:true, name: getSavedAdminName() };
   await logHistory('admin_login', 'Admin logged in', {});
-  await logLoginEvent('admin', 'admin', trainerIdentity.name, 'success');
+  await logLoginEvent('admin', 'admin', trainerIdentity.name, 'success', { enteredIdentifier:'admin' });
   saveSession({ role:'admin', sessionToken });
   currentSessionRole = 'admin'; currentSessionAccountId = 'global';
   currentSessionToken = sessionToken;
@@ -1995,8 +2019,13 @@ async function tryRestoreSession(){
     if(saved.role==='partner'){
       const result = await loginAsPartner(saved.partnerId, { silent:true, sessionToken: saved.sessionToken });
       if(!result.ok){ clearSession(); sessionReplacedNotice = result.reason==='session_replaced'; return false; }
-      currentDay = currentUserUnlockedDays.length ? Math.max(...currentUserUnlockedDays) : 0;
-      currentTab='theory';
+      if(saved.currentDay!==undefined && (saved.currentDay===0 || saved.currentDay>=98 || isDayUnlocked(saved.currentDay))){
+        currentDay = saved.currentDay;
+        currentTab = saved.currentTab || 'theory';
+      } else {
+        currentDay = currentUserUnlockedDays.length ? Math.max(...currentUserUnlockedDays) : 0;
+        currentTab='theory';
+      }
       renderApp();
       startSessionWatch();
       return true;
@@ -2134,11 +2163,18 @@ async function refreshPartnerData(){
   showToast('Refreshed with the latest progress and content.', 'success');
   renderApp();
 }
+function persistPartnerPosition(){
+  if(!currentUser) return;
+  const saved = loadSession();
+  if(!saved || saved.role!=='partner') return;
+  saveSession({ ...saved, currentDay, currentTab });
+}
 function goTo(dayId, tab){
   if(dayId>0 && dayId<98 && !isDayUnlocked(dayId)){ lockedToast(dayId); return; }
   cleanupPlayer();
   currentDay = dayId; currentTab = tab||'theory';
   closeSidebar();
+  persistPartnerPosition();
   renderApp(); window.scrollTo(0,0);
   if(dayId>0 && dayId<98){
     refreshDayContent(dayId).then(()=>{ if(currentDay===dayId){ cleanupPlayer(); renderMainOnly(); } });
@@ -2205,6 +2241,7 @@ function setTab(tab){
   if(tab==='quiz' && !isAssessmentUnlocked(day.id)){ showToast("Your trainer hasn't unlocked this assessment yet.", 'error'); return; }
   cleanupPlayer();
   currentTab = tab; renderMainOnly();
+  persistPartnerPosition();
   if(tab==='assignment') loadMyMedia(day.id);
 }
 async function loadMyMedia(dayId){
@@ -2378,7 +2415,7 @@ function updateTheoryCompleteButtonState(dayId){
   const dp = currentUserProgress[dayId];
   if(ov){
     const items = ov.content || [];
-    const videoIndices = items.map((it,i)=>(it.type==='video' && it.url)?i:null).filter(i=>i!==null);
+    const videoIndices = items.map((it,i)=>(it.type==='video' && it.url && (it.watchSettings?.mandatory!==false))?i:null).filter(i=>i!==null);
     const hasAudio = items.some(i=>i.type==='audio');
     const allVideosDone = videoIndices.every(i => dp.videoItemProgress[i]?.done);
     btn.disabled = !(allVideosDone && (!hasAudio || dp.audioPlayed));
@@ -2484,6 +2521,9 @@ async function handleActivityUpload(event){
 function renderOverrideVideoItem(dayId, item, idx, dp){
   const n = normalizeUrl(item.url);
   const itemProgress = dp.videoItemProgress[idx] || {pct:0, done:false};
+  const ws = item.watchSettings || {};
+  const mandatory = ws.mandatory!==false;
+  const minPercent = ws.minPercent || 90;
   let inner;
   if(n.kind==='youtube'){
     inner = `<div id="yt-player-${dayId}-${idx}" style="width:100%;height:100%;"></div>`;
@@ -2500,7 +2540,7 @@ function renderOverrideVideoItem(dayId, item, idx, dp){
       progressBlock = `
         <div class="video-progress-wrap">
           <div class="video-progress-track"><div class="video-progress-fill" id="ov-progress-fill-${dayId}-${idx}" style="width:${Math.round(itemProgress.pct)}%"></div></div>
-          <div class="video-progress-label" id="ov-progress-label-${dayId}-${idx}">${Math.round(itemProgress.pct)}% watched ${itemProgress.done?'&middot; <span style="color:var(--success);">Done</span>':'&middot; needs 90% to continue'}</div>
+          <div class="video-progress-label" id="ov-progress-label-${dayId}-${idx}">${Math.round(itemProgress.pct)}% watched ${itemProgress.done?'&middot; <span style="color:var(--success);">Done</span>':(mandatory?`&middot; needs ${minPercent}% to continue`:'&middot; optional — you can move on anytime')}</div>
         </div>`;
     } else {
       progressBlock = `
@@ -2599,7 +2639,17 @@ async function pollOverrideYT(dayId, idx, key){
     if(!dur) return;
     ensureDay(dayId);
     const dp = currentUserProgress[dayId];
+    const ov = contentOverrides[dayId];
+    const item = ov && ov.content ? ov.content[idx] : null;
+    const ws = (item && item.watchSettings) || {};
+    const minPercent = ws.minPercent || 90;
+    const allowSkip = ws.allowSkip!==false;
+    const allowRewatch = ws.allowRewatch!==false;
     const prev = dp.videoItemProgress[idx] || {pct:0, done:false, ranges:[], lastTime:null};
+    if(prev.done && !allowRewatch){
+      try{ if(player.pauseVideo) player.pauseVideo(); }catch(e){}
+      return;
+    }
     let ranges = prev.ranges ? prev.ranges.map(r=>[r[0],r[1]]) : [];
     if(prev.done && ranges.length===0){
       // Migration safety: this video was already completed under data saved before range-tracking existed
@@ -2611,21 +2661,29 @@ async function pollOverrideYT(dayId, idx, key){
       const delta = cur - prev.lastTime;
       if(delta > 0 && delta <= POLL_INTERVAL_SEC*2){
         ranges.push([prev.lastTime, cur]);
+      } else if(delta > POLL_INTERVAL_SEC*2 && !allowSkip){
+        // Forward jump beyond normal playback, and skipping isn't allowed - snap back to where they left off
+        try{ player.seekTo(prev.lastTime, true); }catch(e){}
+        dp.videoItemProgress[idx] = { ...prev, lastTime: prev.lastTime };
+        return;
       }
     }
     const merged = mergeWatchRanges(ranges);
     const watchedSec = totalWatchedSeconds(merged);
     const pct = Math.max(prev.done?100:0, Math.min(100, Math.round((watchedSec/dur)*100)));
-    const done = pct>=90 || !!prev.done;
-    const changed = pct !== (prev.pct||0) || done !== !!prev.done;
-    dp.videoItemProgress[idx] = { pct, done, ranges: merged, lastTime: cur };
+    const meetsThreshold = pct>=minPercent;
+    const unlockNext = ws.unlockNext!==false;
+    const done = !!prev.done || (meetsThreshold && unlockNext);
+    const readyForUnlock = !!prev.readyForUnlock || (meetsThreshold && !unlockNext && !done);
+    const changed = pct !== (prev.pct||0) || done !== !!prev.done || readyForUnlock !== !!prev.readyForUnlock;
+    dp.videoItemProgress[idx] = { pct, done, readyForUnlock, ranges: merged, lastTime: cur };
     checkInVideoQuizTriggers(dayId, idx, key, cur);
     if(changed){
       const fill = document.getElementById(`ov-progress-fill-${dayId}-${idx}`);
       const label = document.getElementById(`ov-progress-label-${dayId}-${idx}`);
       if(fill) fill.style.width = pct+'%';
-      if(label) label.innerHTML = pct+'% watched '+(done?'&middot; <span style="color:var(--success);">Done</span>':'&middot; needs 90% to continue');
-      if(pct % 6 === 0 || done) await setProgress(currentUser.id, currentUserProgress);
+      if(label) label.innerHTML = pct+'% watched '+(done?'&middot; <span style="color:var(--success);">Done</span>':readyForUnlock?'&middot; <span style="color:var(--amber);">Watched — waiting for your Trainer to confirm</span>':`&middot; needs ${minPercent}% to continue`);
+      if(pct % 6 === 0 || done || readyForUnlock) await setProgress(currentUser.id, currentUserProgress);
       if(done){
         if(ytPollTimers[key]){ clearInterval(ytPollTimers[key]); delete ytPollTimers[key]; }
         updateTheoryCompleteButtonState(dayId);
@@ -3285,6 +3343,9 @@ let securityPartnerFilterCity = '';
 let securityPartnerFilterCategory = '';
 let securityPartnerFilterSearch = '';
 let securityFilterType = '';
+let securityFilterCity = '';
+let securityFilterDate = '';
+let securityFilterUserSearch = '';
 let securityFilterStatus = '';
 let doubtsFilterStatus = '';
 let adminBatchesCache = [];
@@ -3372,6 +3433,13 @@ function adminTabDefs(){
 }
 
 let openIssueCount = 0;
+let securityAlertCount = 0;
+async function refreshSecurityAlertCount(){
+  try{
+    const logs = await listLoginLogs(300);
+    securityAlertCount = detectSuspiciousLogins(logs).length;
+  }catch(e){ securityAlertCount = 0; }
+}
 function getViewerId(){ return isAdminRole() ? 'admin' : trainerIdentity.trainerId; }
 function unreadCountForIssue(i){
   const viewerId = getViewerId();
@@ -3407,6 +3475,7 @@ async function renderAdmin(){
   root.innerHTML = `<div class="app"><div class="sidebar" id="sidebar"></div><div class="main" id="main"></div></div>`;
   await loadAndApplyDayRegistry();
   refreshOpenIssueCount().then(renderAdminSidebar);
+  refreshSecurityAlertCount().then(renderAdminSidebar);
   renderAdminSidebar();
   renderAdminMain();
 }
@@ -3430,8 +3499,11 @@ function renderAdminSidebar(){
   `;
   tabs.forEach(([key,title,sub])=>{
     const badgeKey = isAdminRole() ? 'support' : 'report';
-    const showBadge = key===badgeKey && openIssueCount>0;
-    html += `<div class="knob-row ${adminTab===key?'active':''}" onclick="setAdminTab('${key}')"><div class="knob"></div><div class="nav-text"><div class="nav-title">${title}${showBadge?` <span class="nav-badge">${openIssueCount}</span>`:''}</div><div class="nav-sub">${sub}</div></div></div>`;
+    const showIssueBadge = key===badgeKey && openIssueCount>0;
+    const showSecurityBadge = key==='security' && isAdminRole() && securityAlertCount>0;
+    const badgeCount = showIssueBadge ? openIssueCount : securityAlertCount;
+    const showBadge = showIssueBadge || showSecurityBadge;
+    html += `<div class="knob-row ${adminTab===key?'active':''}" onclick="setAdminTab('${key}')"><div class="knob"></div><div class="nav-text"><div class="nav-title">${title}${showBadge?` <span class="nav-badge">${badgeCount}</span>`:''}</div><div class="nav-sub">${sub}</div></div></div>`;
   });
   html += `<div class="sidebar-foot">${isAdminRole()?'You can see every trainer, partner, and session on the platform.':'Your dashboard is scoped to your own city and partners.'}</div>`;
   document.getElementById('sidebar').innerHTML = html;
@@ -3456,6 +3528,9 @@ function setAdminTab(t){
     refreshOpenIssueCount().then(renderAdminSidebar);
     markVisibleIssuesRead().then(()=>refreshOpenIssueCount().then(renderAdminSidebar));
     startIssuePolling();
+  } else if(t==='security'){
+    refreshSecurityAlertCount().then(renderAdminSidebar);
+    stopIssuePolling();
   } else {
     stopIssuePolling();
   }
@@ -3487,7 +3562,7 @@ async function renderAdminMain(){
   else if(adminTab==='languages'){ await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderLanguagesTab(); }
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
   else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderSessionsTab(); }
-  else if(adminTab==='access'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); const allR = await listRoster(); adminRoster = Object.fromEntries(Object.entries(allR).filter(([,r])=>isRosterEntryVisibleToViewer(r))); adminUnlocks = await listUnlocks(); adminAssessmentUnlocks = await listAssessmentUnlocks(); el.innerHTML = renderAccessTab(); }
+  else if(adminTab==='access'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); const allR = await listRoster(); adminRoster = Object.fromEntries(Object.entries(allR).filter(([,r])=>isRosterEntryVisibleToViewer(r))); adminUnlocks = await listUnlocks(); adminAssessmentUnlocks = await listAssessmentUnlocks(); adminProgressCache = {}; await Promise.all(Object.keys(adminRoster).map(async id=>{ adminProgressCache[id] = await getProgress(id); })); await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id); if(ov) contentOverrides[d.id] = migrateOldOverrideToUnified(ov); })); el.innerHTML = renderAccessTab(); }
   else if(adminTab==='partners'){
     await seedDefaultCategoriesIfEmpty();
     adminCategories = await listCategories();
@@ -3544,7 +3619,11 @@ async function renderAdminMain(){
     el.innerHTML = renderAiDoubtsTab();
   }
   else if(adminTab==='batches'){
-    if(selectedBatchId){ el.innerHTML = await renderBatchDetailAsync(); }
+    if(selectedBatchId){
+      await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses();
+      await loadTrackingData();
+      el.innerHTML = await renderBatchDetailAsync();
+    }
     else{
       const all = await listAllBatches();
       adminBatchesCache = isAdminRole() ? all : isZTRole() ? all.filter(b=>cityVisibleToViewer(b.city)) : all.filter(b=>b.trainerId===trainerIdentity.trainerId);
@@ -4356,14 +4435,36 @@ async function allAccountsForSecurity(){
   await Promise.all(list.map(async a=>{ a.activeSessionToken = await getStoredSessionToken(a.type, a.id); }));
   return list;
 }
+function loginLogCity(log){
+  if(log.accountType==='trainer' && adminTrainers[log.accountId]) return adminTrainers[log.accountId].city;
+  if(log.accountType==='partner' && adminRoster[log.accountId]) return adminRoster[log.accountId].city;
+  return null;
+}
+function detectSuspiciousLogins(logs){
+  const counts = {};
+  logs.filter(l=>l.event==='failed').forEach(l=>{
+    const key = l.accountType+':'+(l.accountId||l.enteredIdentifier||'unknown');
+    if(!counts[key]) counts[key] = { count:0, accountType:l.accountType, name:l.accountName||l.enteredIdentifier||'Unknown', lastAt:l.at };
+    counts[key].count++;
+    if(new Date(l.at) > new Date(counts[key].lastAt)) counts[key].lastAt = l.at;
+  });
+  return Object.values(counts).filter(c=>c.count>=3).sort((a,b)=>b.count-a.count);
+}
 function renderSecurityTab(){
   const accounts = adminSecurityAccounts;
   const activeSessions = accounts.filter(a=>a.activeSessionToken);
   const lockedAccounts = accounts.filter(a=>a.locked);
   const failedLogs = adminLoginLogs.filter(l=>l.event==='failed');
+  const suspicious = detectSuspiciousLogins(adminLoginLogs);
   let filteredLogs = adminLoginLogs;
   if(securityFilterType) filteredLogs = filteredLogs.filter(l=>l.accountType===securityFilterType);
   if(securityFilterStatus) filteredLogs = filteredLogs.filter(l=>l.event===securityFilterStatus);
+  if(securityFilterCity) filteredLogs = filteredLogs.filter(l=>loginLogCity(l)===securityFilterCity);
+  if(securityFilterDate) filteredLogs = filteredLogs.filter(l=>l.at && l.at.slice(0,10)===securityFilterDate);
+  if(securityFilterUserSearch){
+    const q = securityFilterUserSearch.toLowerCase();
+    filteredLogs = filteredLogs.filter(l=> (l.accountName||'').toLowerCase().includes(q) || (l.enteredIdentifier||'').toLowerCase().includes(q) || (l.accountId||'').toLowerCase().includes(q));
+  }
   return `
     <div class="crumb">Admin dashboard</div>
     <h1 class="page-title">Security &amp; Alerts</h1>
@@ -4438,6 +4539,15 @@ function renderSecurityTab(){
     </div>
     </div>
 
+    ${suspicious.length>0 ? `<div class="card" style="border-left:4px solid var(--danger);">
+      <h3 style="color:var(--danger);">Suspicious login activity detected</h3>
+      <p style="margin-bottom:10px;">These accounts have 3 or more failed login attempts on record. This is an in-app alert — there's no backend here to send an email or SMS, so this only surfaces when you're viewing this dashboard.</p>
+      <table class="data-table">
+        <tr><th>Account</th><th>Role</th><th>Failed attempts</th><th>Most recent</th></tr>
+        ${suspicious.map(s=>`<tr><td>${esc(s.name)}</td><td>${esc(securityRoleLabel(s.accountType))}</td><td class="mono">${s.count}</td><td class="mono">${fmtDateTime(s.lastAt)}</td></tr>`).join('')}
+      </table>
+    </div>` : ''}
+
     <div class="card">
       <h3>Login activity</h3>
       <div class="filter-row">
@@ -4454,18 +4564,28 @@ function renderSecurityTab(){
           <option value="success" ${securityFilterStatus==='success'?'selected':''}>Success only</option>
           <option value="failed" ${securityFilterStatus==='failed'?'selected':''}>Failed only</option>
         </select>
-        <button class="btn secondary small" onclick="renderAdminMain()">Refresh</button>
+        <select id="security-log-city" onchange="securityFilterCity=this.value; renderAdminMain();">
+          <option value="">All cities</option>
+          ${CITIES.map(c=>`<option value="${esc(c)}" ${securityFilterCity===c?'selected':''}>${esc(c)}</option>`).join('')}
+        </select>
+        <input class="field-input" type="date" id="security-log-date" value="${securityFilterDate}" onchange="securityFilterDate=this.value; renderAdminMain();" style="width:auto;margin-bottom:0;">
+        <input class="field-input" id="security-log-search" value="${esc(securityFilterUserSearch)}" placeholder="Search name or ID..." oninput="securityFilterUserSearch=this.value; renderAdminMain();" style="width:180px;margin-bottom:0;">
+        <button class="btn secondary small" onclick="securityFilterType='';securityFilterStatus='';securityFilterCity='';securityFilterDate='';securityFilterUserSearch='';renderAdminMain();">Clear filters</button>
         <button class="btn amber small" onclick="exportSecurityLogsExcel()">Export Excel</button>
       </div>
       ${filteredLogs.length===0?`<div class="empty-state">No login activity matches this filter.</div>`:`
       <table class="data-table">
-        <tr><th>Date &amp; time</th><th>Name</th><th>Role</th><th>Status</th><th>Device</th><th>Browser</th></tr>
+        <tr><th>Date &amp; time</th><th>Name</th><th>ID/Entered</th><th>Role</th><th>City</th><th>Status</th><th>Failure reason</th><th>Device</th><th>OS</th><th>Browser</th></tr>
         ${filteredLogs.slice(0,200).map(l=>`<tr>
           <td class="mono">${fmtDateTime(l.at)}</td>
-          <td>${esc(l.accountName||'')}</td>
+          <td>${esc(l.accountName||'—')}</td>
+          <td class="mono">${esc(l.enteredIdentifier||l.accountId||'—')}</td>
           <td>${esc(securityRoleLabel(l.accountType))}</td>
+          <td>${esc(loginLogCity(l)||'—')}</td>
           <td><span class="pill ${l.event==='success'?'open':'closed'}">${l.event==='success'?'Success':'Failed'}</span></td>
+          <td>${esc(l.failureReason||(l.event==='success'?'—':'—'))}</td>
           <td>${esc(l.device||'—')}</td>
+          <td>${esc(l.os||'—')}</td>
           <td>${esc(l.browser||'—')}</td>
         </tr>`).join('')}
       </table>
@@ -4589,8 +4709,8 @@ async function unlockAccount(type, id){
 }
 async function exportSecurityLogsExcel(){
   if(typeof XLSX==='undefined'){ showToast('Excel library did not load (no internet access?). Please try again when online.', 'error'); return; }
-  const rows = [['Date/Time','Name','Role','Status','Device','Browser']];
-  adminLoginLogs.forEach(l=>{ rows.push([fmtDateTime(l.at), l.accountName||'', securityRoleLabel(l.accountType), l.event, l.device||'', l.browser||'']); });
+  const rows = [['Date/Time','Name','ID/Entered','Role','City','Status','Failure Reason','Device','OS','Browser']];
+  adminLoginLogs.forEach(l=>{ rows.push([fmtDateTime(l.at), l.accountName||'', l.enteredIdentifier||l.accountId||'', securityRoleLabel(l.accountType), loginLogCity(l)||'', l.event, l.failureReason||'', l.device||'', l.os||'', l.browser||'']); });
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.aoa_to_sheet(rows);
   XLSX.utils.book_append_sheet(wb, ws, 'Login Activity');
@@ -4951,21 +5071,16 @@ async function renderBatchDetailAsync(){
     <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'} &middot; Batches</div>
     <div class="back-link" onclick="closeBatchDetail()">&larr; Back to Batches</div>
     <h1 class="page-title">Batch ${batch.batchNumber} &middot; ${esc(batch.trainerName)} &middot; ${esc(batch.city)}</h1>
-    <p class="page-sub">${fmtDate(batch.startDate)} ${batch.endDate?'&ndash; '+fmtDate(batch.endDate):'&ndash; ongoing'} &middot; <span class="pill ${batch.status==='Active'?'open':'scheduled'}">${batch.status}</span></p>
+    <p class="page-sub">${fmtDate(batch.startDate)} ${batch.endDate?'&ndash; '+fmtDate(batch.endDate):'&ndash; ongoing'} &middot; <span class="pill ${batch.status==='Active'?'open':'scheduled'}">${batch.status}</span>${batch.courseId && adminCourses[batch.courseId] ? ` &middot; ${esc(adminCourses[batch.courseId].name)}` : ''}</p>
     <div class="stat-mini-grid">
       <div class="stat-card"><div class="n">${rows.length}</div><div class="l">Partners</div></div>
       <div class="stat-card"><div class="n">${rows.filter(r=>r.isPass===true).length}</div><div class="l">Passed</div></div>
       <div class="stat-card"><div class="n">${rows.filter(r=>r.isPass===false).length}</div><div class="l">Failed</div></div>
       <div class="stat-card"><div class="n">${rows.reduce((s,r)=>s+r.liveAuditCount,0)}</div><div class="l">Total Live Audit Count</div></div>
     </div>
-    ${rows.length===0?`<div class="card"><div class="empty-state">No partners in this batch yet.</div></div>`:`
-    <div class="card" style="overflow-x:auto;">
-      <table class="data-table">
-        <tr><th>Name</th><th>Office ID</th><th>Attendance</th><th>Days Done</th><th>Overall</th><th>Active Failed Media</th><th>Live Audit Count</th></tr>
-        ${rows.map(r=>`<tr><td>${esc(r.name)}</td><td>${esc(r.officeId)}</td><td class="mono">${r.attendance}</td><td class="mono">${r.daysDone}/${DAYS.length}</td><td>${r.overallText}</td><td class="mono">${r.activeFailedMedia}</td><td class="mono">${r.liveAuditCount}</td></tr>`).join('')}
-      </table>
-    </div>`}
-    <button class="btn amber" onclick="exportBatchExcel('${selectedBatchId}')">Export batch to Excel</button>
+    <p style="font-size:12.5px;color:var(--ink-soft);margin:-6px 0 12px;">Full day-by-day attendance, scores, ratings, and pass/fail — the same detail as the main Tracking page, scoped to this batch.</p>
+    <div id="batch-detail-tracking-wrap">${renderTrackingTableInner('','','','','','',selectedBatchId)}</div>
+    <button class="btn amber" onclick="exportBatchExcel('${selectedBatchId}')" style="margin-top:14px;">Export batch to Excel</button>
   `;
 }
 async function exportBatchExcel(batchId){
@@ -5232,10 +5347,33 @@ function renderAccessTab(){
   Object.values(adminRoster).forEach(r=>{ const k = r.city+'__'+r.trainer; groups[k] = {city:r.city, trainer:r.trainer}; });
   if(!isAdminRole()){ groups[trainerIdentity.city+'__'+trainerIdentity.name] = {city:trainerIdentity.city, trainer:trainerIdentity.name}; }
   const groupList = Object.values(groups);
+  const awaitingConfirmation = [];
+  Object.entries(adminRoster).forEach(([pid,r])=>{
+    const prog = adminProgressCache[pid] || {};
+    DAYS.forEach(d=>{
+      const dp = prog[d.id];
+      if(!dp || !dp.videoItemProgress) return;
+      const ov = contentOverrides[d.id];
+      Object.entries(dp.videoItemProgress).forEach(([idx,vp])=>{
+        if(vp.readyForUnlock && !vp.done){
+          const item = ov && ov.content ? ov.content[idx] : null;
+          awaitingConfirmation.push({ pid, partnerName:r.name, dayId:d.id, idx, videoTitle: item?item.title:'Video' });
+        }
+      });
+    });
+  });
   return `
     <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'}</div>
     <h1 class="page-title">Day access</h1>
     <p class="page-sub">Control which days are visible to your partners — like a certificate lock. Nothing is visible until you unlock it here. Assessments have their own separate unlock below — partners can't attempt one until you unlock it, even after finishing the day's video and assignment.</p>
+    ${awaitingConfirmation.length>0 ? `<div class="card">
+      <h3>Videos awaiting your confirmation</h3>
+      <p style="margin-bottom:10px;">These videos are set to require manual unlock instead of unlocking automatically at the required percentage.</p>
+      <table class="data-table">
+        <tr><th>Partner</th><th>Day</th><th>Video</th><th></th></tr>
+        ${awaitingConfirmation.map(a=>`<tr><td>${esc(a.partnerName)}</td><td>Day ${a.dayId}</td><td>${esc(a.videoTitle)}</td><td><button class="btn small amber" onclick="confirmVideoUnlock('${a.pid}',${a.dayId},${a.idx})">Confirm &amp; Unlock</button></td></tr>`).join('')}
+      </table>
+    </div>` : ''}
     ${groupList.length===0?`<div class="card"><div class="empty-state">Add partners first — batches are grouped by city and trainer.</div></div>`:
     groupList.map(g=>{
       const key = slug(g.city)+'__'+slug(g.trainer);
@@ -5254,6 +5392,16 @@ function renderAccessTab(){
       </div>`;
     }).join('')}
   `;
+}
+async function confirmVideoUnlock(partnerId, dayId, idx){
+  const prog = await getProgress(partnerId);
+  if(!prog[dayId] || !prog[dayId].videoItemProgress || !prog[dayId].videoItemProgress[idx]){ showToast("Couldn't find that video's progress record.", 'error'); return; }
+  prog[dayId].videoItemProgress[idx] = { ...prog[dayId].videoItemProgress[idx], done:true, readyForUnlock:false };
+  await setProgress(partnerId, prog);
+  const name = adminRoster[partnerId]?.name || partnerId;
+  await logHistory('video_unlock_confirmed', `Video on Day ${dayId} manually confirmed and unlocked for ${name} by ${trainerIdentity.name}`, {partnerId, dayId, idx});
+  showToast('Confirmed — the partner can continue.', 'success');
+  renderAdminMain();
 }
 async function toggleDayUnlock(city, trainer, day){
   const key = slug(city)+'__'+slug(trainer);
@@ -5302,7 +5450,7 @@ function renderPartnersTab(){
       ${entries.length===0?`<div class="empty-state">No partners added yet. Add your first partner above.</div>`:`
       <table class="data-table">
         <tr><th>Name</th><th>Office ID</th><th>Partner password (ID)</th><th>City</th><th>Trainer</th><th>Course</th><th>Created</th><th></th></tr>
-        ${entries.map(([id,r])=>`<tr><td>${esc(r.name)}</td><td>${esc(r.officeId||'—')}</td><td class="mono">${esc(id)}</td><td>${esc(r.city)}</td><td>${esc(r.trainer)}</td><td>${esc(adminCourses[r.courseId]?.name||'—')}</td><td>${fmtDateTime(r.createdAt)}</td><td><button class="btn small danger" onclick="deletePartnerRow('${id}')">Remove</button></td></tr>`).join('')}
+        ${entries.map(([id,r])=>`<tr><td>${esc(r.name)}</td><td>${esc(r.officeId||'—')}</td><td class="mono">${esc(id)}</td><td>${esc(r.city)}</td><td>${esc(r.trainer)}</td><td>${esc(adminCourses[r.courseId]?.name||'—')}</td><td>${fmtDateTime(r.createdAt)}</td><td><button class="btn small secondary" onclick="resetPartnerProgress('${id}')">Reset Progress</button> <button class="btn small danger" onclick="deletePartnerRow('${id}')">Remove</button></td></tr>`).join('')}
       </table>`}
     </div>
   `;
@@ -5339,6 +5487,15 @@ async function deletePartnerRow(id){
   showConfirmModal(`Remove ${name} from the roster? Their progress data is kept in storage.`, async ()=>{
     await kvDelete('roster:'+id);
     await logHistory('partner_removed', `Partner ${name} removed`, {partnerId:id});
+    renderAdminMain();
+  });
+}
+async function resetPartnerProgress(id){
+  const name = adminRoster[id]?.name||id;
+  showConfirmModal(`Reset ALL course progress for ${name}? This clears their theory/video completion, assignment checkmarks, and assessment scores for every day — they'll start the course again from Day 1. Their trainer, batch, and city stay the same. This cannot be undone.`, async ()=>{
+    await setProgress(id, {});
+    await logHistory('partner_progress_reset', `Course progress reset for ${name} by ${trainerIdentity.name}`, {partnerId:id});
+    showToast(`${name}'s progress has been reset.`, 'success');
     renderAdminMain();
   });
 }
@@ -5458,14 +5615,15 @@ function applyTrackingFilter(){
   const batch = document.getElementById('f-batch')?.value || '';
   document.getElementById('tracking-table-wrap').innerHTML = renderTrackingTableInner(c,t,z,cat,course,batch);
 }
-function renderTrackingTableInner(cityFilter, trainerFilter, zoneFilter, categoryFilter, courseFilter, batchFilter){
+function renderTrackingTableInner(cityFilter, trainerFilter, zoneFilter, categoryFilter, courseFilter, batchFilter, batchIdFilter){
   let entries = Object.entries(adminRoster);
   if(zoneFilter) entries = entries.filter(([,r])=>CITY_ZONE[r.city]===zoneFilter);
   if(cityFilter) entries = entries.filter(([,r])=>r.city===cityFilter);
   if(trainerFilter) entries = entries.filter(([,r])=>r.trainer===trainerFilter);
   if(categoryFilter) entries = entries.filter(([,r])=>r.courseId && adminCourses[r.courseId] && adminCourses[r.courseId].categoryId===categoryFilter);
   if(courseFilter) entries = entries.filter(([,r])=>r.courseId===courseFilter);
-  if(batchFilter) entries = entries.filter(([,r])=>String(r.batchNumber)===String(batchFilter));
+  if(batchIdFilter) entries = entries.filter(([,r])=>r.batchId===batchIdFilter);
+  else if(batchFilter) entries = entries.filter(([,r])=>String(r.batchNumber)===String(batchFilter));
   if(entries.length===0) return `<div class="card"><div class="empty-state">No partners match this filter yet.</div></div>`;
   const rows = entries.map(([id,r])=>{
     const prog = adminProgressCache[id] || {};
@@ -5963,6 +6121,12 @@ function syncModuleDraftFromDOM(){
     } else if(item.type==='video'){
       if(g('c-title-'+i)) item.title = g('c-title-'+i).value;
       if(g('c-url-'+i)) item.url = g('c-url-'+i).value;
+      if(!item.watchSettings) item.watchSettings = {};
+      if(g(`c-ws-mandatory-${i}`)) item.watchSettings.mandatory = g(`c-ws-mandatory-${i}`).value==='yes';
+      if(g(`c-ws-minpercent-${i}`)) item.watchSettings.minPercent = parseInt(g(`c-ws-minpercent-${i}`).value)||90;
+      if(g(`c-ws-unlocknext-${i}`)) item.watchSettings.unlockNext = g(`c-ws-unlocknext-${i}`).value==='yes';
+      if(g(`c-ws-allowskip-${i}`)) item.watchSettings.allowSkip = g(`c-ws-allowskip-${i}`).value==='yes';
+      if(g(`c-ws-allowrewatch-${i}`)) item.watchSettings.allowRewatch = g(`c-ws-allowrewatch-${i}`).value==='yes';
       if(item.inVideoQuizzes){
         item.inVideoQuizzes.forEach((q,qi)=>{
           if(g(`ivq-time-${i}-${qi}`)) q.timestamp = parseMinSec(g(`ivq-time-${i}-${qi}`).value);
@@ -6220,10 +6384,56 @@ function renderContentItemCard(item, i, total){
       <textarea class="field-input reflect" id="c-body-${i}" style="min-height:100px;" placeholder="Edit every single word here">${esc(item.body)}</textarea>
     `;
   } else if(item.type==='video'){
+    const ws = item.watchSettings || {};
+    const mandatory = ws.mandatory!==false;
+    const minPercent = ws.minPercent || 90;
+    const unlockNext = ws.unlockNext!==false;
+    const allowSkip = ws.allowSkip!==false;
+    const allowRewatch = ws.allowRewatch!==false;
     fields = `
       <input class="field-input" id="c-title-${i}" value="${esc(item.title)}" placeholder="Video title">
       <input class="field-input" id="c-url-${i}" value="${esc(item.url)}" placeholder="YouTube, Vimeo, or Google Drive share link">
       ${!item.url ? `<div class="save-note" style="color:var(--danger);">No link set yet — partners won't see this video at all until you add one, or delete this block.</div>` : ''}
+      <div style="border-top:1px solid var(--line);margin-top:14px;padding-top:12px;">
+        <span class="field-label">Video watch settings</span>
+        <div class="form-grid">
+          <div>
+            <span class="field-label">Mandatory watch</span>
+            <select class="field-input" id="c-ws-mandatory-${i}">
+              <option value="yes" ${mandatory?'selected':''}>Yes — partner must watch it to continue</option>
+              <option value="no" ${!mandatory?'selected':''}>No — partner can skip ahead without watching</option>
+            </select>
+          </div>
+          <div>
+            <span class="field-label">Minimum watch required</span>
+            <select class="field-input" id="c-ws-minpercent-${i}">
+              ${[50,70,80,90,100].map(p=>`<option value="${p}" ${minPercent===p?'selected':''}>${p}%</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <span class="field-label">Unlock next content after required watch</span>
+            <select class="field-input" id="c-ws-unlocknext-${i}">
+              <option value="yes" ${unlockNext?'selected':''}>Yes</option>
+              <option value="no" ${!unlockNext?'selected':''}>No</option>
+            </select>
+          </div>
+          <div>
+            <span class="field-label">Allow skip (fast-forward past unwatched parts)</span>
+            <select class="field-input" id="c-ws-allowskip-${i}">
+              <option value="yes" ${allowSkip?'selected':''}>Yes</option>
+              <option value="no" ${!allowSkip?'selected':''}>No — skipping ahead snaps back</option>
+            </select>
+          </div>
+          <div>
+            <span class="field-label">Allow rewatch after completion</span>
+            <select class="field-input" id="c-ws-allowrewatch-${i}">
+              <option value="yes" ${allowRewatch?'selected':''}>Yes</option>
+              <option value="no" ${!allowRewatch?'selected':''}>No — locked once complete</option>
+            </select>
+          </div>
+        </div>
+        <p style="font-size:12px;color:var(--ink-soft);margin-top:4px;">${mandatory ? `Partner must reach ${minPercent}% to ${unlockNext?'unlock the next content':"be marked done, though it won't gate anything"}.` : `Watching this video is optional — the partner can move on regardless of watch %.`}</p>
+      </div>
       ${renderInVideoQuizEditor(i, item)}
     `;
   } else if(item.type==='audio'){
