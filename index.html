@@ -4899,18 +4899,30 @@ function renderAdminPreviewMode(){
   }catch(e){
     bodyHtml = `<div class="empty-state">Could not render this partner's current screen (${esc(e.message)}).</div>`;
   }
+  // Tab-bar buttons stay clickable (routed to a safe admin navigator that bypasses lock gating and
+  // side effects) so Admin can review every section; everything else in the body stays inert so
+  // no partner-facing action (checking a task, picking a quiz answer, playing a video) can fire by accident.
+  bodyHtml = bodyHtml.replace(/onclick="setTab\('(theory|video|assignment|quiz)'\)"/g, (m, tab)=>`onclick="previewSetTab('${tab}')"`);
   return `
     <div style="position:sticky;top:0;z-index:50;background:var(--danger);color:#fff;padding:12px 20px;border-radius:10px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;">
-      <div><strong>Admin Preview — read only</strong> — Viewing exactly what ${esc(r?r.name:previewPartnerId)} sees right now. Nothing you click here affects their account.</div>
+      <div><strong>Admin Preview — read only</strong> — Viewing exactly what ${esc(r?r.name:previewPartnerId)} sees right now. Nothing you click here changes their account except the section tabs, which are safe to browse.</div>
       <div style="display:flex;gap:8px;">
         <button class="btn small amber" onclick="closePartnerPreview(); openOverridePanel('${previewPartnerId}');">Manual Override</button>
         <button class="btn small secondary" onclick="closePartnerPreview()">Exit Preview</button>
       </div>
     </div>
-    <div style="pointer-events:none;user-select:none;">
+    <div class="admin-preview-body">
       ${bodyHtml}
     </div>
+    <style>
+      .admin-preview-body{ pointer-events:none; user-select:none; }
+      .admin-preview-body .tab-btn{ pointer-events:auto; cursor:pointer; }
+    </style>
   `;
+}
+function previewSetTab(tab){
+  currentTab = tab;
+  renderAdminMain();
 }
 function openOverridePanel(partnerId){
   const r = adminRoster[partnerId];
