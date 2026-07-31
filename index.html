@@ -773,9 +773,9 @@ async function logSosSearch(query, categoryId, resultCount){
   const id = String(Date.now()).padStart(14,'0')+'_'+uid();
   await kvSet('sosSearchLog:'+id, { query, categoryId: categoryId||null, resultCount, at: new Date().toISOString() });
 }
-async function logSosView(problemId, categoryId, language){
+async function logSosView(data){
   const id = String(Date.now()).padStart(14,'0')+'_'+uid();
-  await kvSet('sosViewLog:'+id, { problemId, categoryId, language, resolved:null, at: new Date().toISOString() });
+  await kvSet('sosViewLog:'+id, { ...data, resolved:null, escalated:false, theoryOpened:true, watchDurationSec:0, watchPct:0, replayCount:0, at: new Date().toISOString() });
   return id;
 }
 async function markSosViewResolved(viewLogId, resolved){
@@ -1396,6 +1396,14 @@ let sosSelectedLanguage = DEFAULT_LANGUAGE;
 let sosSelectedProblem = null;
 let sosSearchQuery = '';
 let sosCurrentViewLogId = null;
+let sosPartnerId = '';
+let sosPartnerRecord = null;
+let sosYtPlayer = null;
+let sosYtPollTimer = null;
+let sosWatchRanges = [];
+let sosReplayCount = 0;
+let sosLastPeakPct = 0;
+let sosVideoDuration = 0;
 let gateError = '';
 let gateBusy = false;
 let currentSessionToken = null;
@@ -1547,7 +1555,7 @@ function renderGate(){
 /* ---- SOS / SELF-HELP FLOW (accessible pre-login) ---- */
 async function openSosHelp(){
   sosScreen = 'category';
-  sosSelectedCategory = null; sosSelectedProblem = null; sosSearchQuery = '';
+  sosSelectedCategory = null; sosSelectedProblem = null; sosSearchQuery = ''; sosPartnerId = ''; sosPartnerRecord = null;
   const root = document.getElementById('root');
   root.innerHTML = `<div class="gate-wrap"><div class="gate-card" style="max-width:520px;"><div class="empty-state">Loading help topics...</div></div></div>`;
   sosCategories = await listSosCategories();
@@ -1559,6 +1567,7 @@ async function openSosHelp(){
   renderSosScreen();
 }
 function closeSosHelp(){
+  cleanupSosVideoTracking();
   sosScreen = null;
   renderGate();
 }
@@ -1573,8 +1582,9 @@ function renderSosScreen(){
   document.getElementById('hamburger').style.display='none';
   if(sosScreen==='category') root.innerHTML = sosWrap(renderSosCategoryScreen());
   else if(sosScreen==='language') root.innerHTML = sosWrap(renderSosLanguageScreen());
+  else if(sosScreen==='partnerid') root.innerHTML = sosWrap(renderSosPartnerIdScreen());
   else if(sosScreen==='problems') root.innerHTML = sosWrap(renderSosProblemsScreen());
-  else if(sosScreen==='solution') root.innerHTML = sosWrap(renderSosSolutionScreen());
+  else if(sosScreen==='solution'){ root.innerHTML = sosWrap(renderSosSolutionScreen()); initSosVideoTracking(); }
   else if(sosScreen==='escalate') root.innerHTML = sosWrap(renderSosEscalateScreen());
   else renderGate();
 }
@@ -1593,10 +1603,35 @@ function renderSosLanguageScreen(){
   return `
     <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">Which language would you like the theory and video explained in?</p>
     <div style="display:flex;flex-direction:column;gap:8px;">
-      ${sosLanguages.map(l=>`<button class="btn secondary" style="text-align:left;justify-content:flex-start;" onclick="sosSelectedLanguage='${esc(l)}'; sosScreen='problems'; renderSosScreen();">${esc(l)}</button>`).join('')}
+      ${sosLanguages.map(l=>`<button class="btn secondary" style="text-align:left;justify-content:flex-start;" onclick="sosSelectedLanguage='${esc(l)}'; sosScreen='partnerid'; renderSosScreen();">${esc(l)}</button>`).join('')}
     </div>
     <div class="sos-help-link" onclick="sosScreen='category'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back</div>
   `;
+}
+function renderSosPartnerIdScreen(){
+  return `
+    <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">If you enter your Partner ID, we can connect this to your Trainer if you need to escalate later — completely optional.</p>
+    <span class="field-label">Partner ID (optional)</span>
+    <input class="field-input" id="sos-partnerid-input" value="${esc(sosPartnerId)}" placeholder="e.g. SY8213">
+    <div style="display:flex;gap:8px;margin-top:10px;">
+      <button class="btn secondary" style="flex:1;" onclick="skipSosPartnerId()">Skip</button>
+      <button class="btn amber" style="flex:1;" onclick="confirmSosPartnerId()">Continue</button>
+    </div>
+    <div class="sos-help-link" onclick="sosScreen='language'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back</div>
+  `;
+}
+async function confirmSosPartnerId(){
+  const id = document.getElementById('sos-partnerid-input').value.trim().toUpperCase();
+  sosPartnerId = id;
+  sosPartnerRecord = id ? await getRosterEntry(id) : null;
+  sosScreen = 'problems';
+  renderSosScreen();
+}
+function skipSosPartnerId(){
+  sosPartnerId = '';
+  sosPartnerRecord = null;
+  sosScreen = 'problems';
+  renderSosScreen();
 }
 function renderCCGateFields(){
   return `
@@ -1633,10 +1668,29 @@ function renderSosProblemsScreen(){
   `;
 }
 async function openSosProblem(id){
+  cleanupSosVideoTracking();
   sosSelectedProblem = id;
   sosScreen = 'solution';
   await logSosSearch(sosSearchQuery, sosSelectedCategory, 1);
-  sosCurrentViewLogId = await logSosView(id, sosSelectedCategory, sosSelectedLanguage);
+  const p = sosProblems[id];
+  const tr = sosProblemTranslated(p, sosSelectedLanguage);
+  const r = sosPartnerRecord;
+  sosCurrentViewLogId = await logSosView({
+    problemId: id,
+    problemTitle: tr.title,
+    videoTitle: tr.title,
+    categoryId: sosSelectedCategory,
+    categoryName: sosCategories[sosSelectedCategory] ? sosCategories[sosSelectedCategory].name : null,
+    language: sosSelectedLanguage,
+    partnerId: sosPartnerId || null,
+    partnerName: r ? r.name : null,
+    city: r ? r.city : null,
+    cluster: r ? (CITY_ZONE[r.city]||null) : null,
+    trainerName: r ? r.trainer : null,
+    trainerId: r ? r.trainerId||null : null,
+    batchNumber: r ? r.batchNumber||null : null,
+    courseId: r ? r.courseId||null : null,
+  });
   renderSosScreen();
 }
 function renderSosSolutionScreen(){
@@ -1645,26 +1699,99 @@ function renderSosSolutionScreen(){
   const tr = sosProblemTranslated(p, sosSelectedLanguage);
   const related = (p.relatedProblemIds||[]).map(rid=>sosProblems[rid]).filter(Boolean);
   const videoInfo = tr.videoUrl ? normalizeUrl(tr.videoUrl) : null;
+  const isYouTube = videoInfo && videoInfo.kind==='youtube';
   const embedUrl = videoInfo && videoInfo.embedUrl ? videoInfo.embedUrl : null;
   return `
     <h2 style="margin:0 0 10px;font-size:19px;">${esc(tr.title)}</h2>
-    ${embedUrl?`<div style="position:relative;padding-bottom:56.25%;height:0;border-radius:10px;overflow:hidden;margin-bottom:14px;"><iframe src="${esc(embedUrl)}" style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;" allowfullscreen></iframe></div>`:''}
+    ${embedUrl?`<div style="position:relative;padding-bottom:56.25%;height:0;border-radius:10px;overflow:hidden;margin-bottom:14px;">${isYouTube?`<div id="sos-yt-player" style="position:absolute;top:0;left:0;width:100%;height:100%;"></div>`:`<iframe src="${esc(embedUrl)}" style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;" allowfullscreen></iframe>`}</div>`:''}
     <div style="white-space:pre-wrap;font-size:14px;line-height:1.6;margin-bottom:14px;">${esc(tr.theory||'')}</div>
     ${(p.images||[]).length?`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">${p.images.map(src=>`<img src="${esc(src)}" style="max-width:140px;border-radius:8px;">`).join('')}</div>`:''}
     ${tr.nextAction?`<div class="save-note" style="margin-bottom:14px;"><strong>Recommended next step:</strong> ${esc(tr.nextAction)}</div>`:''}
     ${related.length?`<div style="margin-bottom:14px;"><span class="field-label">Related topics</span><div style="display:flex;flex-direction:column;gap:6px;">${related.map(r=>{ const rid = Object.keys(sosProblems).find(k=>sosProblems[k]===r); return `<button class="btn secondary small" style="text-align:left;" onclick="openSosProblem('${rid}')">${esc(sosProblemTranslated(r, sosSelectedLanguage).title)}</button>`; }).join('')}</div></div>`:''}
     <div style="display:flex;gap:8px;margin-top:16px;">
       <button class="btn secondary" style="flex:1;" onclick="markSosResolved(true)">✓ This solved it</button>
-      <button class="btn amber" style="flex:1;" onclick="sosScreen='escalate'; renderSosScreen();">Still Need Help</button>
+      <button class="btn amber" style="flex:1;" onclick="cleanupSosVideoTracking(); sosScreen='escalate'; renderSosScreen();">Still Need Help</button>
     </div>
-    <div class="sos-help-link" onclick="sosScreen='problems'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back to topics</div>
+    <div class="sos-help-link" onclick="cleanupSosVideoTracking(); sosScreen='problems'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back to topics</div>
   `;
 }
 async function markSosResolved(resolved){
   if(sosCurrentViewLogId) await markSosViewResolved(sosCurrentViewLogId, resolved);
   showToast('Glad that helped!', 'success');
+  cleanupSosVideoTracking();
   sosScreen = 'problems';
   renderSosScreen();
+}
+function cleanupSosVideoTracking(){
+  if(sosYtPollTimer){ clearInterval(sosYtPollTimer); sosYtPollTimer = null; }
+  if(sosYtPlayer && sosYtPlayer.destroy){ try{ sosYtPlayer.destroy(); }catch(e){} }
+  sosYtPlayer = null;
+  sosWatchRanges = []; sosReplayCount = 0; sosLastPeakPct = 0; sosVideoDuration = 0;
+}
+function initSosVideoTracking(){
+  cleanupSosVideoTracking();
+  const p = sosProblems[sosSelectedProblem];
+  if(!p) return;
+  const tr = sosProblemTranslated(p, sosSelectedLanguage);
+  if(!tr.videoUrl) return;
+  const info = normalizeUrl(tr.videoUrl);
+  if(info.kind!=='youtube') return;
+  const m = tr.videoUrl.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([\w-]+)/);
+  if(!m) return;
+  const videoId = m[1];
+  let attempts = 0;
+  const tryInit = ()=>{
+    attempts++;
+    if(!document.getElementById('sos-yt-player')) return;
+    if(ytApiReady || (window.YT && window.YT.Player)){
+      sosYtPlayer = new YT.Player('sos-yt-player', {
+        videoId,
+        events:{
+          onStateChange:(e)=>{
+            if(e.data===YT.PlayerState.PLAYING){
+              if(sosYtPollTimer) clearInterval(sosYtPollTimer);
+              sosYtPollTimer = setInterval(pollSosVideo, 2000);
+            } else if(sosYtPollTimer){
+              clearInterval(sosYtPollTimer); sosYtPollTimer = null;
+              persistSosWatchData();
+            }
+          }
+        }
+      });
+    } else if(attempts<10){
+      setTimeout(tryInit, 300);
+    }
+  };
+  tryInit();
+}
+function pollSosVideo(){
+  if(!sosYtPlayer || typeof sosYtPlayer.getCurrentTime!=='function') return;
+  const dur = sosYtPlayer.getDuration();
+  const cur = sosYtPlayer.getCurrentTime();
+  if(!dur) return;
+  sosVideoDuration = dur;
+  const pct = Math.round((cur/dur)*100);
+  // Replay detection: dropped back near the start after having watched a meaningful portion
+  if(sosLastPeakPct >= 60 && cur < 5 && sosWatchRanges.length>0){
+    sosReplayCount++;
+    sosLastPeakPct = 0;
+  }
+  sosLastPeakPct = Math.max(sosLastPeakPct, pct);
+  const last = sosWatchRanges[sosWatchRanges.length-1];
+  if(last && cur - last[1] < 4 && cur >= last[0]){
+    last[1] = cur;
+  } else {
+    sosWatchRanges.push([Math.max(0, cur-2), cur]);
+  }
+  sosWatchRanges = mergeWatchRanges(sosWatchRanges);
+  persistSosWatchData();
+}
+async function persistSosWatchData(){
+  if(!sosCurrentViewLogId) return;
+  const watchedSec = totalWatchedSeconds(sosWatchRanges);
+  const pct = sosVideoDuration ? Math.min(100, Math.round((watchedSec/sosVideoDuration)*100)) : 0;
+  const v = await kvGet('sosViewLog:'+sosCurrentViewLogId);
+  if(v) await kvSet('sosViewLog:'+sosCurrentViewLogId, { ...v, watchDurationSec: Math.round(watchedSec), watchPct: pct, replayCount: sosReplayCount });
 }
 function renderSosEscalateScreen(){
   const p = sosProblems[sosSelectedProblem];
@@ -1710,7 +1837,12 @@ async function submitSosEscalation(){
     trainerId: r ? r.trainerId||null : null,
     trainerName: r ? r.trainer : null,
   });
+  if(sosCurrentViewLogId){
+    const v = await kvGet('sosViewLog:'+sosCurrentViewLogId);
+    if(v) await kvSet('sosViewLog:'+sosCurrentViewLogId, { ...v, escalated:true });
+  }
   showToast('Sent — your Trainer will follow up with you.', 'success');
+  cleanupSosVideoTracking();
   closeSosHelp();
 }
 function renderZTGateFields(){
@@ -3597,6 +3729,10 @@ let adminSecurityAccounts = [];
 let adminPwResetLogs = [];
 let adminEscalations = [];
 let adminOverrideLogs = [];
+let adminSosViewLogs = [];
+let adminSosSearchLogs = [];
+let sosAnalyticsFilters = { dateFrom:'', dateTo:'', category:'', course:'', city:'', cluster:'', trainer:'', batch:'', language:'', problem:'', resolved:'', escalated:'' };
+let sosAnalyticsOpenBucket = null;
 let progressControlSearch = '';
 let progressControlFilterTrainer = '';
 let progressControlFilterCategory = '';
@@ -3659,6 +3795,7 @@ const ADMIN_TAB_KEYS_DEFAULT = [
   ['categories','Category Management','Categories & courses'],
   ['security','Security & Alerts','Sessions, lockouts & login activity'],
   ['progresscontrol','Partner Progress Control','View, diagnose & unblock partners'],
+  ['sosanalytics','SOS Help Analytics','Search, video & escalation insights'],
   ['languages','Languages','Regional language content'],
   ['support','Support','Requests & issues'],
   ['history','History','Audit log'],
@@ -3840,6 +3977,18 @@ async function renderAdminMain(){
     adminEscalations = await listEscalations();
     adminOverrideLogs = await listProgressOverrideLogs(300);
     el.innerHTML = renderProgressControlTab();
+  }
+  else if(adminTab==='sosanalytics'){
+    sosCategories = await listSosCategories();
+    sosProblems = await listSosProblems();
+    adminSosViewLogs = await listSosViewLogs(2000);
+    adminSosSearchLogs = await listSosSearchLogs(2000);
+    adminEscalations = await listEscalations();
+    adminTrainers = await listTrainers();
+    await seedDefaultCategoriesIfEmpty();
+    adminCategories = await listCategories();
+    adminCourses = await listCourses();
+    el.innerHTML = renderSosAnalyticsTab();
   }
   else if(adminTab==='languages'){ await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderLanguagesTab(); }
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
@@ -5281,6 +5430,255 @@ async function resolveEscalationRow(id){
   await resolveEscalation(id);
   showToast('Escalation marked resolved.', 'success');
   renderAdminMain();
+}
+/* ---- SOS HELP ANALYTICS (admin only) ---- */
+function sosFilteredLogs(){
+  const f = sosAnalyticsFilters;
+  return adminSosViewLogs.filter(l=>{
+    if(f.dateFrom && new Date(l.at) < new Date(f.dateFrom)) return false;
+    if(f.dateTo && new Date(l.at) > new Date(f.dateTo+'T23:59:59')) return false;
+    if(f.category && l.categoryId!==f.category) return false;
+    if(f.course && l.courseId!==f.course) return false;
+    if(f.city && l.city!==f.city) return false;
+    if(f.cluster && l.cluster!==f.cluster) return false;
+    if(f.trainer && l.trainerName!==f.trainer) return false;
+    if(f.batch && String(l.batchNumber)!==String(f.batch)) return false;
+    if(f.language && l.language!==f.language) return false;
+    if(f.problem && l.problemId!==f.problem) return false;
+    if(f.resolved==='resolved' && l.resolved!==true) return false;
+    if(f.resolved==='unresolved' && l.resolved!==false) return false;
+    if(f.escalated==='escalated' && !l.escalated) return false;
+    if(f.escalated==='not' && l.escalated) return false;
+    return true;
+  });
+}
+function sosCount(arr, keyFn){
+  const map = {};
+  arr.forEach(item=>{
+    const k = keyFn(item);
+    if(k===null||k===undefined||k==='') return;
+    map[k] = (map[k]||0) + 1;
+  });
+  return Object.entries(map).sort((a,b)=>b[1]-a[1]);
+}
+function computeSosBuckets(logs, searchLogs){
+  const buckets = {};
+  buckets.mostSearched = sosCount(searchLogs, s=>s.query).slice(0,20);
+  buckets.mostWatched = sosCount(logs, l=>l.problemTitle).slice(0,20);
+  const replaySums = {};
+  logs.forEach(l=>{ if(l.replayCount>0) replaySums[l.problemTitle] = (replaySums[l.problemTitle]||0) + l.replayCount; });
+  buckets.mostReplayed = Object.entries(replaySums).sort((a,b)=>b[1]-a[1]).slice(0,20);
+  buckets.highestEscalation = sosCount(logs.filter(l=>l.escalated), l=>l.problemTitle).slice(0,20);
+  buckets.stillNeedHelp = sosCount(logs.filter(l=>l.resolved===false), l=>l.problemTitle).slice(0,20);
+  buckets.categoryWise = sosCount(logs, l=>l.categoryName).slice(0,20);
+  buckets.cityWise = sosCount(logs, l=>l.city).slice(0,20);
+  buckets.clusterWise = sosCount(logs, l=>l.cluster).slice(0,20);
+  buckets.trainerWise = sosCount(logs, l=>l.trainerName).slice(0,20);
+  buckets.languageWise = sosCount(logs, l=>l.language).slice(0,20);
+  buckets.missingContent = sosCount(searchLogs.filter(s=>s.resultCount===0), s=>s.query).slice(0,20);
+  buckets.resolvedNoEscalation = sosCount(logs.filter(l=>l.resolved===true && !l.escalated), l=>l.problemTitle).slice(0,20);
+  buckets.unresolvedAfterVideo = sosCount(logs.filter(l=>l.resolved===false && l.theoryOpened && l.watchPct>=50), l=>l.problemTitle).slice(0,20);
+  return buckets;
+}
+function sosBucketLogsFor(bucketKey, label, logs, searchLogs){
+  if(bucketKey==='mostSearched' || bucketKey==='missingContent'){
+    const src = bucketKey==='missingContent' ? searchLogs.filter(s=>s.resultCount===0) : searchLogs;
+    return src.filter(s=>s.query===label);
+  }
+  if(bucketKey==='highestEscalation') return logs.filter(l=>l.problemTitle===label && l.escalated);
+  if(bucketKey==='stillNeedHelp') return logs.filter(l=>l.problemTitle===label && l.resolved===false);
+  if(bucketKey==='resolvedNoEscalation') return logs.filter(l=>l.problemTitle===label && l.resolved===true && !l.escalated);
+  if(bucketKey==='unresolvedAfterVideo') return logs.filter(l=>l.problemTitle===label && l.resolved===false && l.theoryOpened && l.watchPct>=50);
+  if(bucketKey==='categoryWise') return logs.filter(l=>l.categoryName===label);
+  if(bucketKey==='cityWise') return logs.filter(l=>l.city===label);
+  if(bucketKey==='clusterWise') return logs.filter(l=>l.cluster===label);
+  if(bucketKey==='trainerWise') return logs.filter(l=>l.trainerName===label);
+  if(bucketKey==='languageWise') return logs.filter(l=>l.language===label);
+  return logs.filter(l=>l.problemTitle===label);
+}
+const SOS_BUCKET_DEFS = [
+  ['mostSearched','Most searched problems'],
+  ['mostWatched','Most watched videos'],
+  ['mostReplayed','Most replayed videos'],
+  ['highestEscalation','Highest escalation count'],
+  ['stillNeedHelp','Still need help after watching'],
+  ['categoryWise','Category-wise requests'],
+  ['cityWise','City-wise requests'],
+  ['clusterWise','Cluster-wise requests'],
+  ['trainerWise','Trainer-wise requests'],
+  ['languageWise','Language-wise usage'],
+  ['missingContent','Searches with no results (missing content)'],
+  ['resolvedNoEscalation','Resolved without escalation'],
+  ['unresolvedAfterVideo','Unresolved after video &amp; theory'],
+];
+function computeSosInsights(logs, buckets){
+  const insights = [];
+  if(buckets.unresolvedAfterVideo.length) insights.push(`"${esc(buckets.unresolvedAfterVideo[0][0])}" has the most partners still stuck after watching the video — worth reviewing that video's clarity.`);
+  if(buckets.highestEscalation.length) insights.push(`"${esc(buckets.highestEscalation[0][0])}" generates the most escalations — a candidate for retraining or a clearer video.`);
+  if(buckets.missingContent.length) insights.push(`Partners searched for "${esc(buckets.missingContent[0][0])}" and found nothing — consider adding this topic to the library.`);
+  if(buckets.categoryWise.length) insights.push(`${esc(buckets.categoryWise[0][0])} generates the most SOS requests overall (${buckets.categoryWise[0][1]}).`);
+  const trainerEscalationRate = {};
+  logs.forEach(l=>{ if(!l.trainerName) return; if(!trainerEscalationRate[l.trainerName]) trainerEscalationRate[l.trainerName] = {views:0, esc:0}; trainerEscalationRate[l.trainerName].views++; if(l.escalated) trainerEscalationRate[l.trainerName].esc++; });
+  const worstTrainer = Object.entries(trainerEscalationRate).filter(([,v])=>v.views>=3).sort((a,b)=>(b[1].esc/b[1].views)-(a[1].esc/a[1].views))[0];
+  if(worstTrainer && worstTrainer[1].esc>0) insights.push(`Partners under ${esc(worstTrainer[0])} escalate more often relative to their SOS usage (${worstTrainer[1].esc}/${worstTrainer[1].views}) — may be worth a coaching check-in.`);
+  if(insights.length===0) insights.push('Not enough SOS activity yet to surface insights.');
+  return insights;
+}
+function renderSosAnalyticsTab(){
+  const logs = sosFilteredLogs();
+  const searchLogsFiltered = adminSosSearchLogs.filter(s=>{
+    const f = sosAnalyticsFilters;
+    if(f.dateFrom && new Date(s.at) < new Date(f.dateFrom)) return false;
+    if(f.dateTo && new Date(s.at) > new Date(f.dateTo+'T23:59:59')) return false;
+    if(f.category && s.categoryId!==f.category) return false;
+    return true;
+  });
+  const buckets = computeSosBuckets(logs, searchLogsFiltered);
+  const insights = computeSosInsights(logs, buckets);
+  const trainerNames = [...new Set(adminSosViewLogs.map(l=>l.trainerName).filter(Boolean))];
+  const cityNames = [...new Set(adminSosViewLogs.map(l=>l.city).filter(Boolean))];
+  const clusterNames = [...new Set(adminSosViewLogs.map(l=>l.cluster).filter(Boolean))];
+  const batchNumbers = [...new Set(adminSosViewLogs.map(l=>l.batchNumber).filter(Boolean))];
+  const problemList = Object.entries(sosProblems);
+
+  if(sosAnalyticsOpenBucket) return renderSosBucketDetail(sosAnalyticsOpenBucket, logs, searchLogsFiltered);
+
+  return `
+    <div class="crumb">Admin dashboard</div>
+    <h1 class="page-title">SOS Help Analytics</h1>
+    <p class="page-sub">See which problems partners search for, which videos actually solve their issue, and where they need the most support.</p>
+
+    <div class="card" style="border-left:4px solid var(--brand);">
+      <h3>Insights</h3>
+      <ul style="margin:0;padding-left:18px;font-size:13.5px;line-height:1.7;">
+        ${insights.map(i=>`<li>${i}</li>`).join('')}
+      </ul>
+    </div>
+
+    <div class="card">
+      <h3>Filters</h3>
+      <div class="filter-row">
+        <input class="field-input" type="date" id="sos-f-from" value="${esc(sosAnalyticsFilters.dateFrom)}" onchange="sosAnalyticsFilters.dateFrom=this.value; renderAdminMain();">
+        <input class="field-input" type="date" id="sos-f-to" value="${esc(sosAnalyticsFilters.dateTo)}" onchange="sosAnalyticsFilters.dateTo=this.value; renderAdminMain();">
+        <select id="sos-f-category" onchange="sosAnalyticsFilters.category=this.value; renderAdminMain();">
+          <option value="">All categories</option>
+          ${Object.entries(sosCategories).map(([id,c])=>`<option value="${id}" ${sosAnalyticsFilters.category===id?'selected':''}>${esc(c.name)}</option>`).join('')}
+        </select>
+        <select id="sos-f-course" onchange="sosAnalyticsFilters.course=this.value; renderAdminMain();">
+          <option value="">All courses</option>
+          ${Object.entries(adminCourses).map(([id,c])=>`<option value="${id}" ${sosAnalyticsFilters.course===id?'selected':''}>${esc(c.name)}</option>`).join('')}
+        </select>
+        <select id="sos-f-city" onchange="sosAnalyticsFilters.city=this.value; renderAdminMain();">
+          <option value="">All cities</option>
+          ${cityNames.map(c=>`<option value="${esc(c)}" ${sosAnalyticsFilters.city===c?'selected':''}>${esc(c)}</option>`).join('')}
+        </select>
+        <select id="sos-f-cluster" onchange="sosAnalyticsFilters.cluster=this.value; renderAdminMain();">
+          <option value="">All clusters</option>
+          ${clusterNames.map(c=>`<option value="${esc(c)}" ${sosAnalyticsFilters.cluster===c?'selected':''}>${esc(c)}</option>`).join('')}
+        </select>
+        <select id="sos-f-trainer" onchange="sosAnalyticsFilters.trainer=this.value; renderAdminMain();">
+          <option value="">All trainers</option>
+          ${trainerNames.map(t=>`<option value="${esc(t)}" ${sosAnalyticsFilters.trainer===t?'selected':''}>${esc(t)}</option>`).join('')}
+        </select>
+        <select id="sos-f-batch" onchange="sosAnalyticsFilters.batch=this.value; renderAdminMain();">
+          <option value="">All batches</option>
+          ${batchNumbers.map(b=>`<option value="${b}" ${String(sosAnalyticsFilters.batch)===String(b)?'selected':''}>Batch ${b}</option>`).join('')}
+        </select>
+        <select id="sos-f-language" onchange="sosAnalyticsFilters.language=this.value; renderAdminMain();">
+          <option value="">All languages</option>
+          ${sosLanguages.map(l=>`<option value="${esc(l)}" ${sosAnalyticsFilters.language===l?'selected':''}>${esc(l)}</option>`).join('')}
+        </select>
+        <select id="sos-f-problem" onchange="sosAnalyticsFilters.problem=this.value; renderAdminMain();">
+          <option value="">All problems</option>
+          ${problemList.map(([id,p])=>`<option value="${id}" ${sosAnalyticsFilters.problem===id?'selected':''}>${esc(p.title)}</option>`).join('')}
+        </select>
+        <select id="sos-f-resolved" onchange="sosAnalyticsFilters.resolved=this.value; renderAdminMain();">
+          <option value="">Resolved &amp; unresolved</option>
+          <option value="resolved" ${sosAnalyticsFilters.resolved==='resolved'?'selected':''}>Resolved only</option>
+          <option value="unresolved" ${sosAnalyticsFilters.resolved==='unresolved'?'selected':''}>Unresolved only</option>
+        </select>
+        <select id="sos-f-escalated" onchange="sosAnalyticsFilters.escalated=this.value; renderAdminMain();">
+          <option value="">Escalated &amp; not</option>
+          <option value="escalated" ${sosAnalyticsFilters.escalated==='escalated'?'selected':''}>Escalated only</option>
+          <option value="not" ${sosAnalyticsFilters.escalated==='not'?'selected':''}>Not escalated</option>
+        </select>
+        <button class="btn secondary small" onclick="sosAnalyticsFilters={dateFrom:'',dateTo:'',category:'',course:'',city:'',cluster:'',trainer:'',batch:'',language:'',problem:'',resolved:'',escalated:''}; renderAdminMain();">Clear filters</button>
+        <button class="btn amber small" onclick="exportSosAnalyticsExcel()">Export Excel</button>
+      </div>
+    </div>
+
+    <div class="stat-mini-grid">
+      <div class="stat-card"><div class="n">${logs.length}</div><div class="l">SOS video views</div></div>
+      <div class="stat-card"><div class="n">${searchLogsFiltered.length}</div><div class="l">Searches</div></div>
+      <div class="stat-card"><div class="n">${logs.filter(l=>l.escalated).length}</div><div class="l">Escalations raised</div></div>
+      <div class="stat-card"><div class="n">${logs.length?Math.round(100*logs.filter(l=>l.resolved===true).length/logs.length):0}%</div><div class="l">Resolved without escalation*</div></div>
+    </div>
+
+    <div class="card">
+      <h3>Buckets</h3>
+      <p style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">Click a bucket to see the complete partner-wise detail behind it.</p>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;">
+        ${SOS_BUCKET_DEFS.map(([key,label])=>{
+          const data = buckets[key]||[];
+          return `<div class="stat-card" style="cursor:pointer;text-align:left;" onclick="sosAnalyticsOpenBucket='${key}'; renderAdminMain();">
+            <div style="font-weight:600;font-size:13px;margin-bottom:6px;">${label}</div>
+            ${data.length===0?`<div style="font-size:12px;color:var(--ink-soft);">No data yet</div>`:data.slice(0,3).map(([name,count])=>`<div style="font-size:12px;display:flex;justify-content:space-between;"><span>${esc(String(name))}</span><span class="mono">${count}</span></div>`).join('')}
+            ${data.length>3?`<div style="font-size:11px;color:var(--ink-soft);margin-top:4px;">+${data.length-3} more →</div>`:''}
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+  `;
+}
+function renderSosBucketDetail(bucketKey, logs, searchLogsFiltered){
+  const def = SOS_BUCKET_DEFS.find(d=>d[0]===bucketKey);
+  const buckets = computeSosBuckets(logs, searchLogsFiltered);
+  const items = buckets[bucketKey] || [];
+  const isSearchBucket = bucketKey==='mostSearched' || bucketKey==='missingContent';
+  return `
+    <div class="crumb">Admin dashboard &middot; SOS Help Analytics</div>
+    <div class="back-link" onclick="sosAnalyticsOpenBucket=null; renderAdminMain();">&larr; Back to buckets</div>
+    <h1 class="page-title">${def?def[1]:bucketKey}</h1>
+    ${items.length===0?`<div class="card"><div class="empty-state">No data in this bucket yet.</div></div>`:
+    items.map(([label,count])=>{
+      const rows = sosBucketLogsFor(bucketKey, label, logs, searchLogsFiltered);
+      return `<div class="card">
+        <h3>${esc(String(label))} <span class="mono" style="font-weight:400;color:var(--ink-soft);">(${count})</span></h3>
+        ${isSearchBucket ? `<table class="data-table">
+          <tr><th>Date &amp; time</th><th>Result count</th></tr>
+          ${rows.slice(0,50).map(r=>`<tr><td class="mono">${fmtDateTime(r.at)}</td><td class="mono">${r.resultCount}</td></tr>`).join('')}
+        </table>` : `<table class="data-table" style="font-size:12px;">
+          <tr><th>Partner</th><th>Category</th><th>City</th><th>Cluster</th><th>Trainer</th><th>Batch</th><th>Language</th><th>Watch %</th><th>Replays</th><th>Resolved</th><th>Escalated</th><th>Date</th></tr>
+          ${rows.slice(0,100).map(r=>`<tr>
+            <td>${r.partnerName?esc(r.partnerName)+' <span class="mono" style="font-size:10px;color:var(--ink-soft);">'+esc(r.partnerId)+'</span>':'Anonymous'}</td>
+            <td>${esc(r.categoryName||'—')}</td>
+            <td>${esc(r.city||'—')}</td>
+            <td>${esc(r.cluster||'—')}</td>
+            <td>${esc(r.trainerName||'—')}</td>
+            <td>${r.batchNumber||'—'}</td>
+            <td>${esc(r.language||'—')}</td>
+            <td class="mono">${r.watchPct||0}%</td>
+            <td class="mono">${r.replayCount||0}</td>
+            <td>${r.resolved===true?'✓':r.resolved===false?'✗':'—'}</td>
+            <td>${r.escalated?'✓':'—'}</td>
+            <td class="mono">${fmtDateTime(r.at)}</td>
+          </tr>`).join('')}
+        </table>`}
+      </div>`;
+    }).join('')}
+  `;
+}
+async function exportSosAnalyticsExcel(){
+  if(typeof XLSX==='undefined'){ showToast('Excel library did not load (no internet access?). Please try again when online.', 'error'); return; }
+  const logs = sosFilteredLogs();
+  const rows = [['Date/Time','Partner Name','Partner ID','Category','City','Cluster','Trainer','Batch','Language','Problem','Video Title','Watch Duration (s)','Watch %','Replays','Theory Opened','Resolved','Escalated']];
+  logs.forEach(l=>{
+    rows.push([fmtDateTime(l.at), l.partnerName||'Anonymous', l.partnerId||'', l.categoryName||'', l.city||'', l.cluster||'', l.trainerName||'', l.batchNumber||'', l.language||'', l.problemTitle||'', l.videoTitle||'', l.watchDurationSec||0, l.watchPct||0, l.replayCount||0, l.theoryOpened?'Yes':'No', l.resolved===true?'Resolved':l.resolved===false?'Unresolved':'Not answered', l.escalated?'Yes':'No']);
+  });
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  XLSX.utils.book_append_sheet(wb, ws, 'SOS Tracking');
+  XLSX.writeFile(wb, 'sos-help-analytics-'+todayStr()+'.xlsx');
 }
 function securityRoleLabel(type){
   return { admin:'Admin', trainer:'Trainer', cc:'Content Creator', zt:'Zonal Manager', partner:'Partner' }[type] || type;
