@@ -711,6 +711,32 @@ async function logPasswordReset(accountType, accountId, accountName, reason){
   const id = String(Date.now()).padStart(14,'0')+'_'+uid();
   await kvSet('pwResetLog:'+id, { id, accountType, accountId, accountName, reason: reason||'Not specified', resetBy: trainerIdentity.name, at: new Date().toISOString() });
 }
+async function logProgressOverride(partnerId, partnerName, dayId, activity, previousStatus, updatedStatus, reason){
+  const id = String(Date.now()).padStart(14,'0')+'_'+uid();
+  await kvSet('overrideLog:'+id, { id, adminName: trainerIdentity.name, partnerId, partnerName, dayId, activity, previousStatus, updatedStatus, reason: reason||'Not specified', at: new Date().toISOString() });
+}
+async function listProgressOverrideLogs(limit){
+  const keys = (await kvList('overrideLog:')).sort().reverse();
+  const capped = keys.slice(0, limit||500);
+  const out = [];
+  await Promise.all(capped.map(async k=>{ const v = await kvGet(k); if(v) out.push(v); }));
+  return out.sort((a,b)=> new Date(b.at)-new Date(a.at));
+}
+async function createEscalation(data){
+  const id = String(Date.now()).padStart(14,'0')+'_'+uid();
+  await kvSet('escalation:'+id, { id, status:'open', at: new Date().toISOString(), ...data });
+  return id;
+}
+async function listEscalations(){
+  const keys = (await kvList('escalation:')).sort().reverse();
+  const out = [];
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out.push(v); }));
+  return out.sort((a,b)=> new Date(b.at)-new Date(a.at));
+}
+async function resolveEscalation(id){
+  const esc = await kvGet('escalation:'+id);
+  if(esc) await kvSet('escalation:'+id, { ...esc, status:'resolved', resolvedBy: trainerIdentity.name, resolvedAt: new Date().toISOString() });
+}
 async function listPasswordResetLogs(limit){
   const keys = (await kvList('pwResetLog:')).sort().reverse();
   const capped = keys.slice(0, limit||500);
@@ -3336,6 +3362,12 @@ let adminDoubtsCache = [];
 let adminLoginLogs = [];
 let adminSecurityAccounts = [];
 let adminPwResetLogs = [];
+let adminEscalations = [];
+let adminOverrideLogs = [];
+let progressControlSearch = '';
+let progressControlFilterTrainer = '';
+let progressControlFilterCategory = '';
+let previewPartnerId = null;
 let adminSecuritySettings = { partnerLoginPolicy:'auto' };
 let securityResetCategory = 'partner';
 let securityPartnerFilterTrainer = '';
@@ -3393,6 +3425,7 @@ const ADMIN_TAB_KEYS_DEFAULT = [
   ['ztmanage','Zonal Managers','Manage ZT access & zones'],
   ['categories','Category Management','Categories & courses'],
   ['security','Security & Alerts','Sessions, lockouts & login activity'],
+  ['progresscontrol','Partner Progress Control','View, diagnose & unblock partners'],
   ['languages','Languages','Regional language content'],
   ['support','Support','Requests & issues'],
   ['history','History','Audit log'],
@@ -3559,6 +3592,22 @@ async function renderAdminMain(){
     adminSecuritySettings = await getSecuritySettings();
     el.innerHTML = renderSecurityTab();
   }
+  else if(adminTab==='progresscontrol'){
+    await seedDefaultCategoriesIfEmpty();
+    adminCategories = await listCategories();
+    adminCourses = await listCourses();
+    adminTrainers = await listTrainers();
+    const allRoster = await listRoster();
+    adminRoster = allRoster;
+    adminProgressCache = {};
+    await Promise.all(Object.keys(adminRoster).map(async id=>{ adminProgressCache[id] = await getProgress(id); }));
+    adminUnlocks = await listUnlocks();
+    adminAssessmentUnlocks = await listAssessmentUnlocks();
+    await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id); if(ov) contentOverrides[d.id] = migrateOldOverrideToUnified(ov); audiosCache[d.id] = await getAudioUrl(d.id); }));
+    adminEscalations = await listEscalations();
+    adminOverrideLogs = await listProgressOverrideLogs(300);
+    el.innerHTML = renderProgressControlTab();
+  }
   else if(adminTab==='languages'){ await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderLanguagesTab(); }
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
   else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderSessionsTab(); }
@@ -3607,7 +3656,7 @@ async function renderAdminMain(){
       }
     }
   }
-  else if(adminTab==='tracking'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); await loadTrackingData(); el.innerHTML = renderTrackingTab(); }
+  else if(adminTab==='tracking'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); await loadTrackingData(); adminUnlocks = await listUnlocks(); el.innerHTML = renderTrackingTab(); }
   else if(adminTab==='media'){
     const all = await listAllMedia();
     adminMediaCache = isAdminRole() ? all : all.filter(m=>m.trainerId ? m.trainerId===trainerIdentity.trainerId : m.trainerName===trainerIdentity.name);
@@ -4687,6 +4736,307 @@ async function updatePartnerLoginPolicy(value){
   await logHistory('security_policy_changed', `Partner single-device login policy set to "${value==='block'?'Block new login':'Auto-logout old device'}" by ${trainerIdentity.name}`, {value});
   showToast('Policy saved.', 'success');
 }
+/* ---- PARTNER PROGRESS CONTROL (admin only) ---- */
+function computePartnerStatus(partnerId, r){
+  const key = slug(r.city)+'__'+slug(r.trainer);
+  const unlocked = adminUnlocks[key] || [];
+  const assessUnlocked = adminAssessmentUnlocks[key] || [];
+  const prog = adminProgressCache[partnerId] || {};
+  const currentDay = unlocked.length ? Math.max(...unlocked) : 1;
+  const dp = prog[currentDay] || {};
+  const ov = contentOverrides[currentDay];
+  let videoPct = dp.videoPct || 0;
+  let videoDone = !!dp.videoDone;
+  if(ov && dp.videoItemProgress){
+    const items = Object.values(dp.videoItemProgress);
+    if(items.length){
+      videoPct = Math.round(items.reduce((s,i)=>s+(i.pct||0),0)/items.length);
+      videoDone = items.every(i=>i.done);
+    }
+  }
+  const assignmentTasks = dp.tasksChecked || [];
+  const assignmentDone = assignmentTasks.length>0 && assignmentTasks.every(Boolean);
+  const assessmentStatus = dp.quizSubmitted ? (dp.quizPct>=PASS_THRESHOLD?'Pass':'Fail') : (assessUnlocked.includes(currentDay) ? 'Unlocked, not attempted' : 'Locked');
+  const daysSubmitted = DAYS.filter(d=>prog[d.id] && prog[d.id].quizSubmitted);
+  const overallPct = Math.round((daysSubmitted.length / DAYS.length) * 100);
+  const allSubmitted = daysSubmitted.length === DAYS.length;
+  const avgPct = allSubmitted ? daysSubmitted.reduce((s,d)=>s+(prog[d.id].quizPct||0),0)/DAYS.length : null;
+  const overallPassFail = allSubmitted ? (avgPct>=PASS_THRESHOLD && daysSubmitted.every(d=>(prog[d.id].quizPct||0)>=PASS_THRESHOLD) ? 'Pass' : 'Fail') : '—';
+  return { currentDay, unlocked, assessUnlocked, dp, theoryDone: !!dp.theoryDone, videoDone, videoPct, audioPlayed: !!dp.audioPlayed, hasAudio: !!audiosCache[currentDay] || (ov && ov.content && ov.content.some(c=>c.type==='audio')), assignmentDone, assessmentStatus, overallPct, overallPassFail };
+}
+function renderProgressControlTab(){
+  if(previewPartnerId) return renderAdminPreviewMode();
+  let entries = Object.entries(adminRoster);
+  if(progressControlFilterTrainer) entries = entries.filter(([,r])=>r.trainer===progressControlFilterTrainer);
+  if(progressControlFilterCategory) entries = entries.filter(([,r])=>r.courseId && adminCourses[r.courseId] && adminCourses[r.courseId].categoryId===progressControlFilterCategory);
+  if(progressControlSearch){
+    const q = progressControlSearch.toLowerCase();
+    entries = entries.filter(([id,r])=> r.name.toLowerCase().includes(q) || id.toLowerCase().includes(q));
+  }
+  const trainerNames = [...new Set(Object.values(adminRoster).map(r=>r.trainer))];
+  const openEscalations = adminEscalations.filter(e=>e.status==='open');
+  return `
+    <div class="crumb">Admin dashboard</div>
+    <h1 class="page-title">Partner Progress Control</h1>
+    <p class="page-sub">See exactly where any partner is stuck, view their interface without needing their password, and manually unblock them when something isn't unlocking as expected.</p>
+
+    ${openEscalations.length>0 ? `<div class="card" style="border-left:4px solid var(--amber);">
+      <h3>Escalations from Trainers (${openEscalations.length} open)</h3>
+      <table class="data-table">
+        <tr><th>Partner</th><th>Trainer</th><th>Day</th><th>Stuck at</th><th>Issue</th><th>When</th><th></th></tr>
+        ${openEscalations.map(e=>`<tr>
+          <td>${esc(e.partnerName)} <span class="mono" style="font-size:11px;color:var(--ink-soft);">${esc(e.partnerId)}</span></td>
+          <td>${esc(e.trainerName)}</td>
+          <td>Day ${e.dayId}</td>
+          <td>${esc(e.activity)}</td>
+          <td style="max-width:220px;">${esc(e.description)}${e.attachmentUrl?` <a href="${esc(e.attachmentUrl)}" target="_blank">[attachment]</a>`:''}</td>
+          <td class="mono">${fmtDateTime(e.at)}</td>
+          <td>
+            <button class="btn small amber" onclick="openPartnerPreview('${e.partnerId}')">View</button>
+            <button class="btn small secondary" onclick="resolveEscalationRow('${e.id}')">Resolve</button>
+          </td>
+        </tr>`).join('')}
+      </table>
+    </div>` : ''}
+
+    <div class="card">
+      <div class="filter-row">
+        <select id="pc-filter-trainer" onchange="progressControlFilterTrainer=this.value; renderAdminMain();">
+          <option value="">All trainers</option>
+          ${trainerNames.map(t=>`<option value="${esc(t)}" ${progressControlFilterTrainer===t?'selected':''}>${esc(t)}</option>`).join('')}
+        </select>
+        <select id="pc-filter-category" onchange="progressControlFilterCategory=this.value; renderAdminMain();">
+          <option value="">All categories</option>
+          ${Object.entries(adminCategories).map(([id,cat])=>`<option value="${id}" ${progressControlFilterCategory===id?'selected':''}>${esc(cat.name)}</option>`).join('')}
+        </select>
+        <input class="field-input" id="pc-search" value="${esc(progressControlSearch)}" placeholder="Search name or ID..." oninput="progressControlSearch=this.value; renderAdminMain();" style="width:200px;margin-bottom:0;">
+        <button class="btn secondary small" onclick="renderAdminMain()">Refresh</button>
+      </div>
+      ${entries.length===0?`<div class="empty-state">No partners match this filter.</div>`:`
+      <table class="data-table" style="font-size:12.5px;">
+        <tr><th>Name</th><th>Category</th><th>Course</th><th>Batch</th><th>Trainer</th><th>Day</th><th>Video</th><th>Theory</th><th>Audio</th><th>Assignment</th><th>Assessment</th><th>Overall</th><th>Result</th><th></th></tr>
+        ${entries.map(([id,r])=>{
+          const s = computePartnerStatus(id, r);
+          const course = r.courseId ? adminCourses[r.courseId] : null;
+          const category = course ? adminCategories[course.categoryId] : null;
+          return `<tr>
+            <td>${esc(r.name)}</td>
+            <td>${category?esc(category.name):'—'}</td>
+            <td>${course?esc(course.name):'—'}</td>
+            <td>${r.batchNumber?esc(String(r.batchNumber)):'—'}</td>
+            <td>${esc(r.trainer)}</td>
+            <td>Day ${s.currentDay}</td>
+            <td class="mono">${s.videoPct}%${s.videoDone?' ✓':''}</td>
+            <td>${s.theoryDone?'✓':'—'}</td>
+            <td>${s.hasAudio?(s.audioPlayed?'✓':'—'):'n/a'}</td>
+            <td>${s.assignmentDone?'✓':'—'}</td>
+            <td>${esc(s.assessmentStatus)}</td>
+            <td class="mono">${s.overallPct}%</td>
+            <td>${s.overallPassFail==='Pass'?'<span class="pill open">Pass</span>':s.overallPassFail==='Fail'?'<span class="pill closed">Fail</span>':'—'}</td>
+            <td>
+              <button class="btn small secondary" onclick="openPartnerPreview('${id}')">View Interface</button>
+              <button class="btn small amber" onclick="openOverridePanel('${id}')">Manual Override</button>
+            </td>
+          </tr>`;
+        }).join('')}
+      </table>`}
+    </div>
+
+    <div class="card">
+      <h3>Admin Action History</h3>
+      ${adminOverrideLogs.length===0?`<div class="empty-state">No manual overrides recorded yet.</div>`:`
+      <table class="data-table">
+        <tr><th>Date &amp; time</th><th>Admin</th><th>Partner</th><th>Day</th><th>Activity</th><th>Before</th><th>After</th><th>Reason</th></tr>
+        ${adminOverrideLogs.slice(0,100).map(l=>`<tr>
+          <td class="mono">${fmtDateTime(l.at)}</td>
+          <td>${esc(l.adminName)}</td>
+          <td>${esc(l.partnerName)} <span class="mono" style="font-size:11px;color:var(--ink-soft);">${esc(l.partnerId)}</span></td>
+          <td>Day ${l.dayId}</td>
+          <td>${esc(l.activity)}</td>
+          <td>${esc(String(l.previousStatus))}</td>
+          <td>${esc(String(l.updatedStatus))}</td>
+          <td>${esc(l.reason)}</td>
+        </tr>`).join('')}
+      </table>`}
+    </div>
+  `;
+}
+async function openPartnerPreview(partnerId){
+  const r = adminRoster[partnerId];
+  if(!r){ showToast('Could not find that partner.', 'error'); return; }
+  const s = computePartnerStatus(partnerId, r);
+  currentUser = { id: partnerId, name: r.name, officeId: r.officeId||'', city: r.city, trainer: r.trainer, trainerId: r.trainerId||null, courseId: r.courseId||null, preferredLanguage: r.preferredLanguage||DEFAULT_LANGUAGE, day: s.currentDay, open:'—', close:'—' };
+  currentUserProgress = await getProgress(partnerId);
+  for(const d of DAYS) ensureDay(d.id);
+  currentUserUnlockedDays = s.unlocked;
+  currentUserAssessmentUnlockedDays = s.assessUnlocked;
+  videosCache = {}; audiosCache = {}; contentOverrides = {}; extraVideosCache = {}; extraAudiosCache = {};
+  await Promise.all(DAYS.map(async d=>{
+    videosCache[d.id]=await getVideoUrl(d.id);
+    audiosCache[d.id]=await getAudioUrl(d.id);
+    extraVideosCache[d.id]=await getExtraVideos(d.id);
+    extraAudiosCache[d.id]=await getExtraAudios(d.id);
+    const result = await getContentOverrideWithFallback(d.id, currentUser.courseId, currentUser.preferredLanguage);
+    if(result.data) contentOverrides[d.id] = migrateOldOverrideToUnified(result.data);
+  }));
+  const homeOv = await getContentOverride('home');
+  if(homeOv) contentOverrides['home'] = migrateOldOverrideToUnified(homeOv);
+  currentDay = s.currentDay;
+  currentTab = 'theory';
+  previewPartnerId = partnerId;
+  renderAdminMain();
+}
+function closePartnerPreview(){
+  previewPartnerId = null;
+  renderAdminMain();
+}
+function renderAdminPreviewMode(){
+  const r = adminRoster[previewPartnerId];
+  const dayObj = DAYS.find(d=>d.id===currentDay) || DAYS[0];
+  let bodyHtml;
+  try{
+    bodyHtml = currentDay===0 ? renderHome() : currentDay===99 ? renderResult() : renderDayShell(dayObj);
+  }catch(e){
+    bodyHtml = `<div class="empty-state">Could not render this partner's current screen (${esc(e.message)}).</div>`;
+  }
+  return `
+    <div style="position:sticky;top:0;z-index:50;background:var(--danger);color:#fff;padding:12px 20px;border-radius:10px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;">
+      <div><strong>Admin Preview — read only</strong> — Viewing exactly what ${esc(r?r.name:previewPartnerId)} sees right now. Nothing you click here affects their account.</div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn small amber" onclick="closePartnerPreview(); openOverridePanel('${previewPartnerId}');">Manual Override</button>
+        <button class="btn small secondary" onclick="closePartnerPreview()">Exit Preview</button>
+      </div>
+    </div>
+    <div style="pointer-events:none;user-select:none;">
+      ${bodyHtml}
+    </div>
+  `;
+}
+function openOverridePanel(partnerId){
+  const r = adminRoster[partnerId];
+  if(!r){ showToast('Could not find that partner.', 'error'); return; }
+  const s = computePartnerStatus(partnerId, r);
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `<div class="confirm-box" style="text-align:left;max-width:480px;">
+    <p><strong>Manual Override — ${esc(r.name)}</strong><br><span style="font-size:12.5px;color:var(--ink-soft);">Currently on Day ${s.currentDay}. These actions only unblock progress forward — they never delete or reset existing scores, attendance, or feedback.</span></p>
+    <div style="display:flex;flex-direction:column;gap:8px;margin:14px 0;">
+      <button class="btn secondary" ${s.theoryDone?'disabled':''} onclick="promptOverrideAction('${partnerId}',${s.currentDay},'Theory','${s.theoryDone}','Mark Theory as complete?')">Mark Theory complete ${s.theoryDone?'✓ already done':''}</button>
+      <button class="btn secondary" ${s.videoDone?'disabled':''} onclick="promptOverrideAction('${partnerId}',${s.currentDay},'Video','${s.videoDone}','Mark the video as watched (100%) and unlock what comes next?')">Mark Video complete ${s.videoDone?'✓ already done':''}</button>
+      ${s.hasAudio?`<button class="btn secondary" ${s.audioPlayed?'disabled':''} onclick="promptOverrideAction('${partnerId}',${s.currentDay},'Audio','${s.audioPlayed}','Mark the audio as played?')">Mark Audio complete ${s.audioPlayed?'✓ already done':''}</button>`:''}
+      <button class="btn secondary" ${s.assignmentDone?'disabled':''} onclick="promptOverrideAction('${partnerId}',${s.currentDay},'Assignment','${s.assignmentDone}','Mark all assignment tasks as checked off?')">Mark Assignment complete ${s.assignmentDone?'✓ already done':''}</button>
+      <button class="btn secondary" ${s.assessUnlocked.includes(s.currentDay)?'disabled':''} onclick="promptOverrideAction('${partnerId}',${s.currentDay},'Assessment Unlock','locked','Unlock this day\\'s assessment for the partner?')">Unlock this day's Assessment ${s.assessUnlocked.includes(s.currentDay)?'✓ already unlocked':''}</button>
+      <button class="btn amber" ${s.unlocked.includes(s.currentDay+1)?'disabled':''} onclick="promptOverrideAction('${partnerId}',${s.currentDay+1},'Day Unlock','locked','Unlock Day ${s.currentDay+1} for the partner?')">Unlock Day ${s.currentDay+1} ${s.unlocked.includes(s.currentDay+1)?'✓ already unlocked':''}</button>
+    </div>
+    <div class="confirm-actions"><button class="btn secondary" id="override-panel-close">Close</button></div>
+  </div>`;
+  document.body.appendChild(overlay);
+  const cleanup = ()=>{ if(overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+  overlay.querySelector('#override-panel-close').addEventListener('click', cleanup);
+  overlay.addEventListener('click', (e)=>{ if(e.target===overlay) cleanup(); });
+  overlay.dataset.overridePanel = 'true';
+}
+function promptOverrideAction(partnerId, dayId, activity, previousStatus, confirmMsg){
+  document.querySelectorAll('.confirm-overlay').forEach(o=>o.remove());
+  promptForResetReason(confirmMsg, async (reason)=>{
+    const r = adminRoster[partnerId];
+    const prog = await getProgress(partnerId);
+    ensureDayInProgObj(prog, dayId);
+    let updatedStatus = 'done';
+    if(activity==='Theory'){ prog[dayId].theoryDone = true; }
+    else if(activity==='Video'){
+      prog[dayId].videoDone = true; prog[dayId].videoPct = 100;
+      if(prog[dayId].videoItemProgress){
+        Object.keys(prog[dayId].videoItemProgress).forEach(idx=>{
+          prog[dayId].videoItemProgress[idx] = { ...prog[dayId].videoItemProgress[idx], done:true, readyForUnlock:false, pct:100 };
+        });
+      }
+    }
+    else if(activity==='Audio'){ prog[dayId].audioPlayed = true; }
+    else if(activity==='Assignment'){
+      const totalTasks = getEffectiveTasks(dayId).length || (prog[dayId].tasksChecked||[]).length || 1;
+      prog[dayId].tasksChecked = new Array(totalTasks).fill(true);
+    }
+    else if(activity==='Assessment Unlock'){
+      const key = slug(r.city)+'__'+slug(r.trainer);
+      const days = new Set(adminAssessmentUnlocks[key] || []);
+      days.add(dayId);
+      await setAssessmentUnlock(r.city, r.trainer, [...days]);
+      updatedStatus = 'unlocked';
+    }
+    else if(activity==='Day Unlock'){
+      const key = slug(r.city)+'__'+slug(r.trainer);
+      const days = new Set(adminUnlocks[key] || []);
+      days.add(dayId);
+      await setUnlock(r.city, r.trainer, [...days]);
+      updatedStatus = 'unlocked';
+    }
+    if(activity!=='Assessment Unlock' && activity!=='Day Unlock'){
+      await setProgress(partnerId, prog);
+    }
+    await logProgressOverride(partnerId, r?r.name:partnerId, dayId, activity, previousStatus, updatedStatus, reason);
+    showToast(`${activity} updated for ${r?r.name:partnerId}. They'll see it next time they refresh.`, 'success');
+    renderAdminMain();
+  });
+}
+function ensureDayInProgObj(prog, dayId){
+  if(!prog[dayId]) prog[dayId] = { theoryDone:false, videoDone:false, videoPct:0, audioPlayed:false, tasksChecked:[], quizSubmitted:false };
+}
+function openEscalationForm(partnerId){
+  const r = adminRoster[partnerId];
+  if(!r){ showToast('Could not find that partner.', 'error'); return; }
+  const prog = adminProgressCache[partnerId] || {};
+  const key = slug(r.city)+'__'+slug(r.trainer);
+  const unlocked = adminUnlocks[key] || [];
+  const currentDay = unlocked.length ? Math.max(...unlocked) : 1;
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `<div class="confirm-box" style="text-align:left;max-width:480px;">
+    <p><strong>Escalate to Admin</strong><br><span style="font-size:12.5px;color:var(--ink-soft);">${esc(r.name)} (${esc(partnerId)})</span></p>
+    <span class="field-label">Day</span>
+    <select class="field-input" id="esc-day">
+      ${DAYS.map(d=>`<option value="${d.id}" ${d.id===currentDay?'selected':''}>Day ${d.id} — ${esc(d.title)}</option>`).join('')}
+    </select>
+    <span class="field-label">Where they're stuck</span>
+    <select class="field-input" id="esc-activity">
+      <option>Theory</option><option>Video</option><option>Audio</option><option>Assignment</option><option>Assessment</option><option>Other</option>
+    </select>
+    <span class="field-label">What's happening</span>
+    <textarea class="field-input reflect" id="esc-description" style="min-height:70px;" placeholder="e.g. Partner watched the full video but Assignment tab is still locked"></textarea>
+    <span class="field-label">Attach a screenshot (optional)</span>
+    <input class="field-input" id="esc-attachment" type="file" accept="image/*">
+    <div class="confirm-actions">
+      <button class="btn secondary" id="esc-cancel">Cancel</button>
+      <button class="btn amber" id="esc-submit">Send to Admin</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  const cleanup = ()=>{ if(overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+  overlay.querySelector('#esc-cancel').addEventListener('click', cleanup);
+  overlay.addEventListener('click', (e)=>{ if(e.target===overlay) cleanup(); });
+  overlay.querySelector('#esc-submit').addEventListener('click', async ()=>{
+    const dayId = parseInt(document.getElementById('esc-day').value);
+    const activity = document.getElementById('esc-activity').value;
+    const description = document.getElementById('esc-description').value.trim();
+    if(!description){ showToast('Describe what\'s happening before sending.', 'error'); return; }
+    const fileInput = document.getElementById('esc-attachment');
+    const file = fileInput.files && fileInput.files[0];
+    let attachmentUrl = null;
+    if(file){
+      const path = `escalations/${partnerId}_${Date.now()}_${file.name}`;
+      attachmentUrl = await uploadFile(path, file);
+      if(!attachmentUrl) showToast('Attachment upload failed — sending the escalation without it.', 'error');
+    }
+    await createEscalation({ partnerId, partnerName: r.name, courseId: r.courseId||null, dayId, activity, description, attachmentUrl, trainerId: trainerIdentity.trainerId, trainerName: trainerIdentity.name });
+    cleanup();
+    showToast('Escalation sent to Admin.', 'success');
+  });
+}
+async function resolveEscalationRow(id){
+  await resolveEscalation(id);
+  showToast('Escalation marked resolved.', 'success');
+  renderAdminMain();
+}
 function securityRoleLabel(type){
   return { admin:'Admin', trainer:'Trainer', cc:'Content Creator', zt:'Zonal Manager', partner:'Partner' }[type] || type;
 }
@@ -5662,6 +6012,7 @@ function renderTrackingTableInner(cityFilter, trainerFilter, zoneFilter, categor
       ${isColumnVisible('dayScores')?`<td style="white-space:normal;font-size:11px;">${dayCells}</td>`:''}
       ${isColumnVisible('overall')?`<td>${overallText}</td>`:''}
       ${isColumnVisible('feedback')?`<td style="white-space:normal;font-size:11.5px;max-width:260px;">${feedbackCell}</td>`:''}
+      ${!isAdminRole() && !isZTRole() ? `<td><button class="btn small danger" onclick="openEscalationForm('${id}')">Escalate to Admin</button></td>` : ''}
     </tr>`;
   }).join('');
   const headerCells = [
