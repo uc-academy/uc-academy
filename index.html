@@ -737,6 +737,70 @@ async function resolveEscalation(id){
   const esc = await kvGet('escalation:'+id);
   if(esc) await kvSet('escalation:'+id, { ...esc, status:'resolved', resolvedBy: trainerIdentity.name, resolvedAt: new Date().toISOString() });
 }
+async function setEscalationStatus(id, status){
+  const esc = await kvGet('escalation:'+id);
+  if(esc) await kvSet('escalation:'+id, { ...esc, status, ...(status==='resolved'?{resolvedBy: trainerIdentity.name, resolvedAt: new Date().toISOString()}:{}) });
+}
+
+/* ---- SOS / SELF-HELP KNOWLEDGE BASE ---- */
+async function listSosCategories(){
+  const keys = await kvList('sosCategory:');
+  const out = {};
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out[k.slice(12)] = v; }));
+  return out;
+}
+async function createSosCategory(name){
+  const id = uid();
+  await kvSet('sosCategory:'+id, { name, active:true, createdAt:new Date().toISOString() });
+  return id;
+}
+async function updateSosCategory(id, data){ const c = await kvGet('sosCategory:'+id); if(c) await kvSet('sosCategory:'+id, {...c, ...data}); }
+async function deleteSosCategory(id){ await kvDelete('sosCategory:'+id); }
+
+async function listSosProblems(){
+  const keys = await kvList('sosProblem:');
+  const out = {};
+  await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out[k.slice(11)] = v; }));
+  return out;
+}
+function defaultSosProblem(categoryId){
+  return { categoryId, title:'New problem', keywords:[], theory:'', videoUrl:'', images:[], relatedProblemIds:[], nextAction:'', order:Date.now(), status:'Draft', translations:{}, createdAt:new Date().toISOString() };
+}
+async function saveSosProblem(id, data){ await kvSet('sosProblem:'+id, data); }
+async function deleteSosProblem(id){ await kvDelete('sosProblem:'+id); }
+
+async function logSosSearch(query, categoryId, resultCount){
+  const id = String(Date.now()).padStart(14,'0')+'_'+uid();
+  await kvSet('sosSearchLog:'+id, { query, categoryId: categoryId||null, resultCount, at: new Date().toISOString() });
+}
+async function logSosView(problemId, categoryId, language){
+  const id = String(Date.now()).padStart(14,'0')+'_'+uid();
+  await kvSet('sosViewLog:'+id, { problemId, categoryId, language, resolved:null, at: new Date().toISOString() });
+  return id;
+}
+async function markSosViewResolved(viewLogId, resolved){
+  const v = await kvGet('sosViewLog:'+viewLogId);
+  if(v) await kvSet('sosViewLog:'+viewLogId, { ...v, resolved });
+}
+async function listSosSearchLogs(limit){
+  const keys = (await kvList('sosSearchLog:')).sort().reverse();
+  const out = [];
+  await Promise.all(keys.slice(0,limit||1000).map(async k=>{ const v = await kvGet(k); if(v) out.push(v); }));
+  return out.sort((a,b)=> new Date(b.at)-new Date(a.at));
+}
+async function listSosViewLogs(limit){
+  const keys = (await kvList('sosViewLog:')).sort().reverse();
+  const out = [];
+  await Promise.all(keys.slice(0,limit||1000).map(async k=>{ const v = await kvGet(k); if(v) out.push(v); }));
+  return out.sort((a,b)=> new Date(b.at)-new Date(a.at));
+}
+function sosProblemTranslated(problem, lang){
+  if(!problem) return problem;
+  if(lang && lang!==DEFAULT_LANGUAGE && problem.translations && problem.translations[lang]){
+    return { ...problem, ...problem.translations[lang] };
+  }
+  return problem;
+}
 async function listPasswordResetLogs(limit){
   const keys = (await kvList('pwResetLog:')).sort().reverse();
   const capped = keys.slice(0, limit||500);
@@ -1323,6 +1387,15 @@ let currentUserUnlockedDays = [];
 let currentUserAssessmentUnlockedDays = [];
 let trainerIdentity = null;
 let gateMode = 'partner';
+let sosScreen = null; // null | 'category' | 'language' | 'problems' | 'solution' | 'escalate'
+let sosCategories = {};
+let sosProblems = {};
+let sosLanguages = [];
+let sosSelectedCategory = null;
+let sosSelectedLanguage = DEFAULT_LANGUAGE;
+let sosSelectedProblem = null;
+let sosSearchQuery = '';
+let sosCurrentViewLogId = null;
 let gateError = '';
 let gateBusy = false;
 let currentSessionToken = null;
@@ -1461,6 +1534,7 @@ function renderGate(){
         </div>
         ${gateMode==='partner' ? renderPartnerGateFields() : gateMode==='trainer' ? renderTrainerGateFields() : gateMode==='cc' ? renderCCGateFields() : renderZTGateFields()}
         ${gateError ? `<div class="gate-msg error">${gateError}</div>` : ''}
+        <div class="sos-help-link" onclick="openSosHelp()" style="text-align:center;margin-top:12px;padding:10px;border-radius:10px;background:rgba(255,255,255,0.08);cursor:pointer;font-weight:600;">🆘 SOS / Help — Find a quick solution</div>
         <div class="admin-login-link" onclick="setGateMode('admin')">&#128100; Admin Login</div>
       </div>
     </div>
@@ -1469,6 +1543,60 @@ function renderGate(){
   else if(gateMode==='trainer') attachGateEnter('trainer-pass-input', submitTrainerLogin);
   else if(gateMode==='cc') attachGateEnter('cc-pass-input', submitCCLogin);
   else attachGateEnter('zt-pass-input', submitZTLogin);
+}
+/* ---- SOS / SELF-HELP FLOW (accessible pre-login) ---- */
+async function openSosHelp(){
+  sosScreen = 'category';
+  sosSelectedCategory = null; sosSelectedProblem = null; sosSearchQuery = '';
+  const root = document.getElementById('root');
+  root.innerHTML = `<div class="gate-wrap"><div class="gate-card" style="max-width:520px;"><div class="empty-state">Loading help topics...</div></div></div>`;
+  sosCategories = await listSosCategories();
+  sosProblems = await listSosProblems();
+  await seedDefaultLanguageIfEmpty();
+  const langs = await listLanguages();
+  sosLanguages = Object.values(langs).filter(l=>l.active!==false).map(l=>l.name);
+  if(!sosLanguages.includes(DEFAULT_LANGUAGE)) sosLanguages.unshift(DEFAULT_LANGUAGE);
+  renderSosScreen();
+}
+function closeSosHelp(){
+  sosScreen = null;
+  renderGate();
+}
+function sosWrap(inner){
+  return `<div class="gate-wrap"><div class="gate-card" style="max-width:560px;text-align:left;">
+    <div class="gate-brand" style="margin-bottom:10px;">${renderLogoMark('gate-mark')}<div class="gate-brand-text"><div class="t1">🆘 SOS / Help</div><div class="t2">Find a quick solution before contacting your Trainer</div></div></div>
+    ${inner}
+  </div></div>`;
+}
+function renderSosScreen(){
+  const root = document.getElementById('root');
+  document.getElementById('hamburger').style.display='none';
+  if(sosScreen==='category') root.innerHTML = sosWrap(renderSosCategoryScreen());
+  else if(sosScreen==='language') root.innerHTML = sosWrap(renderSosLanguageScreen());
+  else if(sosScreen==='problems') root.innerHTML = sosWrap(renderSosProblemsScreen());
+  else if(sosScreen==='solution') root.innerHTML = sosWrap(renderSosSolutionScreen());
+  else if(sosScreen==='escalate') root.innerHTML = sosWrap(renderSosEscalateScreen());
+  else renderGate();
+}
+function renderSosCategoryScreen(){
+  const cats = Object.entries(sosCategories).filter(([,c])=>c.active!==false);
+  return `
+    <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">What kind of appliance or issue do you need help with?</p>
+    ${cats.length===0?`<div class="empty-state">No help topics have been set up yet. Please contact your Trainer.</div>`:`
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      ${cats.map(([id,c])=>`<button class="btn secondary" style="text-align:left;justify-content:flex-start;" onclick="sosSelectedCategory='${id}'; sosScreen='language'; renderSosScreen();">${esc(c.name)}</button>`).join('')}
+    </div>`}
+    <div class="sos-help-link" onclick="closeSosHelp()" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back to Login</div>
+  `;
+}
+function renderSosLanguageScreen(){
+  return `
+    <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">Which language would you like the theory and video explained in?</p>
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      ${sosLanguages.map(l=>`<button class="btn secondary" style="text-align:left;justify-content:flex-start;" onclick="sosSelectedLanguage='${esc(l)}'; sosScreen='problems'; renderSosScreen();">${esc(l)}</button>`).join('')}
+    </div>
+    <div class="sos-help-link" onclick="sosScreen='category'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back</div>
+  `;
 }
 function renderCCGateFields(){
   return `
@@ -1479,6 +1607,111 @@ function renderCCGateFields(){
     <button class="gate-submit" onclick="submitCCLogin()" ${gateBusy?'disabled':''}>${gateBusy?'Checking...':'Login'}</button>
     <div class="gate-foot">Content Creator access — module editing only. Contact your Admin for a password.</div>
   `;
+}
+function sosMatchesQuery(problem, q){
+  if(!q) return true;
+  const query = q.toLowerCase();
+  const inTitle = (problem.title||'').toLowerCase().includes(query);
+  const inKeywords = (problem.keywords||[]).some(k=>k.toLowerCase().includes(query));
+  const inTheory = (problem.theory||'').toLowerCase().includes(query);
+  return inTitle || inKeywords || inTheory;
+}
+function renderSosProblemsScreen(){
+  const catName = sosCategories[sosSelectedCategory] ? sosCategories[sosSelectedCategory].name : '';
+  let list = Object.entries(sosProblems).filter(([,p])=>p.categoryId===sosSelectedCategory && p.status==='Published');
+  if(sosSearchQuery) list = list.filter(([,p])=>sosMatchesQuery(sosProblemTranslated(p, sosSelectedLanguage), sosSearchQuery));
+  list.sort((a,b)=>(a[1].order||0)-(b[1].order||0));
+  return `
+    <p style="font-size:13px;color:var(--ink-soft);margin-bottom:4px;">${esc(catName)} &middot; ${esc(sosSelectedLanguage)}</p>
+    <span class="field-label">Search your issue</span>
+    <input class="field-input" id="sos-search-input" value="${esc(sosSearchQuery)}" placeholder="e.g. no cooling, water leaking..." oninput="sosSearchQuery=this.value; renderSosScreen();">
+    ${list.length===0?`<div class="empty-state">${sosSearchQuery?'No matching topics — try different keywords, or ':'No published topics for this category yet — '}<span style="cursor:pointer;text-decoration:underline;" onclick="sosScreen='escalate'; renderSosScreen();">ask your Trainer directly</span>.</div>`:`
+    <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px;">
+      ${list.map(([id,p])=>{ const tr = sosProblemTranslated(p, sosSelectedLanguage); return `<button class="btn secondary" style="text-align:left;justify-content:flex-start;" onclick="openSosProblem('${id}')">${esc(tr.title)}</button>`; }).join('')}
+    </div>`}
+    <div class="sos-help-link" onclick="sosScreen='language'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back</div>
+  `;
+}
+async function openSosProblem(id){
+  sosSelectedProblem = id;
+  sosScreen = 'solution';
+  await logSosSearch(sosSearchQuery, sosSelectedCategory, 1);
+  sosCurrentViewLogId = await logSosView(id, sosSelectedCategory, sosSelectedLanguage);
+  renderSosScreen();
+}
+function renderSosSolutionScreen(){
+  const p = sosProblems[sosSelectedProblem];
+  if(!p) return `<div class="empty-state">This topic is no longer available.</div><div class="sos-help-link" onclick="sosScreen='problems'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;">← Back</div>`;
+  const tr = sosProblemTranslated(p, sosSelectedLanguage);
+  const related = (p.relatedProblemIds||[]).map(rid=>sosProblems[rid]).filter(Boolean);
+  const videoInfo = tr.videoUrl ? normalizeUrl(tr.videoUrl) : null;
+  const embedUrl = videoInfo && videoInfo.embedUrl ? videoInfo.embedUrl : null;
+  return `
+    <h2 style="margin:0 0 10px;font-size:19px;">${esc(tr.title)}</h2>
+    ${embedUrl?`<div style="position:relative;padding-bottom:56.25%;height:0;border-radius:10px;overflow:hidden;margin-bottom:14px;"><iframe src="${esc(embedUrl)}" style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;" allowfullscreen></iframe></div>`:''}
+    <div style="white-space:pre-wrap;font-size:14px;line-height:1.6;margin-bottom:14px;">${esc(tr.theory||'')}</div>
+    ${(p.images||[]).length?`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">${p.images.map(src=>`<img src="${esc(src)}" style="max-width:140px;border-radius:8px;">`).join('')}</div>`:''}
+    ${tr.nextAction?`<div class="save-note" style="margin-bottom:14px;"><strong>Recommended next step:</strong> ${esc(tr.nextAction)}</div>`:''}
+    ${related.length?`<div style="margin-bottom:14px;"><span class="field-label">Related topics</span><div style="display:flex;flex-direction:column;gap:6px;">${related.map(r=>{ const rid = Object.keys(sosProblems).find(k=>sosProblems[k]===r); return `<button class="btn secondary small" style="text-align:left;" onclick="openSosProblem('${rid}')">${esc(sosProblemTranslated(r, sosSelectedLanguage).title)}</button>`; }).join('')}</div></div>`:''}
+    <div style="display:flex;gap:8px;margin-top:16px;">
+      <button class="btn secondary" style="flex:1;" onclick="markSosResolved(true)">✓ This solved it</button>
+      <button class="btn amber" style="flex:1;" onclick="sosScreen='escalate'; renderSosScreen();">Still Need Help</button>
+    </div>
+    <div class="sos-help-link" onclick="sosScreen='problems'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back to topics</div>
+  `;
+}
+async function markSosResolved(resolved){
+  if(sosCurrentViewLogId) await markSosViewResolved(sosCurrentViewLogId, resolved);
+  showToast('Glad that helped!', 'success');
+  sosScreen = 'problems';
+  renderSosScreen();
+}
+function renderSosEscalateScreen(){
+  const p = sosProblems[sosSelectedProblem];
+  const catName = sosCategories[sosSelectedCategory] ? sosCategories[sosSelectedCategory].name : '';
+  return `
+    <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">Still stuck? Send this to your Trainer (or Admin, if no Trainer is assigned yet) and they'll follow up with you directly.</p>
+    <span class="field-label">Your Partner ID</span>
+    <input class="field-input" id="sos-esc-partnerid" placeholder="e.g. SY8213">
+    <span class="field-label">Describe what's happening</span>
+    <textarea class="field-input reflect" id="sos-esc-description" style="min-height:70px;" placeholder="What have you tried already?"></textarea>
+    <span class="field-label">Attach a photo (optional)</span>
+    <input class="field-input" id="sos-esc-attachment" type="file" accept="image/*">
+    <button class="btn amber" style="width:100%;margin-top:8px;" onclick="submitSosEscalation()">Send</button>
+    <div class="sos-help-link" onclick="sosScreen=sosSelectedProblem?'solution':'problems'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back</div>
+  `;
+}
+async function submitSosEscalation(){
+  const partnerId = document.getElementById('sos-esc-partnerid').value.trim().toUpperCase();
+  const description = document.getElementById('sos-esc-description').value.trim();
+  if(!partnerId){ showToast('Enter your Partner ID so your Trainer can find your record.', 'error'); return; }
+  if(!description){ showToast('Describe what\'s happening before sending.', 'error'); return; }
+  const r = await getRosterEntry(partnerId);
+  const p = sosProblems[sosSelectedProblem];
+  const fileInput = document.getElementById('sos-esc-attachment');
+  const file = fileInput.files && fileInput.files[0];
+  let attachmentUrl = null;
+  if(file){
+    const path = `sos-escalations/${partnerId}_${Date.now()}_${file.name}`;
+    attachmentUrl = await uploadFile(path, file);
+  }
+  await createEscalation({
+    source:'sos',
+    partnerId,
+    partnerName: r ? r.name : partnerId,
+    courseId: r ? r.courseId||null : null,
+    dayId: null,
+    activity: p ? p.title : 'SOS Help',
+    sosCategoryId: sosSelectedCategory,
+    sosCategoryName: sosCategories[sosSelectedCategory] ? sosCategories[sosSelectedCategory].name : null,
+    language: sosSelectedLanguage,
+    description,
+    attachmentUrl,
+    trainerId: r ? r.trainerId||null : null,
+    trainerName: r ? r.trainer : null,
+  });
+  showToast('Sent — your Trainer will follow up with you.', 'success');
+  closeSosHelp();
 }
 function renderZTGateFields(){
   return `
