@@ -1554,7 +1554,7 @@ function renderGate(){
 }
 /* ---- SOS / SELF-HELP FLOW (accessible pre-login) ---- */
 async function openSosHelp(){
-  sosScreen = 'category';
+  sosScreen = 'step1';
   sosSelectedCategory = null; sosSelectedProblem = null; sosSearchQuery = ''; sosPartnerId = ''; sosPartnerRecord = null;
   const root = document.getElementById('root');
   root.innerHTML = `<div class="gate-wrap"><div class="gate-card" style="max-width:520px;"><div class="empty-state">Loading help topics...</div></div></div>`;
@@ -1580,56 +1580,40 @@ function sosWrap(inner){
 function renderSosScreen(){
   const root = document.getElementById('root');
   document.getElementById('hamburger').style.display='none';
-  if(sosScreen==='category') root.innerHTML = sosWrap(renderSosCategoryScreen());
-  else if(sosScreen==='language') root.innerHTML = sosWrap(renderSosLanguageScreen());
-  else if(sosScreen==='partnerid') root.innerHTML = sosWrap(renderSosPartnerIdScreen());
+  if(sosScreen==='step1') root.innerHTML = sosWrap(renderSosStep1Screen());
   else if(sosScreen==='problems') root.innerHTML = sosWrap(renderSosProblemsScreen());
   else if(sosScreen==='solution'){ root.innerHTML = sosWrap(renderSosSolutionScreen()); initSosVideoTracking(); }
   else if(sosScreen==='escalate') root.innerHTML = sosWrap(renderSosEscalateScreen());
   else renderGate();
 }
-function renderSosCategoryScreen(){
+function renderSosStep1Screen(){
   const cats = Object.entries(sosCategories).filter(([,c])=>c.active!==false);
   return `
-    <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">What kind of appliance or issue do you need help with?</p>
+    <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">Tell us what you need help with, and in which language.</p>
     ${cats.length===0?`<div class="empty-state">No help topics have been set up yet. Please contact your Trainer.</div>`:`
-    <div style="display:flex;flex-direction:column;gap:8px;">
-      ${cats.map(([id,c])=>`<button class="btn secondary" style="text-align:left;justify-content:flex-start;" onclick="sosSelectedCategory='${id}'; sosScreen='language'; renderSosScreen();">${esc(c.name)}</button>`).join('')}
-    </div>`}
+    <span class="field-label">Category</span>
+    <select class="field-input" id="sos-category-select">
+      <option value="">— Select a category —</option>
+      ${cats.map(([id,c])=>`<option value="${id}" ${sosSelectedCategory===id?'selected':''}>${esc(c.name)}</option>`).join('')}
+    </select>
+    <span class="field-label">Language</span>
+    <select class="field-input" id="sos-language-select">
+      ${sosLanguages.map(l=>`<option value="${esc(l)}" ${sosSelectedLanguage===l?'selected':''}>${esc(l)}</option>`).join('')}
+    </select>
+    <span class="field-label">Partner ID (optional)</span>
+    <input class="field-input" id="sos-partnerid-input" value="${esc(sosPartnerId)}" placeholder="e.g. SY8213 — helps connect you to your Trainer if you escalate later">
+    <button class="btn amber" style="width:100%;margin-top:8px;" onclick="confirmSosStep1()">Next</button>`}
     <div class="sos-help-link" onclick="closeSosHelp()" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back to Login</div>
   `;
 }
-function renderSosLanguageScreen(){
-  return `
-    <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">Which language would you like the theory and video explained in?</p>
-    <div style="display:flex;flex-direction:column;gap:8px;">
-      ${sosLanguages.map(l=>`<button class="btn secondary" style="text-align:left;justify-content:flex-start;" onclick="sosSelectedLanguage='${esc(l)}'; sosScreen='partnerid'; renderSosScreen();">${esc(l)}</button>`).join('')}
-    </div>
-    <div class="sos-help-link" onclick="sosScreen='category'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back</div>
-  `;
-}
-function renderSosPartnerIdScreen(){
-  return `
-    <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">If you enter your Partner ID, we can connect this to your Trainer if you need to escalate later — completely optional.</p>
-    <span class="field-label">Partner ID (optional)</span>
-    <input class="field-input" id="sos-partnerid-input" value="${esc(sosPartnerId)}" placeholder="e.g. SY8213">
-    <div style="display:flex;gap:8px;margin-top:10px;">
-      <button class="btn secondary" style="flex:1;" onclick="skipSosPartnerId()">Skip</button>
-      <button class="btn amber" style="flex:1;" onclick="confirmSosPartnerId()">Continue</button>
-    </div>
-    <div class="sos-help-link" onclick="sosScreen='language'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back</div>
-  `;
-}
-async function confirmSosPartnerId(){
+async function confirmSosStep1(){
+  const catId = document.getElementById('sos-category-select').value;
+  if(!catId){ showToast('Select a category to continue.', 'error'); return; }
+  sosSelectedCategory = catId;
+  sosSelectedLanguage = document.getElementById('sos-language-select').value;
   const id = document.getElementById('sos-partnerid-input').value.trim().toUpperCase();
   sosPartnerId = id;
   sosPartnerRecord = id ? await getRosterEntry(id) : null;
-  sosScreen = 'problems';
-  renderSosScreen();
-}
-function skipSosPartnerId(){
-  sosPartnerId = '';
-  sosPartnerRecord = null;
   sosScreen = 'problems';
   renderSosScreen();
 }
@@ -1643,19 +1627,38 @@ function renderCCGateFields(){
     <div class="gate-foot">Content Creator access — module editing only. Contact your Admin for a password.</div>
   `;
 }
-function sosMatchesQuery(problem, q){
-  if(!q) return true;
-  const query = q.toLowerCase();
-  const inTitle = (problem.title||'').toLowerCase().includes(query);
-  const inKeywords = (problem.keywords||[]).some(k=>k.toLowerCase().includes(query));
-  const inTheory = (problem.theory||'').toLowerCase().includes(query);
-  return inTitle || inKeywords || inTheory;
+function sosRelevanceScore(problem, q){
+  if(!q) return 0;
+  const query = q.toLowerCase().trim();
+  const title = (problem.title||'').toLowerCase();
+  const keywords = (problem.keywords||[]).map(k=>k.toLowerCase());
+  const theory = (problem.theory||'').toLowerCase();
+  let score = 0;
+  if(title===query) score = Math.max(score, 100);
+  else if(title.startsWith(query)) score = Math.max(score, 80);
+  else if(title.includes(query)) score = Math.max(score, 60);
+  if(keywords.some(k=>k===query)) score = Math.max(score, 70);
+  else if(keywords.some(k=>k.includes(query) || query.includes(k))) score = Math.max(score, 50);
+  if(theory.includes(query)) score = Math.max(score, 20);
+  // Partial word-overlap boost, so "AC water leaking" still surfaces "Washing machine leaking" style matches
+  const queryWords = query.split(/\s+/).filter(w=>w.length>2);
+  const titleWords = title.split(/\s+/);
+  const overlap = queryWords.filter(w=>titleWords.some(tw=>tw.includes(w))).length;
+  if(overlap>0) score = Math.max(score, 30+overlap*10);
+  return score;
 }
 function renderSosProblemsScreen(){
   const catName = sosCategories[sosSelectedCategory] ? sosCategories[sosSelectedCategory].name : '';
   let list = Object.entries(sosProblems).filter(([,p])=>p.categoryId===sosSelectedCategory && p.status==='Published');
-  if(sosSearchQuery) list = list.filter(([,p])=>sosMatchesQuery(sosProblemTranslated(p, sosSelectedLanguage), sosSearchQuery));
-  list.sort((a,b)=>(a[1].order||0)-(b[1].order||0));
+  if(sosSearchQuery){
+    list = list
+      .map(([id,p])=>[id, p, sosRelevanceScore(sosProblemTranslated(p, sosSelectedLanguage), sosSearchQuery)])
+      .filter(([,,score])=>score>0)
+      .sort((a,b)=>b[2]-a[2])
+      .map(([id,p])=>[id,p]);
+  } else {
+    list.sort((a,b)=>(a[1].order||0)-(b[1].order||0));
+  }
   return `
     <p style="font-size:13px;color:var(--ink-soft);margin-bottom:4px;">${esc(catName)} &middot; ${esc(sosSelectedLanguage)}</p>
     <span class="field-label">Search your issue</span>
@@ -1664,7 +1667,7 @@ function renderSosProblemsScreen(){
     <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px;">
       ${list.map(([id,p])=>{ const tr = sosProblemTranslated(p, sosSelectedLanguage); return `<button class="btn secondary" style="text-align:left;justify-content:flex-start;" onclick="openSosProblem('${id}')">${esc(tr.title)}</button>`; }).join('')}
     </div>`}
-    <div class="sos-help-link" onclick="sosScreen='language'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back</div>
+    <div class="sos-help-link" onclick="sosScreen='step1'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back</div>
   `;
 }
 async function openSosProblem(id){
