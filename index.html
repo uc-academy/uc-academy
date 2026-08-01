@@ -1599,12 +1599,21 @@ async function openSosHelp(){
   sosSelectedCategory = null; sosSelectedProblem = null; sosSearchQuery = ''; sosPartnerId = ''; sosPartnerRecord = null;
   const root = document.getElementById('root');
   root.innerHTML = `<div class="gate-wrap"><div class="gate-card" style="max-width:520px;"><div class="empty-state">Loading help topics...</div></div></div>`;
-  sosCategories = await listSosCategories();
-  sosProblems = await listSosProblems();
-  await seedDefaultLanguageIfEmpty();
-  const langs = await listLanguages();
-  sosLanguages = Object.values(langs).filter(l=>l.active!==false).map(l=>l.name);
-  if(!sosLanguages.includes(DEFAULT_LANGUAGE)) sosLanguages.unshift(DEFAULT_LANGUAGE);
+  try{
+    sosCategories = await listSosCategories();
+    sosProblems = await listSosProblems();
+    await seedDefaultLanguageIfEmpty();
+    const langs = await listLanguages();
+    sosLanguages = Object.values(langs).filter(l=>l.active!==false).map(l=>l.name);
+    if(!sosLanguages.includes(DEFAULT_LANGUAGE)) sosLanguages.unshift(DEFAULT_LANGUAGE);
+  }catch(e){
+    console.error('SOS Help failed to load:', e);
+    sosCategories = sosCategories || {};
+    sosProblems = sosProblems || {};
+    sosLanguages = sosLanguages && sosLanguages.length ? sosLanguages : [DEFAULT_LANGUAGE];
+    root.innerHTML = sosWrap(`<div class="empty-state">Couldn't load help topics right now — check your connection and try again.</div><div class="sos-help-link" onclick="closeSosHelp()" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back to Login</div>`);
+    return;
+  }
   renderSosScreen();
 }
 function closeSosHelp(){
