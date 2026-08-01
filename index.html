@@ -763,8 +763,24 @@ async function listSosProblems(){
   await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out[k.slice(11)] = v; }));
   return out;
 }
+function sosProblemCategoryIds(p){
+  if(!p) return [];
+  if(p.categoryIds && p.categoryIds.length) return p.categoryIds;
+  if(p.categoryId) return [p.categoryId];
+  return [];
+}
 function defaultSosProblem(categoryId){
-  return { categoryId, title:'New problem', keywords:[], theory:'', videoUrl:'', images:[], relatedProblemIds:[], nextAction:'', order:Date.now(), status:'Draft', translations:{}, createdAt:new Date().toISOString() };
+  return { categoryIds: categoryId?[categoryId]:[], title:'New problem', shortDescription:'', keywords:[], theory:'', videoUrl:'', audioUrl:'', images:[], documents:[], relatedProblemIds:[], nextAction:'', escalationInstructions:'', order:Date.now(), status:'Draft', enabled:true, translations:{}, createdAt:new Date().toISOString() };
+}
+async function logSosActivity(action, problemId, problemTitle, detail){
+  const id = String(Date.now()).padStart(14,'0')+'_'+uid();
+  await kvSet('sosActivityLog:'+id, { id, action, problemId, problemTitle, detail: detail||'', editorName: trainerIdentity.name, at: new Date().toISOString() });
+}
+async function listSosActivityLogs(limit){
+  const keys = (await kvList('sosActivityLog:')).sort().reverse();
+  const out = [];
+  await Promise.all(keys.slice(0,limit||500).map(async k=>{ const v = await kvGet(k); if(v) out.push(v); }));
+  return out.sort((a,b)=> new Date(b.at)-new Date(a.at));
 }
 async function saveSosProblem(id, data){ await kvSet('sosProblem:'+id, data); }
 async function deleteSosProblem(id){ await kvDelete('sosProblem:'+id); }
@@ -962,6 +978,31 @@ function effectiveCCPermissions(cc){
   const defaults = defaultCCPermissions();
   if(!cc || !cc.permissions) return defaults;
   return { ...defaults, ...cc.permissions };
+}
+const SOS_ACTION_TYPES = [
+  ['canCreate','Add problems'], ['canEdit','Edit problems'], ['canDelete','Delete problems'],
+  ['canUploadVideo','Upload videos'], ['canEditTheory','Edit theory'],
+  ['canSaveDraft','Save drafts'], ['canPublish','Publish content'],
+];
+function defaultSosCCPermissions(){
+  const perms = {};
+  SOS_ACTION_TYPES.forEach(([key])=>{ perms[key] = true; });
+  return perms;
+}
+function effectiveSosCCPermissions(cc){
+  const defaults = defaultSosCCPermissions();
+  if(!cc || !cc.sosPermissions) return defaults;
+  return { ...defaults, ...cc.sosPermissions };
+}
+function ccSosCan(action){
+  if(!isCCRole()) return true;
+  const perms = trainerIdentity.sosPermissions || defaultSosCCPermissions();
+  return perms[action]!==false;
+}
+function ccSosLanguageAllowed(langName){
+  if(isAdminRole()) return true;
+  const list = trainerIdentity.sosAssignedLanguages || [];
+  return list.length===0 || list.includes(langName);
 }
 function ccCan(action){
   if(!isCCRole()) return true; // Admin always has full permissions
@@ -1569,6 +1610,7 @@ async function openSosHelp(){
 function closeSosHelp(){
   cleanupSosVideoTracking();
   sosScreen = null;
+  if(sosPreviewMode){ exitSosPreview(); return; }
   renderGate();
 }
 function sosWrap(inner){
@@ -1578,6 +1620,7 @@ function sosWrap(inner){
   </div></div>`;
 }
 function renderSosScreen(){
+  if(sosPreviewMode){ renderAdminMain(); return; }
   const root = document.getElementById('root');
   document.getElementById('hamburger').style.display='none';
   if(sosScreen==='step1') root.innerHTML = sosWrap(renderSosStep1Screen());
@@ -1649,7 +1692,7 @@ function sosRelevanceScore(problem, q){
 }
 function renderSosProblemsScreen(){
   const catName = sosCategories[sosSelectedCategory] ? sosCategories[sosSelectedCategory].name : '';
-  let list = Object.entries(sosProblems).filter(([,p])=>p.categoryId===sosSelectedCategory && p.status==='Published');
+  let list = Object.entries(sosProblems).filter(([,p])=>sosProblemCategoryIds(p).includes(sosSelectedCategory) && (p.status==='Published' || sosPreviewMode) && p.enabled!==false);
   if(sosSearchQuery){
     list = list
       .map(([id,p])=>[id, p, sosRelevanceScore(sosProblemTranslated(p, sosSelectedLanguage), sosSearchQuery)])
@@ -1665,7 +1708,7 @@ function renderSosProblemsScreen(){
     <input class="field-input" id="sos-search-input" value="${esc(sosSearchQuery)}" placeholder="e.g. no cooling, water leaking..." oninput="sosSearchQuery=this.value; renderSosScreen();">
     ${list.length===0?`<div class="empty-state">${sosSearchQuery?'No matching topics — try different keywords, or ':'No published topics for this category yet — '}<span style="cursor:pointer;text-decoration:underline;" onclick="sosScreen='escalate'; renderSosScreen();">ask your Trainer directly</span>.</div>`:`
     <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px;">
-      ${list.map(([id,p])=>{ const tr = sosProblemTranslated(p, sosSelectedLanguage); return `<button class="btn secondary" style="text-align:left;justify-content:flex-start;" onclick="openSosProblem('${id}')">${esc(tr.title)}</button>`; }).join('')}
+      ${list.map(([id,p])=>{ const tr = sosProblemTranslated(p, sosSelectedLanguage); return `<button class="btn secondary" style="text-align:left;justify-content:flex-start;" onclick="openSosProblem('${id}')">${esc(tr.title)}${sosPreviewMode && p.status==='Draft'?' <span style="color:var(--amber);font-size:11px;">(Draft)</span>':''}</button>`; }).join('')}
     </div>`}
     <div class="sos-help-link" onclick="sosScreen='step1'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back</div>
   `;
@@ -1674,26 +1717,30 @@ async function openSosProblem(id){
   cleanupSosVideoTracking();
   sosSelectedProblem = id;
   sosScreen = 'solution';
-  await logSosSearch(sosSearchQuery, sosSelectedCategory, 1);
   const p = sosProblems[id];
   const tr = sosProblemTranslated(p, sosSelectedLanguage);
   const r = sosPartnerRecord;
-  sosCurrentViewLogId = await logSosView({
-    problemId: id,
-    problemTitle: tr.title,
-    videoTitle: tr.title,
-    categoryId: sosSelectedCategory,
-    categoryName: sosCategories[sosSelectedCategory] ? sosCategories[sosSelectedCategory].name : null,
-    language: sosSelectedLanguage,
-    partnerId: sosPartnerId || null,
-    partnerName: r ? r.name : null,
-    city: r ? r.city : null,
-    cluster: r ? (CITY_ZONE[r.city]||null) : null,
-    trainerName: r ? r.trainer : null,
-    trainerId: r ? r.trainerId||null : null,
-    batchNumber: r ? r.batchNumber||null : null,
-    courseId: r ? r.courseId||null : null,
-  });
+  if(!sosPreviewMode){
+    await logSosSearch(sosSearchQuery, sosSelectedCategory, 1);
+    sosCurrentViewLogId = await logSosView({
+      problemId: id,
+      problemTitle: tr.title,
+      videoTitle: tr.title,
+      categoryId: sosSelectedCategory,
+      categoryName: sosCategories[sosSelectedCategory] ? sosCategories[sosSelectedCategory].name : null,
+      language: sosSelectedLanguage,
+      partnerId: sosPartnerId || null,
+      partnerName: r ? r.name : null,
+      city: r ? r.city : null,
+      cluster: r ? (CITY_ZONE[r.city]||null) : null,
+      trainerName: r ? r.trainer : null,
+      trainerId: r ? r.trainerId||null : null,
+      batchNumber: r ? r.batchNumber||null : null,
+      courseId: r ? r.courseId||null : null,
+    });
+  } else {
+    sosCurrentViewLogId = null;
+  }
   renderSosScreen();
 }
 function renderSosSolutionScreen(){
@@ -1706,9 +1753,12 @@ function renderSosSolutionScreen(){
   const embedUrl = videoInfo && videoInfo.embedUrl ? videoInfo.embedUrl : null;
   return `
     <h2 style="margin:0 0 10px;font-size:19px;">${esc(tr.title)}</h2>
+    ${tr.shortDescription?`<p style="font-size:13px;color:var(--ink-soft);margin:-6px 0 12px;">${esc(tr.shortDescription)}</p>`:''}
     ${embedUrl?`<div style="position:relative;padding-bottom:56.25%;height:0;border-radius:10px;overflow:hidden;margin-bottom:14px;">${isYouTube?`<div id="sos-yt-player" style="position:absolute;top:0;left:0;width:100%;height:100%;"></div>`:`<iframe src="${esc(embedUrl)}" style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;" allowfullscreen></iframe>`}</div>`:''}
-    <div style="white-space:pre-wrap;font-size:14px;line-height:1.6;margin-bottom:14px;">${esc(tr.theory||'')}</div>
-    ${(p.images||[]).length?`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">${p.images.map(src=>`<img src="${esc(src)}" style="max-width:140px;border-radius:8px;">`).join('')}</div>`:''}
+    ${tr.theory?`<div style="white-space:pre-wrap;font-size:14px;line-height:1.6;margin-bottom:14px;">${esc(tr.theory)}</div>`:''}
+    ${tr.audioUrl?`<audio controls style="width:100%;margin-bottom:14px;"><source src="${esc(tr.audioUrl)}"></audio>`:''}
+    ${(tr.images||[]).length?`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">${tr.images.map(src=>`<img src="${esc(src)}" style="max-width:140px;border-radius:8px;">`).join('')}</div>`:''}
+    ${(tr.documents||[]).length?`<div style="margin-bottom:14px;"><span class="field-label">Downloads</span>${tr.documents.map((d,i)=>`<a href="${esc(d)}" target="_blank" style="display:block;font-size:13px;color:var(--brand);margin-bottom:4px;">📄 Document ${i+1}</a>`).join('')}</div>`:''}
     ${tr.nextAction?`<div class="save-note" style="margin-bottom:14px;"><strong>Recommended next step:</strong> ${esc(tr.nextAction)}</div>`:''}
     ${related.length?`<div style="margin-bottom:14px;"><span class="field-label">Related topics</span><div style="display:flex;flex-direction:column;gap:6px;">${related.map(r=>{ const rid = Object.keys(sosProblems).find(k=>sosProblems[k]===r); return `<button class="btn secondary small" style="text-align:left;" onclick="openSosProblem('${rid}')">${esc(sosProblemTranslated(r, sosSelectedLanguage).title)}</button>`; }).join('')}</div></div>`:''}
     <div style="display:flex;gap:8px;margin-top:16px;">
@@ -2136,7 +2186,7 @@ async function loginAsCC(ccId, opts){
       if(stored && opts.sessionToken!==stored) return { ok:false, reason:'session_replaced' };
     }
   }
-  trainerIdentity = { isAdmin:false, isCC:true, ccId, name:c.name, phone:c.phone, assignedCategories:c.assignedCategories||[], assignedCourses:c.assignedCourses||[], assignedLanguages:c.assignedLanguages||[], permissions: effectiveCCPermissions(c) };
+  trainerIdentity = { isAdmin:false, isCC:true, ccId, name:c.name, phone:c.phone, assignedCategories:c.assignedCategories||[], assignedCourses:c.assignedCourses||[], assignedLanguages:c.assignedLanguages||[], permissions: effectiveCCPermissions(c), sosAssignedCategories:c.sosAssignedCategories||[], sosAssignedLanguages:c.sosAssignedLanguages||[], sosPermissions: effectiveSosCCPermissions(c) };
   let sessionToken = opts.sessionToken;
   if(!opts.silent){
     sessionToken = newSessionToken();
@@ -3736,6 +3786,16 @@ let adminSosViewLogs = [];
 let adminSosSearchLogs = [];
 let sosAnalyticsFilters = { dateFrom:'', dateTo:'', category:'', course:'', city:'', cluster:'', trainer:'', batch:'', language:'', problem:'', resolved:'', escalated:'' };
 let sosAnalyticsOpenBucket = null;
+let adminSosActivityLogs = [];
+let sosContentFilterCategory = '';
+let sosContentFilterLanguage = '';
+let sosContentFilterProblem = '';
+let sosContentFilterSearch = '';
+let sosContentFilterStatus = '';
+let editingSosProblemId = null;
+let sosEditorDraft = null;
+let sosEditorLanguage = DEFAULT_LANGUAGE;
+let sosPreviewMode = false;
 let progressControlSearch = '';
 let progressControlFilterTrainer = '';
 let progressControlFilterCategory = '';
@@ -3799,6 +3859,7 @@ const ADMIN_TAB_KEYS_DEFAULT = [
   ['security','Security & Alerts','Sessions, lockouts & login activity'],
   ['progresscontrol','Partner Progress Control','View, diagnose & unblock partners'],
   ['sosanalytics','SOS Help Analytics','Search, video & escalation insights'],
+  ['soscontent','SOS Content Management','Manage help problems & solutions'],
   ['languages','Languages','Regional language content'],
   ['support','Support','Requests & issues'],
   ['history','History','Audit log'],
@@ -3824,6 +3885,7 @@ const TRAINER_TAB_KEYS_DEFAULT = [
 ];
 const CC_TAB_KEYS_DEFAULT = [
   ['modules','Modules','Edit course content'],
+  ['soscontent','SOS Content','Manage help problems & solutions'],
 ];
 const ZT_TAB_KEYS_DEFAULT = [
   ['partners','Partners','Create & manage'],
@@ -3947,7 +4009,7 @@ async function renderAdminMain(){
   el.innerHTML = `<div class="spinner-note">Loading...</div>`;
   if(adminTab==='overview'){ el.innerHTML = await renderOverviewTabAsync(); }
   else if(adminTab==='trainers'){ adminTrainers = await listTrainers(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderTrainersTab(); }
-  else if(adminTab==='ccmanage'){ adminCCs = await listCCs(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); el.innerHTML = renderCCManageTab(); }
+  else if(adminTab==='ccmanage'){ adminCCs = await listCCs(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); sosCategories = await listSosCategories(); el.innerHTML = renderCCManageTab(); }
   else if(adminTab==='ztmanage'){ adminZTs = await listZTs(); adminTrainers = await listTrainers(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); el.innerHTML = renderZTManageTab(); }
   else if(adminTab==='categories'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderCategoryManageTab(); }
   else if(adminTab==='security'){
@@ -3992,6 +4054,16 @@ async function renderAdminMain(){
     adminCategories = await listCategories();
     adminCourses = await listCourses();
     el.innerHTML = renderSosAnalyticsTab();
+  }
+  else if(adminTab==='soscontent'){
+    sosCategories = await listSosCategories();
+    sosProblems = await listSosProblems();
+    await seedDefaultLanguageIfEmpty();
+    const langs = await listLanguages();
+    sosLanguages = Object.values(langs).filter(l=>l.active!==false).map(l=>l.name);
+    if(!sosLanguages.includes(DEFAULT_LANGUAGE)) sosLanguages.unshift(DEFAULT_LANGUAGE);
+    adminSosActivityLogs = await listSosActivityLogs(300);
+    el.innerHTML = renderSosContentTab();
   }
   else if(adminTab==='languages'){ await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderLanguagesTab(); }
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
@@ -4234,6 +4306,7 @@ function renderCCManageTab(){
           <td>${fmtDateTime(c.createdAt)}</td>
           <td style="display:flex;gap:6px;flex-wrap:wrap;">
             <button class="btn small secondary" onclick="openCCPermissionsPanel('${id}')">Permissions</button>
+            <button class="btn small secondary" onclick="openSosCCPermissionsPanel('${id}')">SOS Permissions</button>
             <button class="btn small secondary" onclick="toggleCCActive('${id}')">${c.active!==false?'Deactivate':'Reactivate'}</button>
             <button class="btn small secondary" onclick="resetCCPassword('${id}')">Reset password</button>
             <button class="btn small danger" onclick="removeCC('${id}')">Remove</button>
@@ -4366,6 +4439,55 @@ async function saveCCPermissions(ccId){
   await logHistory('cc_permissions_updated', `Permissions for ${c.name} updated by ${trainerIdentity.name}`, {ccId, assignedCategories, assignedCourses, assignedLanguages, permissions});
   document.getElementById('cc-permissions-overlay')?.remove();
   showToast('Permissions saved.', 'success');
+  renderAdminMain();
+}
+function openSosCCPermissionsPanel(ccId){
+  const c = adminCCs[ccId];
+  if(!c) return;
+  const perms = effectiveSosCCPermissions(c);
+  const assignedCats = c.sosAssignedCategories||[];
+  const assignedLangs = c.sosAssignedLanguages||[];
+  const overlay = document.createElement('div');
+  overlay.id = 'sos-cc-permissions-overlay';
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `<div class="confirm-box" style="max-width:640px;max-height:85vh;overflow-y:auto;text-align:left;">
+    <h3 style="margin-top:0;">SOS Help permissions for ${esc(c.name)}</h3>
+    <p style="font-size:12.5px;color:var(--ink-soft);margin-top:-6px;">Separate from their course-editing permissions — this only controls what they can do in SOS Content Management.</p>
+
+    <span class="field-label">Assigned SOS categories <span style="font-weight:400;color:var(--ink-soft);">(leave none checked to allow every category)</span></span>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px;">
+      ${Object.entries(sosCategories).map(([id,cat])=>`<label style="display:flex;gap:5px;align-items:center;cursor:pointer;"><input type="checkbox" class="soscc-category" value="${id}" ${assignedCats.includes(id)?'checked':''}>${esc(cat.name)}</label>`).join('') || '<span style="color:var(--ink-soft);font-size:12px;">No SOS categories yet.</span>'}
+    </div>
+
+    <span class="field-label">Assigned languages <span style="font-weight:400;color:var(--ink-soft);">(leave none checked to allow every enabled language)</span></span>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+      ${Object.values(adminLanguages).filter(l=>l.active!==false).map(l=>`<label style="display:flex;gap:5px;align-items:center;cursor:pointer;"><input type="checkbox" class="soscc-language" value="${esc(l.name)}" ${assignedLangs.includes(l.name)?'checked':''}>${esc(l.name)}</label>`).join('')}
+    </div>
+
+    <span class="field-label">Allowed actions</span>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;">
+      ${SOS_ACTION_TYPES.map(([key,label])=>`<label style="display:flex;gap:5px;align-items:center;cursor:pointer;"><input type="checkbox" class="soscc-action" data-key="${key}" ${perms[key]?'checked':''}>${esc(label)}</label>`).join('')}
+    </div>
+
+    <div class="confirm-actions">
+      <button class="btn secondary" id="soscc-perm-cancel">Cancel</button>
+      <button class="btn amber" onclick="saveSosCCPermissions('${ccId}')">Save permissions</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#soscc-perm-cancel').addEventListener('click', ()=> overlay.remove());
+}
+async function saveSosCCPermissions(ccId){
+  const c = adminCCs[ccId];
+  if(!c) return;
+  const sosAssignedCategories = Array.from(document.querySelectorAll('.soscc-category:checked')).map(el=>el.value);
+  const sosAssignedLanguages = Array.from(document.querySelectorAll('.soscc-language:checked')).map(el=>el.value);
+  const sosPermissions = {};
+  document.querySelectorAll('.soscc-action').forEach(el=>{ sosPermissions[el.dataset.key] = el.checked; });
+  await kvSet('cc:'+ccId, { ...c, sosAssignedCategories, sosAssignedLanguages, sosPermissions });
+  await logHistory('cc_sos_permissions_updated', `SOS Help permissions for ${c.name} updated by ${trainerIdentity.name}`, {ccId, sosAssignedCategories, sosAssignedLanguages, sosPermissions});
+  document.getElementById('sos-cc-permissions-overlay')?.remove();
+  showToast('SOS permissions saved.', 'success');
   renderAdminMain();
 }
 
@@ -5683,6 +5805,296 @@ async function exportSosAnalyticsExcel(){
   XLSX.utils.book_append_sheet(wb, ws, 'SOS Tracking');
   XLSX.writeFile(wb, 'sos-help-analytics-'+todayStr()+'.xlsx');
 }
+/* ---- SOS CONTENT MANAGEMENT (admin + authorized CC) ---- */
+function renderSosContentTab(){
+  if(editingSosProblemId) return renderSosProblemEditor();
+  if(sosPreviewMode) return renderSosPreviewAsPartner();
+  const isCC = isCCRole();
+  let entries = Object.entries(sosProblems);
+  if(isCC) entries = entries.filter(([,p])=>sosProblemCategoryIds(p).some(cid=>ccSosCategoryAllowed(cid)));
+  const visibleCats = Object.entries(sosCategories).filter(([id])=>!isCC || ccSosCategoryAllowed(id));
+  if(sosContentFilterCategory) entries = entries.filter(([,p])=>sosProblemCategoryIds(p).includes(sosContentFilterCategory));
+  if(sosContentFilterLanguage && sosContentFilterLanguage!==DEFAULT_LANGUAGE) entries = entries.filter(([,p])=>p.translations && p.translations[sosContentFilterLanguage]);
+  if(sosContentFilterProblem) entries = entries.filter(([id])=>id===sosContentFilterProblem);
+  if(sosContentFilterStatus) entries = entries.filter(([,p])=>p.status===sosContentFilterStatus);
+  if(sosContentFilterSearch){
+    const q = sosContentFilterSearch.toLowerCase();
+    entries = entries.filter(([,p])=>(p.title||'').toLowerCase().includes(q) || (p.keywords||[]).some(k=>k.toLowerCase().includes(q)));
+  }
+  entries.sort((a,b)=>(a[1].order||0)-(b[1].order||0));
+  return `
+    <div class="crumb">${isAdminRole()?'Admin dashboard':'Content Creator dashboard'}</div>
+    <h1 class="page-title">SOS Content Management</h1>
+    <p class="page-sub">Create and manage the self-help problems and solutions partners see in SOS / Help.</p>
+    <div class="card">
+      <div class="filter-row">
+        <select id="soscm-f-category" onchange="sosContentFilterCategory=this.value; renderAdminMain();">
+          <option value="">All categories</option>
+          ${visibleCats.map(([id,c])=>`<option value="${id}" ${sosContentFilterCategory===id?'selected':''}>${esc(c.name)}</option>`).join('')}
+        </select>
+        <select id="soscm-f-language" onchange="sosContentFilterLanguage=this.value; renderAdminMain();">
+          <option value="">All languages</option>
+          ${sosLanguages.filter(l=>ccSosLanguageAllowed(l)).map(l=>`<option value="${esc(l)}" ${sosContentFilterLanguage===l?'selected':''}>${esc(l)}</option>`).join('')}
+        </select>
+        <select id="soscm-f-problem" onchange="sosContentFilterProblem=this.value; renderAdminMain();">
+          <option value="">All problem types</option>
+          ${entries.map(([id,p])=>`<option value="${id}" ${sosContentFilterProblem===id?'selected':''}>${esc(p.title)}</option>`).join('')}
+        </select>
+        <input class="field-input" id="soscm-f-search" value="${esc(sosContentFilterSearch)}" placeholder="Search title or keyword..." oninput="sosContentFilterSearch=this.value; renderAdminMain();" style="width:200px;margin-bottom:0;">
+        <select id="soscm-f-status" onchange="sosContentFilterStatus=this.value; renderAdminMain();">
+          <option value="">Draft &amp; Published</option>
+          <option value="Draft" ${sosContentFilterStatus==='Draft'?'selected':''}>Draft only</option>
+          <option value="Published" ${sosContentFilterStatus==='Published'?'selected':''}>Published only</option>
+        </select>
+        <button class="btn secondary small" onclick="sosContentFilterCategory='';sosContentFilterLanguage='';sosContentFilterProblem='';sosContentFilterSearch='';sosContentFilterStatus='';renderAdminMain();">Clear filters</button>
+        <button class="btn amber small" onclick="sosPreviewMode=true; renderAdminMain();">Preview as Partner</button>
+        ${ccSosCan('canCreate')?`<button class="btn amber small" onclick="createNewSosProblem()">+ New Problem</button>`:''}
+      </div>
+    </div>
+    <div class="card">
+      ${entries.length===0?`<div class="empty-state">No problems match this filter yet.${ccSosCan('canCreate')?' Click "+ New Problem" to add one.':''}</div>`:`
+      <table class="data-table">
+        <tr><th>Order</th><th>Title</th><th>Categories</th><th>Status</th><th>Enabled</th><th>Languages</th><th></th></tr>
+        ${entries.map(([id,p],i)=>`<tr>
+          <td>
+            <button class="btn small secondary" onclick="moveSosProblemOrder('${id}',-1)" ${i===0?'disabled':''}>↑</button>
+            <button class="btn small secondary" onclick="moveSosProblemOrder('${id}',1)" ${i===entries.length-1?'disabled':''}>↓</button>
+          </td>
+          <td>${esc(p.title)}</td>
+          <td>${sosProblemCategoryIds(p).map(cid=>sosCategories[cid]?esc(sosCategories[cid].name):'—').join(', ')||'—'}</td>
+          <td><span class="pill ${p.status==='Published'?'open':'scheduled'}">${p.status}</span></td>
+          <td>${p.enabled!==false?'✓':'<span style="color:var(--danger);">Off</span>'}</td>
+          <td style="font-size:11px;">${DEFAULT_LANGUAGE}${Object.keys(p.translations||{}).length?', '+Object.keys(p.translations).join(', '):''}</td>
+          <td>
+            <button class="btn small secondary" onclick="openSosProblemEditor('${id}')">Edit</button>
+            ${ccSosCan('canCreate')?`<button class="btn small secondary" onclick="duplicateSosProblemRow('${id}')">Duplicate</button>`:''}
+            <button class="btn small secondary" onclick="toggleSosProblemEnabled('${id}')">${p.enabled!==false?'Disable':'Enable'}</button>
+            ${ccSosCan('canDelete')?`<button class="btn small danger" onclick="deleteSosProblemRow('${id}')">Delete</button>`:''}
+          </td>
+        </tr>`).join('')}
+      </table>`}
+    </div>
+    <div class="card">
+      <h3>Activity History</h3>
+      ${adminSosActivityLogs.length===0?`<div class="empty-state">No SOS content changes recorded yet.</div>`:`
+      <table class="data-table">
+        <tr><th>Date &amp; time</th><th>Editor</th><th>Action</th><th>Problem</th><th>Detail</th></tr>
+        ${adminSosActivityLogs.slice(0,100).map(l=>`<tr><td class="mono">${fmtDateTime(l.at)}</td><td>${esc(l.editorName)}</td><td>${esc(l.action)}</td><td>${esc(l.problemTitle||'—')}</td><td>${esc(l.detail||'')}</td></tr>`).join('')}
+      </table>`}
+    </div>
+  `;
+}
+async function createNewSosProblem(){
+  const catId = sosContentFilterCategory || (Object.keys(sosCategories)[0]||null);
+  const id = uid();
+  const p = defaultSosProblem(catId);
+  await saveSosProblem(id, p);
+  sosProblems[id] = p;
+  await logSosActivity('Created', id, p.title, `New problem created`);
+  openSosProblemEditor(id);
+}
+function openSosProblemEditor(id){
+  editingSosProblemId = id;
+  sosEditorDraft = JSON.parse(JSON.stringify(sosProblems[id]));
+  sosEditorLanguage = DEFAULT_LANGUAGE;
+  renderAdminMain();
+}
+async function duplicateSosProblemRow(id){
+  const p = sosProblems[id];
+  if(!p) return;
+  const newId = uid();
+  const copy = { ...JSON.parse(JSON.stringify(p)), title: p.title+' (Copy)', status:'Draft', order: Date.now() };
+  await saveSosProblem(newId, copy);
+  await logSosActivity('Duplicated', newId, copy.title, `Duplicated from "${p.title}"`);
+  showToast('Problem duplicated as a new draft.', 'success');
+  renderAdminMain();
+}
+async function toggleSosProblemEnabled(id){
+  const p = sosProblems[id];
+  if(!p) return;
+  const newEnabled = p.enabled===false;
+  await saveSosProblem(id, { ...p, enabled: newEnabled });
+  await logSosActivity(newEnabled?'Enabled':'Disabled', id, p.title, '');
+  showToast(`Problem ${newEnabled?'enabled':'disabled'}.`, 'success');
+  renderAdminMain();
+}
+async function deleteSosProblemRow(id){
+  const p = sosProblems[id];
+  if(!p) return;
+  showConfirmModal(`Delete "${p.title}"? This can't be undone.`, async ()=>{
+    await deleteSosProblem(id);
+    await logSosActivity('Deleted', id, p.title, '');
+    showToast('Problem deleted.', 'success');
+    renderAdminMain();
+  });
+}
+async function moveSosProblemOrder(id, direction){
+  const entries = Object.entries(sosProblems).sort((a,b)=>(a[1].order||0)-(b[1].order||0));
+  const idx = entries.findIndex(([pid])=>pid===id);
+  const swapIdx = idx + direction;
+  if(swapIdx<0 || swapIdx>=entries.length) return;
+  const [id1, p1] = entries[idx];
+  const [id2, p2] = entries[swapIdx];
+  const order1 = p1.order||0, order2 = p2.order||0;
+  await saveSosProblem(id1, { ...p1, order: order2 });
+  await saveSosProblem(id2, { ...p2, order: order1 });
+  renderAdminMain();
+}
+function renderSosProblemEditor(){
+  const p = sosEditorDraft;
+  if(!p) return `<div class="empty-state">Nothing to edit.</div>`;
+  const isDefault = sosEditorLanguage===DEFAULT_LANGUAGE;
+  const tr = isDefault ? p : (p.translations[sosEditorLanguage] || {});
+  const existingLangs = [DEFAULT_LANGUAGE, ...Object.keys(p.translations||{})];
+  const addableLangs = sosLanguages.filter(l=>!existingLangs.includes(l) && ccSosLanguageAllowed(l));
+  const videoInfo = tr.videoUrl ? normalizeUrl(tr.videoUrl) : null;
+  const canEdit = ccSosCan('canEdit');
+  const canDelete = ccSosCan('canDelete');
+  const canEditTheory = canEdit && ccSosCan('canEditTheory');
+  const canUploadVideo = canEdit && ccSosCan('canUploadVideo');
+  return `
+    <div class="crumb">${isAdminRole()?'Admin dashboard':'Content Creator dashboard'} &middot; SOS Content</div>
+    <div class="back-link" onclick="cancelSosProblemEdit()">&larr; Back to problem list</div>
+    <h1 class="page-title">Edit Problem</h1>
+    <div class="card">
+      <span class="field-label">Editing language</span>
+      <div class="filter-row" style="margin-bottom:12px;">
+        ${existingLangs.map(l=>`<button class="btn small ${sosEditorLanguage===l?'amber':'secondary'}" onclick="switchSosEditorLanguage('${esc(l)}')">${esc(l)}</button>`).join('')}
+        ${addableLangs.length?`<select id="sos-add-lang" onchange="if(this.value){ switchSosEditorLanguage(this.value); this.value=''; }"><option value="">+ Add language...</option>${addableLangs.map(l=>`<option value="${esc(l)}">${esc(l)}</option>`).join('')}</select>`:''}
+      </div>
+
+      ${isDefault ? `
+      <span class="field-label">Categories (assign to one or more)</span>
+      <div class="filter-row" style="margin-bottom:10px;">
+        ${Object.entries(sosCategories).filter(([id])=>ccSosCategoryAllowed(id)).map(([id,c])=>`<label style="display:flex;align-items:center;gap:6px;font-size:13px;"><input type="checkbox" class="sos-cat-check" value="${id}" ${sosProblemCategoryIds(p).includes(id)?'checked':''} ${!canEdit?'disabled':''}>${esc(c.name)}</label>`).join('')}
+      </div>` : ''}
+
+      <span class="field-label">Problem title</span>
+      <input class="field-input" id="sos-ed-title" value="${esc(tr.title||'')}" ${!canEdit?'disabled':''}>
+
+      <span class="field-label">Short description</span>
+      <input class="field-input" id="sos-ed-shortdesc" value="${esc(tr.shortDescription||'')}" placeholder="One line summary shown in the problem list" ${!canEdit?'disabled':''}>
+
+      <span class="field-label">Step-by-step theory</span>
+      <textarea class="field-input reflect" id="sos-ed-theory" style="min-height:100px;" ${!canEditTheory?'disabled':''}>${esc(tr.theory||'')}</textarea>
+      <p style="font-size:11.5px;color:var(--ink-soft);margin:-8px 0 10px;">Leave blank to hide the theory section from partners entirely.</p>
+
+      <span class="field-label">Video link (YouTube, Drive, or direct link)</span>
+      <input class="field-input" id="sos-ed-video" value="${esc(tr.videoUrl||'')}" placeholder="https://..." ${!canUploadVideo?'disabled':''} oninput="previewSosVideo()">
+      <div id="sos-video-preview" style="margin-bottom:10px;">${videoInfo && videoInfo.embedUrl ? `<div style="position:relative;padding-bottom:40%;height:0;border-radius:8px;overflow:hidden;max-width:360px;"><iframe src="${esc(videoInfo.embedUrl)}" style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;" allowfullscreen></iframe></div>` : `<p style="font-size:11.5px;color:var(--ink-soft);">No video preview — paste a link above. Leave blank to hide the video section from partners entirely.</p>`}</div>
+      ${tr.videoUrl && canUploadVideo ? `<button class="btn small danger" onclick="document.getElementById('sos-ed-video').value=''; previewSosVideo();" style="margin-bottom:10px;">Remove video</button>` : ''}
+
+      <span class="field-label">Audio link (optional)</span>
+      <input class="field-input" id="sos-ed-audio" value="${esc(tr.audioUrl||'')}" placeholder="https://..." ${!canEdit?'disabled':''}>
+
+      <span class="field-label">Images (one URL per line)</span>
+      <textarea class="field-input reflect" id="sos-ed-images" style="min-height:60px;" ${!canEdit?'disabled':''}>${esc((tr.images||[]).join('\n'))}</textarea>
+
+      <span class="field-label">Downloadable documents (one URL per line)</span>
+      <textarea class="field-input reflect" id="sos-ed-documents" style="min-height:60px;" ${!canEdit?'disabled':''}>${esc((tr.documents||[]).join('\n'))}</textarea>
+
+      <span class="field-label">Recommended action</span>
+      <textarea class="field-input reflect" id="sos-ed-nextaction" style="min-height:50px;" ${!canEdit?'disabled':''}>${esc(tr.nextAction||'')}</textarea>
+
+      <span class="field-label">Escalation instructions</span>
+      <textarea class="field-input reflect" id="sos-ed-escalation" style="min-height:50px;" placeholder="What should the partner mention when escalating this specific issue?" ${!canEdit?'disabled':''}>${esc(tr.escalationInstructions||'')}</textarea>
+
+      ${isDefault ? `
+      <span class="field-label">Search keywords (comma separated)</span>
+      <input class="field-input" id="sos-ed-keywords" value="${esc((p.keywords||[]).join(', '))}" ${!canEdit?'disabled':''}>
+
+      <span class="field-label">Related problems</span>
+      <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px;">
+        ${Object.entries(sosProblems).filter(([id])=>id!==editingSosProblemId).map(([id,rp])=>`<label style="display:flex;align-items:center;gap:6px;font-size:13px;"><input type="checkbox" class="sos-related-check" value="${id}" ${(p.relatedProblemIds||[]).includes(id)?'checked':''} ${!canEdit?'disabled':''}>${esc(rp.title)}</label>`).join('') || '<span style="font-size:12px;color:var(--ink-soft);">No other problems yet.</span>'}
+      </div>` : ''}
+
+      <div style="display:flex;gap:8px;margin-top:14px;">
+        ${ccSosCan('canSaveDraft')?`<button class="btn secondary" onclick="saveSosProblemEdit('Draft')">Save as Draft</button>`:''}
+        ${ccSosCan('canPublish')?`<button class="btn amber" onclick="saveSosProblemEdit('Published')">Save &amp; Publish</button>`:''}
+        <button class="btn secondary" onclick="cancelSosProblemEdit()">Cancel</button>
+      </div>
+    </div>
+  `;
+}
+function previewSosVideo(){
+  const url = document.getElementById('sos-ed-video').value.trim();
+  const info = url ? normalizeUrl(url) : null;
+  const el = document.getElementById('sos-video-preview');
+  el.innerHTML = info && info.embedUrl ? `<div style="position:relative;padding-bottom:40%;height:0;border-radius:8px;overflow:hidden;max-width:360px;"><iframe src="${esc(info.embedUrl)}" style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;" allowfullscreen></iframe></div>` : `<p style="font-size:11.5px;color:var(--ink-soft);">No video preview — paste a link above. Leave blank to hide the video section from partners entirely.</p>`;
+}
+function syncSosEditorFromDOM(){
+  const p = sosEditorDraft;
+  const isDefault = sosEditorLanguage===DEFAULT_LANGUAGE;
+  const fields = {
+    title: document.getElementById('sos-ed-title').value.trim(),
+    shortDescription: document.getElementById('sos-ed-shortdesc').value.trim(),
+    theory: document.getElementById('sos-ed-theory').value,
+    videoUrl: document.getElementById('sos-ed-video').value.trim(),
+    audioUrl: document.getElementById('sos-ed-audio').value.trim(),
+    images: document.getElementById('sos-ed-images').value.split('\n').map(s=>s.trim()).filter(Boolean),
+    documents: document.getElementById('sos-ed-documents').value.split('\n').map(s=>s.trim()).filter(Boolean),
+    nextAction: document.getElementById('sos-ed-nextaction').value.trim(),
+    escalationInstructions: document.getElementById('sos-ed-escalation').value.trim(),
+  };
+  if(isDefault){
+    Object.assign(p, fields);
+    p.categoryIds = Array.from(document.querySelectorAll('.sos-cat-check:checked')).map(el=>el.value);
+    p.keywords = document.getElementById('sos-ed-keywords').value.split(',').map(s=>s.trim()).filter(Boolean);
+    p.relatedProblemIds = Array.from(document.querySelectorAll('.sos-related-check:checked')).map(el=>el.value);
+  } else {
+    if(!p.translations) p.translations = {};
+    p.translations[sosEditorLanguage] = fields;
+  }
+}
+function switchSosEditorLanguage(lang){
+  syncSosEditorFromDOM();
+  sosEditorLanguage = lang;
+  renderAdminMain();
+}
+async function saveSosProblemEdit(status){
+  syncSosEditorFromDOM();
+  const p = sosEditorDraft;
+  if(!p.title){ showToast('Give the problem a title before saving.', 'error'); return; }
+  p.status = status;
+  p.updatedAt = new Date().toISOString();
+  p.updatedBy = trainerIdentity.name;
+  await saveSosProblem(editingSosProblemId, p);
+  await logSosActivity(status==='Published'?'Published':'Saved as Draft', editingSosProblemId, p.title, `Edited in ${sosEditorLanguage}`);
+  showToast(status==='Published'?'Published — partners can now see this.':'Saved as draft.', 'success');
+  editingSosProblemId = null;
+  sosEditorDraft = null;
+  renderAdminMain();
+}
+function cancelSosProblemEdit(){
+  editingSosProblemId = null;
+  sosEditorDraft = null;
+  renderAdminMain();
+}
+function renderSosPreviewAsPartner(){
+  if(!sosScreen || sosScreen==='step1'){
+    sosScreen = 'step1';
+    sosSelectedCategory = null; sosSelectedProblem = null; sosSearchQuery = '';
+  }
+  let bodyHtml;
+  if(sosScreen==='step1') bodyHtml = renderSosStep1Screen();
+  else if(sosScreen==='problems') bodyHtml = renderSosProblemsScreen();
+  else if(sosScreen==='solution') bodyHtml = renderSosSolutionScreen();
+  else if(sosScreen==='escalate') bodyHtml = renderSosEscalateScreen();
+  else bodyHtml = renderSosStep1Screen();
+  return `
+    <div style="background:var(--amber);color:#fff;padding:12px 20px;border-radius:10px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;">
+      <div><strong>Preview as Partner</strong> — this shows exactly what a partner sees, including unpublished drafts (marked). Nothing here is tracked in analytics.</div>
+      <button class="btn small secondary" onclick="exitSosPreview()">Exit Preview</button>
+    </div>
+    <div style="max-width:560px;">${bodyHtml}</div>
+  `;
+}
+function exitSosPreview(){
+  cleanupSosVideoTracking();
+  sosPreviewMode = false;
+  sosScreen = null;
+  renderAdminMain();
+}
 function securityRoleLabel(type){
   return { admin:'Admin', trainer:'Trainer', cc:'Content Creator', zt:'Zonal Manager', partner:'Partner' }[type] || type;
 }
@@ -6737,6 +7149,11 @@ let courseEditorOverrideCache = {};
 function ccCourseAllowed(courseId){
   const list = trainerIdentity.assignedCourses || [];
   return list.length===0 || list.includes(courseId);
+}
+function ccSosCategoryAllowed(categoryId){
+  if(isAdminRole()) return true;
+  const list = trainerIdentity.sosAssignedCategories || [];
+  return list.length===0 || list.includes(categoryId);
 }
 function ccLanguageAllowed(langName){
   const list = trainerIdentity.assignedLanguages || [];
