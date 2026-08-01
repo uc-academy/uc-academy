@@ -5827,6 +5827,17 @@ function renderSosContentTab(){
     <h1 class="page-title">SOS Content Management</h1>
     <p class="page-sub">Create and manage the self-help problems and solutions partners see in SOS / Help.</p>
     <div class="card">
+      <h3>Categories</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:${ccSosCan('canCreate')?'12px':'0'};">
+        ${Object.entries(sosCategories).length===0?`<span style="font-size:12.5px;color:var(--ink-soft);">No categories yet — add one below to start creating SOS content.</span>`:
+        Object.entries(sosCategories).filter(([id])=>!isCC || ccSosCategoryAllowed(id)).map(([id,c])=>`<span class="pill ${c.active===false?'closed':'open'}" style="display:flex;align-items:center;gap:6px;">${esc(c.name)}${isAdminRole()?`<span onclick="deleteSosCategoryRow('${id}','${esc(c.name)}')" style="cursor:pointer;font-weight:700;">&times;</span>`:''}</span>`).join('')}
+      </div>
+      ${ccSosCan('canCreate')?`<div class="filter-row" style="margin-bottom:0;">
+        <input class="field-input" id="sos-new-category-name" placeholder="New category name (e.g. Refrigerator)" style="width:240px;margin-bottom:0;">
+        <button class="btn amber small" onclick="addSosCategoryRow()">+ Add Category</button>
+      </div>`:''}
+    </div>
+    <div class="card">
       <div class="filter-row">
         <select id="soscm-f-category" onchange="sosContentFilterCategory=this.value; renderAdminMain();">
           <option value="">All categories</option>
@@ -5883,6 +5894,30 @@ function renderSosContentTab(){
       </table>`}
     </div>
   `;
+}
+async function addSosCategoryRow(){
+  const input = document.getElementById('sos-new-category-name');
+  const name = input.value.trim();
+  if(!name){ showToast('Enter a category name first.', 'error'); return; }
+  if(Object.values(sosCategories).some(c=>c.name.toLowerCase()===name.toLowerCase())){ showToast('A category with that name already exists.', 'error'); return; }
+  const id = await createSosCategory(name);
+  sosCategories[id] = { name, active:true, createdAt:new Date().toISOString() };
+  await logSosActivity('Category created', null, name, `New SOS category "${name}" added`);
+  showToast(`"${name}" category added.`, 'success');
+  renderAdminMain();
+}
+async function deleteSosCategoryRow(id, name){
+  const affectedCount = Object.values(sosProblems).filter(p=>sosProblemCategoryIds(p).includes(id)).length;
+  const msg = affectedCount>0
+    ? `Delete "${name}"? ${affectedCount} problem${affectedCount===1?'':'s'} currently assigned to it will need a new category, or they'll stop showing to partners.`
+    : `Delete "${name}"? This category has no problems assigned yet.`;
+  showConfirmModal(msg, async ()=>{
+    await deleteSosCategory(id);
+    delete sosCategories[id];
+    await logSosActivity('Category deleted', null, name, `SOS category "${name}" deleted`);
+    showToast(`"${name}" category deleted.`, 'success');
+    renderAdminMain();
+  });
 }
 async function createNewSosProblem(){
   const catId = sosContentFilterCategory || (Object.keys(sosCategories)[0]||null);
