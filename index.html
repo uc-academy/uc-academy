@@ -497,14 +497,15 @@ const BASE_DAYS = [
 ];
 let DAYS = [...BASE_DAYS];
 function rebuildDaysList(registryIds){
-  const kept = BASE_DAYS.filter(d=>registryIds.includes(d.id));
-  const newIds = registryIds.filter(id=>!BASE_DAYS.some(d=>d.id===id)).sort((a,b)=>a-b);
-  const synthetic = newIds.map(id=>({
-    id, machine:'BOTH', title:'New Day', sub:'Custom day added by Admin — edit this in Modules.',
-    theory:[], video:{title:'Video'}, assignment:{intro:'', tasks:[]},
-    quiz:[{q:'Question 1', opts:['Option A','Option B','Option C','Option D'], correct:0}]
-  }));
-  DAYS = [...kept, ...synthetic].sort((a,b)=>a.id-b.id);
+  DAYS = registryIds.map(id=>{
+    const base = BASE_DAYS.find(d=>d.id===id);
+    if(base) return base;
+    return {
+      id, machine:'BOTH', title:'New Day', sub:'Custom day added by Admin — edit this in Modules.',
+      theory:[], video:{title:'Video'}, assignment:{intro:'', tasks:[]},
+      quiz:[{q:'Question 1', opts:['Option A','Option B','Option C','Option D'], correct:0}]
+    };
+  });
 }
 function isFinalDay(id){ return DAYS.length>0 && id === DAYS[DAYS.length-1].id; }
 
@@ -1122,6 +1123,29 @@ function contentKey(dayId, courseId, lang){
   const langSuffix = (lang && lang!==DEFAULT_LANGUAGE) ? ':'+lang : '';
   return courseId ? `courseContent:${courseId}:${dayId}${langSuffix}` : `content:${dayId}${langSuffix}`;
 }
+function dayEnabledKey(courseId){ return 'dayEnabled:'+(courseId||'legacy'); }
+async function getDayEnabledMap(courseId){ const v = await kvGet(dayEnabledKey(courseId)); return (v && v.map) || {}; }
+async function setDayEnabledMap(courseId, map){ return await kvSet(dayEnabledKey(courseId), { map }); }
+async function isDayEnabled(dayId, courseId, cachedMap){
+  const map = cachedMap || await getDayEnabledMap(courseId);
+  return map[dayId] !== false;
+}
+async function isHomeEnabled(courseId, cachedMap){
+  const map = cachedMap || await getDayEnabledMap(courseId);
+  return map['home'] !== false;
+}
+async function toggleDayEnabledState(dayId, courseId){
+  const map = await getDayEnabledMap(courseId);
+  map[dayId] = map[dayId]===false ? true : false;
+  await setDayEnabledMap(courseId, map);
+  return map[dayId];
+}
+async function toggleHomeEnabledState(courseId){
+  const map = await getDayEnabledMap(courseId);
+  map['home'] = map['home']===false ? true : false;
+  await setDayEnabledMap(courseId, map);
+  return map['home'];
+}
 function draftContentKey(dayId, courseId, lang){
   return 'draft:'+contentKey(dayId, courseId, lang);
 }
@@ -1425,6 +1449,8 @@ async function loadAndApplyDayRegistry(){
 let currentUser = null;
 let currentUserProgress = {};
 let currentUserUnlockedDays = [];
+let currentUserHomeEnabled = true;
+let currentUserDisabledDayIds = [];
 let currentUserAssessmentUnlockedDays = [];
 let trainerIdentity = null;
 let gateMode = 'partner';
@@ -2051,7 +2077,11 @@ async function loginAsPartner(id, opts){
   const langs = await listLanguages();
   partnerAvailableLanguages = Object.values(langs).filter(l=>l.active!==false).map(l=>l.name);
   if(!partnerAvailableLanguages.includes(DEFAULT_LANGUAGE)) partnerAvailableLanguages.unshift(DEFAULT_LANGUAGE);
-  currentUserUnlockedDays = await getUnlock(r.city, r.trainer);
+  const rawUnlocked = await getUnlock(r.city, r.trainer);
+  const partnerDayEnabledMap = await getDayEnabledMap(r.courseId||null);
+  currentUserUnlockedDays = rawUnlocked.filter(dayId => partnerDayEnabledMap[dayId] !== false);
+  currentUserHomeEnabled = partnerDayEnabledMap['home'] !== false;
+  currentUserDisabledDayIds = Object.entries(partnerDayEnabledMap).filter(([k,v])=>v===false && k!=='home').map(([k])=>parseInt(k));
   currentUserAssessmentUnlockedDays = await getAssessmentUnlock(r.city, r.trainer);
   currentUserProgress = await getProgress(id);
   await loadAndApplyDayRegistry();
@@ -2549,12 +2579,12 @@ function renderSidebar(){
       <div class="meter-value">${s.done} / ${s.total} DAYS</div>
       <div class="meter-track"><div class="meter-fill" style="width:${s.pct}%"></div></div>
     </div>
-    <div class="knob-row ${currentDay===0?'active':''}" onclick="goTo(0,'theory')">
+    ${currentUserHomeEnabled ? `<div class="knob-row ${currentDay===0?'active':''}" onclick="goTo(0,'theory')">
       <div class="knob" style="border-color:var(--amber);"></div>
       <div class="nav-text"><div class="nav-title">Home</div><div class="nav-sub">Welcome & Safety</div></div>
-    </div>
+    </div>` : ''}
   `;
-  if(DAYS.length===7 && DAYS.every((d,i)=>d.id===i+1)){
+  if(DAYS.length===7 && DAYS.every((d,i)=>d.id===i+1) && currentUserDisabledDayIds.length===0){
     html += `<div class="nav-section-label">Semi-Automatic</div>`;
     DAYS.slice(0,3).forEach(d=>html+=knobRow(d));
     html += `<div class="nav-section-label">Top-Load</div>`;
@@ -2563,7 +2593,7 @@ function renderSidebar(){
     html += knobRow(DAYS[6]);
   } else {
     html += `<div class="nav-section-label">Course Days</div>`;
-    DAYS.forEach(d=>html+=knobRow(d));
+    DAYS.filter(d=>!currentUserDisabledDayIds.includes(d.id)).forEach(d=>html+=knobRow(d));
   }
   html += `
     <div class="knob-row ${currentDay===98?'active':''}" onclick="goTo(98,'theory')">
@@ -2598,7 +2628,11 @@ async function refreshPartnerData(){
   if(!currentUser) return;
   const r = await getRosterEntry(currentUser.id);
   if(!r){ showToast("Couldn't refresh — check your connection.", 'error'); return; }
-  currentUserUnlockedDays = await getUnlock(r.city, r.trainer);
+  const rawUnlocked = await getUnlock(r.city, r.trainer);
+  const partnerDayEnabledMap = await getDayEnabledMap(r.courseId||null);
+  currentUserUnlockedDays = rawUnlocked.filter(dayId => partnerDayEnabledMap[dayId] !== false);
+  currentUserHomeEnabled = partnerDayEnabledMap['home'] !== false;
+  currentUserDisabledDayIds = Object.entries(partnerDayEnabledMap).filter(([k,v])=>v===false && k!=='home').map(([k])=>parseInt(k));
   currentUserAssessmentUnlockedDays = await getAssessmentUnlock(r.city, r.trainer);
   currentUserProgress = await getProgress(currentUser.id);
   await loadAndApplyDayRegistry();
@@ -4118,6 +4152,7 @@ async function renderAdminMain(){
         const homeOv = await getContentOverride('home', null, editingLanguage);
         adminModuleStatus['home'] = !!homeOv;
         adminModuleOverrideCache['home'] = homeOv;
+        adminDayEnabledMap = await getDayEnabledMap(null);
         el.innerHTML = renderModulesListTab();
       }
     }
@@ -7413,6 +7448,7 @@ function blankCourseModuleDraft(){
 }
 let moduleDraft = null;
 let adminModuleStatus = {};
+let adminDayEnabledMap = {};
 let adminModuleOverrideCache = {};
 
 function renderModulesListTab(){
@@ -7453,21 +7489,30 @@ function renderModulesListTab(){
       <p style="font-size:12px;color:var(--ink-soft);margin-top:6px;">${editingLanguage===DEFAULT_LANGUAGE ? `This is the fallback version partners see if a day isn't translated into their chosen language.` : `Editing the ${esc(editingLanguage)} version. Days shown here as "Default content" have no ${esc(editingLanguage)} translation yet — partners using ${esc(editingLanguage)} will see ${esc(DEFAULT_LANGUAGE)} instead until you add one.`}</p>
     </div>
     <h2 class="page-title" style="font-size:20px;">Original Washing Machine course</h2>
-    <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+    <p style="font-size:12.5px;color:var(--ink-soft);margin-top:-8px;">Nothing here is fixed — Home and every day can be reordered, disabled, duplicated, or deleted.</p>
+    <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;${adminDayEnabledMap['home']===false?'opacity:0.55;':''}">
       <div>
-        <h3 style="margin-bottom:2px;">Home Page</h3>
+        <h3 style="margin-bottom:2px;">Home Page ${adminDayEnabledMap['home']===false?'<span class="pill closed">Disabled</span>':''}</h3>
         <span class="pill ${adminModuleStatus['home']?'open':'scheduled'}">${adminModuleStatus['home']?'Customized':'Default content'}</span>
       </div>
-      <button class="btn amber small" onclick="openModuleEditor('home')">Edit &rarr;</button>
+      <div style="display:flex;gap:8px;">
+        <button class="btn secondary small" onclick="toggleHomeEnabledRow()">${adminDayEnabledMap['home']===false?'Enable':'Disable'}</button>
+        ${adminModuleStatus['home']?`<button class="btn danger small" onclick="deleteHomeOverrideRow()">Delete customization</button>`:''}
+        <button class="btn amber small" onclick="openModuleEditor('home')">Edit &rarr;</button>
+      </div>
     </div>
-    ${DAYS.map(d=>`
-      <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+    ${DAYS.map((d,i)=>`
+      <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;${adminDayEnabledMap[d.id]===false?'opacity:0.55;':''}">
         <div>
-          <h3 style="margin-bottom:2px;">Day ${d.id} &middot; ${esc(adminModuleOverrideCache[d.id]?.title || (isFinalDay(d.id)?'Final Assessment':d.title))}</h3>
+          <h3 style="margin-bottom:2px;">Day ${d.id} &middot; ${esc(adminModuleOverrideCache[d.id]?.title || (isFinalDay(d.id)?'Final Assessment':d.title))} ${adminDayEnabledMap[d.id]===false?'<span class="pill closed">Disabled</span>':''}</h3>
           <span class="pill ${adminModuleStatus[d.id]?'open':'scheduled'}">${adminModuleStatus[d.id]?'Customized':'Default content'}</span>
         </div>
-        <div style="display:flex;gap:8px;">
-          <button class="btn danger small" onclick="deleteDay(${d.id})" ${DAYS.length<=1?'disabled':''}>Delete</button>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <button class="btn small secondary" onclick="moveDayRow(${d.id},'up')" ${i===0?'disabled':''} title="Move up">&uarr;</button>
+          <button class="btn small secondary" onclick="moveDayRow(${d.id},'down')" ${i===DAYS.length-1?'disabled':''} title="Move down">&darr;</button>
+          <button class="btn small secondary" onclick="toggleDayEnabledRow(${d.id})">${adminDayEnabledMap[d.id]===false?'Enable':'Disable'}</button>
+          <button class="btn small secondary" onclick="duplicateDayRow(${d.id})">Duplicate</button>
+          <button class="btn danger small" onclick="deleteDay(${d.id})">Delete</button>
           <button class="btn amber small" onclick="openModuleEditor(${d.id})">Edit &rarr;</button>
         </div>
       </div>
@@ -7495,6 +7540,63 @@ async function addNewDay(){
   rebuildDaysList(newIds);
   showToast(`Day ${newId} added — opening editor.`, 'success');
   await openModuleEditor(newId);
+}
+async function toggleHomeEnabledRow(){
+  const nowEnabled = await toggleHomeEnabledState(null);
+  await logHistory('home_enabled_toggled', `Home Page ${nowEnabled?'enabled':'disabled'} by ${trainerIdentity.name}`, {});
+  showToast(`Home Page ${nowEnabled?'enabled':'disabled'}.`, 'success');
+  renderAdminMain();
+}
+async function toggleDayEnabledRow(dayId){
+  const nowEnabled = await toggleDayEnabledState(dayId, null);
+  await logHistory('day_enabled_toggled', `Day ${dayId} ${nowEnabled?'enabled':'disabled'} by ${trainerIdentity.name}`, {dayId});
+  showToast(`Day ${dayId} ${nowEnabled?'enabled':'disabled'}.`, 'success');
+  renderAdminMain();
+}
+async function moveDayRow(dayId, direction){
+  const ids = await getDayRegistry();
+  const idx = ids.indexOf(dayId);
+  if(idx<0) return;
+  const swapIdx = direction==='up' ? idx-1 : idx+1;
+  if(swapIdx<0 || swapIdx>=ids.length) return;
+  [ids[idx], ids[swapIdx]] = [ids[swapIdx], ids[idx]];
+  const ok = await setDayRegistry(ids);
+  if(!ok){ showToast("Couldn't reorder — check your connection.", 'error'); return; }
+  await logHistory('day_reordered', `Day ${dayId} moved ${direction} by ${trainerIdentity.name}`, {dayId, direction});
+  rebuildDaysList(ids);
+  renderAdminMain();
+}
+async function duplicateDayRow(dayId){
+  showConfirmModal(`Duplicate Day ${dayId}? This creates a new day with a copy of its content, right after the original.`, async ()=>{
+    const ids = await getDayRegistry();
+    const newId = Math.max(0, ...ids) + 1;
+    const idx = ids.indexOf(dayId);
+    const newIds = [...ids];
+    newIds.splice(idx+1, 0, newId);
+    const ok = await setDayRegistry(newIds);
+    if(!ok){ showToast("Couldn't duplicate — check your connection.", 'error'); return; }
+    const langsToCopy = await listLanguages();
+    await Promise.all(Object.values(langsToCopy).filter(l=>l.active!==false).map(async l=>{
+      const ov = await getContentOverride(dayId, null, l.name);
+      if(ov) await setContentOverride(newId, JSON.parse(JSON.stringify(ov)), null, l.name);
+    }));
+    const enabledMap = await getDayEnabledMap(null);
+    if(enabledMap[dayId]===false){ enabledMap[newId] = false; await setDayEnabledMap(null, enabledMap); }
+    await logHistory('day_duplicated', `Day ${dayId} duplicated as Day ${newId} by ${trainerIdentity.name}`, {dayId, newId});
+    rebuildDaysList(newIds);
+    showToast(`Day ${newId} created as a copy of Day ${dayId}.`, 'success');
+    renderAdminMain();
+  });
+}
+async function deleteHomeOverrideRow(){
+  showConfirmModal('Delete the Home Page customization? Partners will see the default Home content again — this does not delete the page itself, just your edits to it.', async ()=>{
+    await kvDelete(contentKey('home', null, DEFAULT_LANGUAGE));
+    const langs = await listLanguages();
+    await Promise.all(Object.values(langs).filter(l=>l.active!==false && !l.isDefault).map(l=>kvDelete(contentKey('home', null, l.name))));
+    await logHistory('home_override_deleted', `Home Page customization deleted by ${trainerIdentity.name}`, {});
+    showToast('Home Page reverted to default content.', 'success');
+    renderAdminMain();
+  });
 }
 async function deleteDay(dayId){
   if(DAYS.length<=1){ showToast('At least one day must remain.', 'error'); return; }
