@@ -3286,6 +3286,7 @@ function renderActivityUploadItem(dayId, item, idx){
     </label>
   </div>`;
 }
+let lastActivityUploadFingerprint = {};
 async function handleActivityUpload(event){
   const el = event.target;
   const file = el.files[0];
@@ -3295,6 +3296,24 @@ async function handleActivityUpload(event){
   const mediaType = el.dataset.mediatype;
   const activityLabel = el.dataset.label;
   const aiCriteria = el.dataset.criteria;
+
+  if(mediaType==='photo'){
+    const check = rteValidateImageFile(file);
+    if(!check.ok){ showToast(check.reason, 'error'); el.value=''; return; }
+  } else if(mediaType==='video'){
+    const VIDEO_MAX_MB = 100;
+    if(file.size > VIDEO_MAX_MB*1024*1024){ showToast(`"${file.name}" is too large (max ${VIDEO_MAX_MB}MB). Try a shorter or compressed video.`, 'error'); el.value=''; return; }
+  }
+
+  const fingerprintKey = `${dayId}-${idx}`;
+  const fingerprint = `${file.name}|${file.size}|${file.lastModified}`;
+  const last = lastActivityUploadFingerprint[fingerprintKey];
+  if(last && last.fingerprint===fingerprint && (Date.now()-last.at) < 15000){
+    showToast('This file was just uploaded — please wait before submitting it again.', 'error');
+    el.value=''; return;
+  }
+  lastActivityUploadFingerprint[fingerprintKey] = { fingerprint, at: Date.now() };
+
   showToast('Uploading...', 'info');
   const path = `activity/${currentUser.id}/${dayId}/${idx}/${Date.now()}_${file.name}`;
   const url = await uploadFile(path, file);
@@ -3930,9 +3949,29 @@ function renderMyMediaRow(m){
     </div>
   `;
 }
+let lastMediaUploadFingerprint = {};
 async function handleMediaUpload(event, dayId, type){
-  const file = event.target.files[0];
+  const el = event.target;
+  const file = el.files[0];
   if(!file) return;
+
+  if(type==='photo'){
+    const check = rteValidateImageFile(file);
+    if(!check.ok){ showToast(check.reason, 'error'); el.value=''; return; }
+  } else if(type==='video'){
+    const VIDEO_MAX_MB = 100;
+    if(file.size > VIDEO_MAX_MB*1024*1024){ showToast(`"${file.name}" is too large (max ${VIDEO_MAX_MB}MB). Try a shorter or compressed video.`, 'error'); el.value=''; return; }
+  }
+
+  const fingerprintKey = `${dayId}-${type}`;
+  const fingerprint = `${file.name}|${file.size}|${file.lastModified}`;
+  const last = lastMediaUploadFingerprint[fingerprintKey];
+  if(last && last.fingerprint===fingerprint && (Date.now()-last.at) < 15000){
+    showToast('This file was just uploaded — please wait before submitting it again.', 'error');
+    el.value=''; return;
+  }
+  lastMediaUploadFingerprint[fingerprintKey] = { fingerprint, at: Date.now() };
+
   showToast('Uploading...', 'info');
   const path = `media/${currentUser.id}/${dayId}/${Date.now()}_${file.name}`;
   const url = await uploadFile(path, file);
