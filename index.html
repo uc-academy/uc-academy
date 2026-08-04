@@ -4423,6 +4423,11 @@ async function renderAdminMain(){
       courseEditorOverrideCache = {};
       await Promise.all(courseEditorDays.map(async dayId=>{ courseEditorOverrideCache[dayId] = await getContentOverride(dayId, editingCourseId, editingLanguage); }));
       adminDayEnabledMap = await getDayEnabledMap(editingCourseId);
+      const courseHomeOv = await getContentOverride('home', editingCourseId, editingLanguage);
+      adminModuleStatus = adminModuleStatus || {};
+      adminModuleStatus['home'] = !!courseHomeOv;
+      adminModuleOverrideCache = adminModuleOverrideCache || {};
+      adminModuleOverrideCache['home'] = courseHomeOv;
       el.innerHTML = renderCourseModulesListTab();
     }
     else{
@@ -7750,6 +7755,19 @@ function renderCourseModulesListTab(){
         ${Object.values(adminLanguages).filter(l=>l.active!==false).map(l=>`<option value="${esc(l.name)}" ${editingLanguage===l.name?'selected':''}>${esc(l.name)}${l.isDefault?' (default)':''}</option>`).join('')}
       </select>
     </div>
+    <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;${adminDayEnabledMap['home']===false?'opacity:0.55;':''}">
+      <div>
+        <h3 style="margin-bottom:2px;">Home Page ${adminDayEnabledMap['home']===false?'<span class="pill closed">Disabled</span>':''}</h3>
+        <span class="pill ${adminModuleStatus['home']?'open':'scheduled'}">${adminModuleStatus['home']?'Customized':'No content yet'}</span>
+        <p style="font-size:12px;color:var(--ink-soft);margin-top:6px;">Shown to partners before Day 1 — the first screen of this course. Independent from every other course's Home Page.</p>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn secondary small" onclick="toggleCourseHomeEnabledRow()">${adminDayEnabledMap['home']===false?'Enable':'Disable'}</button>
+        ${adminModuleStatus['home']?`<button class="btn secondary small" onclick="duplicateCourseHomeRow()">Duplicate to another course</button>`:''}
+        ${adminModuleStatus['home']?`<button class="btn danger small" onclick="deleteCourseHomeOverrideRow()">Delete</button>`:''}
+        <button class="btn amber small" onclick="openModuleEditor('home', '${editingCourseId}')">${adminModuleStatus['home']?'Edit':'+ Home Page'} &rarr;</button>
+      </div>
+    </div>
     ${courseEditorDays.length===0 ? `<div class="card"><div class="empty-state">No days yet for this course — add the first one below.</div></div>` : ''}
     ${courseEditorDays.map((dayId,i)=>`
       <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;${adminDayEnabledMap[dayId]===false?'opacity:0.55;':''}">
@@ -8020,6 +8038,60 @@ async function deleteHomeOverrideRow(){
     showToast('Home Page reverted to default content.', 'success');
     renderAdminMain();
   });
+}
+async function toggleCourseHomeEnabledRow(){
+  const nowEnabled = await toggleHomeEnabledState(editingCourseId);
+  await logHistory('course_home_enabled_toggled', `Home Page ${nowEnabled?'enabled':'disabled'} for course ${adminCourses[editingCourseId]?.name||editingCourseId} by ${trainerIdentity.name}`, {courseId:editingCourseId});
+  showToast(`Home Page ${nowEnabled?'enabled':'disabled'}.`, 'success');
+  openCourseModuleEditor(editingCourseId);
+}
+async function deleteCourseHomeOverrideRow(){
+  showConfirmModal('Delete this course\'s Home Page content? Partners will see a blank default Home Page until you add content again.', async ()=>{
+    const langs = await listLanguages();
+    await Promise.all(Object.values(langs).filter(l=>l.active!==false).map(l=>kvDelete(contentKey('home', editingCourseId, l.name))));
+    await logHistory('course_home_deleted', `Home Page deleted for course ${adminCourses[editingCourseId]?.name||editingCourseId} by ${trainerIdentity.name}`, {courseId:editingCourseId});
+    showToast('Home Page deleted.', 'success');
+    openCourseModuleEditor(editingCourseId);
+  });
+}
+function duplicateCourseHomeRow(){
+  const otherCourses = Object.entries(adminCourses).filter(([id])=>id!==editingCourseId);
+  if(otherCourses.length===0){ showToast('No other courses exist yet to duplicate this Home Page to.', 'error'); return; }
+  const overlay = document.createElement('div');
+  overlay.id = 'duplicate-home-overlay';
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `<div class="confirm-box" style="max-width:440px;text-align:left;">
+    <h3 style="margin-top:0;">Duplicate this Home Page to another course</h3>
+    <p style="font-size:12.5px;color:var(--ink-soft);margin-top:-6px;">This copies content only — the destination course's own Home Page (if it has one) will be overwritten. The original stays here, unchanged.</p>
+    <span class="field-label">Destination course</span>
+    <select class="field-input" id="duplicate-home-target">
+      ${otherCourses.map(([id,c])=>{ const cat = adminCategories[c.categoryId]; return `<option value="${id}">${cat?esc(cat.name)+' → ':''}${esc(c.name)}</option>`; }).join('')}
+    </select>
+    <div class="confirm-actions">
+      <button class="btn secondary" id="duplicate-home-cancel">Cancel</button>
+      <button class="btn amber" onclick="executeDuplicateCourseHome()">Duplicate</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#duplicate-home-cancel').addEventListener('click', ()=> overlay.remove());
+  overlay.addEventListener('click', (e)=>{ if(e.target===overlay) overlay.remove(); });
+}
+async function executeDuplicateCourseHome(){
+  const targetCourseId = document.getElementById('duplicate-home-target').value;
+  const langs = await listLanguages();
+  await Promise.all(Object.values(langs).filter(l=>l.active!==false).map(async l=>{
+    const ov = await getContentOverride('home', editingCourseId, l.name);
+    if(ov) await setContentOverride('home', JSON.parse(JSON.stringify(ov)), targetCourseId, l.name);
+  }));
+  const enabledMap = await getDayEnabledMap(editingCourseId);
+  if(enabledMap['home']===false){
+    const targetMap = await getDayEnabledMap(targetCourseId);
+    targetMap['home'] = false;
+    await setDayEnabledMap(targetCourseId, targetMap);
+  }
+  await logHistory('course_home_duplicated', `Home Page duplicated from ${adminCourses[editingCourseId]?.name||editingCourseId} to ${adminCourses[targetCourseId]?.name||targetCourseId} by ${trainerIdentity.name}`, {fromCourseId:editingCourseId, toCourseId:targetCourseId});
+  document.getElementById('duplicate-home-overlay')?.remove();
+  showToast(`Home Page duplicated to ${adminCourses[targetCourseId]?.name||'the selected course'}.`, 'success');
 }
 async function deleteDay(dayId){
   if(DAYS.length<=1){ showToast('At least one day must remain.', 'error'); return; }
