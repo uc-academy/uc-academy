@@ -1516,7 +1516,7 @@ window.onYouTubeIframeAPIReady = function(){ ytApiReady = true; };
 function defaultDayProgress(){
   return { theoryDone:false, audioPlayed:false, videoPct:0, videoDone:false,
     quizSubmitted:false, quizScore:0, quizTotal:0, quizPct:0, quizAnswers:[], quizDate:'',
-    tasksChecked:[], reflection:'', videoItemProgress:{}, videoRanges:[], videoLastTime:null, inVideoQuizAnswers:{} };
+    tasksChecked:[], reflection:'', videoItemProgress:{}, videoRanges:[], videoLastTime:null, inVideoQuizAnswers:{}, quickAssessments:{} };
 }
 function ensureDay(d){
   if(!currentUserProgress[d]) currentUserProgress[d] = defaultDayProgress();
@@ -2872,10 +2872,14 @@ function renderTheory(day){
         html += `<div class="card"><h3>${esc(item.title||'Photo')}</h3>${item.url?`<img src="${esc(item.url)}" style="max-width:100%;border-radius:8px;">`:'<div class="video-placeholder">No image linked yet.</div>'}${item.caption?`<p style="margin-top:8px;color:var(--ink-soft);font-size:12.5px;">${esc(item.caption)}</p>`:''}</div>`;
       } else if(item.type==='uploadActivity'){
         html += renderActivityUploadItem(day.id, item, idx);
+      } else if(item.type==='quickAssessment'){
+        if(item.enabled!==false) html += renderQuickAssessmentBlock(day.id, item, idx, dp);
       }
     });
     const allVideosDone = videoIndices.every(i => dp.videoItemProgress[i]?.done);
-    const canComplete = allVideosDone && (!hasAudio || dp.audioPlayed);
+    const mandatoryQAIndices = items.map((it,i)=>(it.type==='quickAssessment' && it.enabled!==false && it.mandatory!==false)?i:null).filter(i=>i!==null);
+    const allQAPassed = mandatoryQAIndices.every(i => dp.quickAssessments && dp.quickAssessments[i] && dp.quickAssessments[i].passed);
+    const canComplete = allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed;
     const fullyDone = dp.theoryDone && dp.videoDone;
     html += `<div class="card">
       ${fullyDone ? `<p style="color:var(--success);font-weight:500;">Marked complete. Assignment and Assessment are unlocked below.</p>` :
@@ -2918,7 +2922,9 @@ function updateTheoryCompleteButtonState(dayId){
     const videoIndices = items.map((it,i)=>(it.type==='video' && it.url && (it.watchSettings?.mandatory!==false))?i:null).filter(i=>i!==null);
     const hasAudio = items.some(i=>i.type==='audio');
     const allVideosDone = videoIndices.every(i => dp.videoItemProgress[i]?.done);
-    btn.disabled = !(allVideosDone && (!hasAudio || dp.audioPlayed));
+    const mandatoryQAIndices = items.map((it,i)=>(it.type==='quickAssessment' && it.enabled!==false && it.mandatory!==false)?i:null).filter(i=>i!==null);
+    const allQAPassed = mandatoryQAIndices.every(i => dp.quickAssessments && dp.quickAssessments[i] && dp.quickAssessments[i].passed);
+    btn.disabled = !(allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed);
   } else {
     const audioUrl = audiosCache[dayId];
     btn.disabled = !!(audioUrl && !dp.audioPlayed);
@@ -2934,6 +2940,116 @@ async function markTheoryDone(dayId){
   renderMainOnly(); renderSidebar();
 }
 
+let qaTimerInterval = null;
+function quickAssessmentDurationSeconds(item){
+  const mins = item.timerMinutes==='custom' ? (item.customTimerMinutes||30) : (item.timerMinutes||10);
+  return mins*60;
+}
+function renderQuickAssessmentBlock(dayId, item, idx, dp){
+  if(!dp.quickAssessments) dp.quickAssessments = {};
+  const state = dp.quickAssessments[idx] || { attempts:[], startedAt:null, currentAnswers:[], passed:false };
+  dp.quickAssessments[idx] = state;
+  const attemptCount = state.attempts.length;
+  const maxAttempts = item.maxAttempts||3;
+  const attemptsLeft = maxAttempts - attemptCount;
+  const canAttempt = !state.passed && (attemptCount===0 || (item.allowReattempt!==false && attemptsLeft>0));
+
+  if(state.startedAt && !state.justSubmittedAttempt){
+    // In progress
+    const durationSec = quickAssessmentDurationSeconds(item);
+    const elapsedSec = (Date.now() - new Date(state.startedAt).getTime())/1000;
+    const remainingSec = Math.max(0, Math.round(durationSec - elapsedSec));
+    if(remainingSec<=0){
+      // Time's up - auto submit on next tick after render
+      setTimeout(()=>submitQuickAssessment(dayId, idx, true), 50);
+    }
+    const mins = Math.floor(remainingSec/60), secs = remainingSec%60;
+    return `<div class="card" id="qa-block-${idx}" style="border:2px solid var(--amber);">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <h3 style="margin:0;">${esc(item.title||'Quick Assessment')}</h3>
+        <div id="qa-timer-${idx}" style="font-family:monospace;font-size:20px;font-weight:700;color:${remainingSec<60?'var(--danger)':'var(--brand)'};">${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}</div>
+      </div>
+      ${(item.questions||[]).map((q,qi)=>`
+        <div style="margin-bottom:16px;">
+          <p style="font-weight:600;margin-bottom:8px;">${qi+1}. ${esc(q.question)}</p>
+          ${(q.options||[]).map((opt,oi)=>`
+            <label style="display:flex;gap:8px;align-items:center;padding:8px;border-radius:8px;cursor:pointer;" class="qa-option-label">
+              <input type="radio" name="qa-answer-${idx}-${qi}" value="${oi}" ${state.currentAnswers[qi]===oi?'checked':''}>
+              ${esc(opt)}
+            </label>
+          `).join('')}
+        </div>
+      `).join('')}
+      <button class="btn amber" onclick="submitQuickAssessment(${dayId},${idx},false)">Submit Now</button>
+    </div>`;
+  }
+
+  if(attemptCount>0){
+    // Results view (most recent attempt) - always shown after submission, regardless of whether a retry is still available
+    const last = state.attempts[state.attempts.length-1];
+    return `<div class="card" id="qa-block-${idx}">
+      <h3 style="margin-top:0;">${esc(item.title||'Quick Assessment')}</h3>
+      <p style="font-size:22px;font-weight:700;color:${last.passed?'var(--success)':'var(--danger)'};margin:4px 0;">${last.score}/${last.total} (${last.percent}%) — ${last.passed?'Passed':'Failed'}</p>
+      ${!last.passed ? `<div style="margin-top:10px;">
+        <p style="font-weight:600;margin-bottom:6px;">Questions to review:</p>
+        ${(item.questions||[]).map((q,qi)=>last.answers[qi]!==q.correct?`<div class="save-note" style="margin-bottom:8px;"><strong>${esc(q.question)}</strong><br>Correct answer: ${esc(q.options[q.correct])}${q.keyLearningPoint?`<br><em>${esc(q.keyLearningPoint)}</em>`:''}</div>`:'').join('')}
+      </div>` : ''}
+      ${!last.passed && canAttempt ? `<p style="font-size:12.5px;color:var(--ink-soft);margin-top:8px;">Attempt ${attemptCount} of ${maxAttempts} used.</p><button class="btn amber" onclick="startQuickAssessment(${dayId},${idx})">Retry Assessment</button>` : ''}
+      ${!last.passed && !canAttempt ? `<p style="color:var(--danger);font-size:13px;margin-top:8px;">No attempts remaining. Contact your Trainer.</p>` : ''}
+    </div>`;
+  }
+
+  // Never attempted yet
+  return `<div class="card" id="qa-block-${idx}">
+    <h3 style="margin-top:0;">${esc(item.title||'Quick Assessment')}</h3>
+    <p style="color:var(--ink-soft);font-size:13px;">${(item.questions||[]).length} question${(item.questions||[]).length===1?'':'s'} &middot; ${item.timerMinutes==='custom'?item.customTimerMinutes:item.timerMinutes} minute timer &middot; ${item.passingPercent||70}% to pass${item.mandatory!==false?' &middot; Required to continue':''}</p>
+    <button class="btn amber" onclick="startQuickAssessment(${dayId},${idx})">Start Your Assessment</button>
+  </div>`;
+}
+async function startQuickAssessment(dayId, idx){
+  const dp = currentUserProgress[dayId];
+  if(!dp.quickAssessments) dp.quickAssessments = {};
+  dp.quickAssessments[idx] = { ...(dp.quickAssessments[idx]||{attempts:[],passed:false}), startedAt:new Date().toISOString(), currentAnswers:[], justSubmittedAttempt:false };
+  await setProgress(currentUser.id, currentUserProgress);
+  renderApp();
+  if(qaTimerInterval) clearInterval(qaTimerInterval);
+  qaTimerInterval = setInterval(()=>{
+    const el = document.getElementById('qa-timer-'+idx);
+    if(!el){ clearInterval(qaTimerInterval); return; }
+    const item = contentOverrides[dayId].content[idx];
+    const state = currentUserProgress[dayId].quickAssessments[idx];
+    if(!state || !state.startedAt){ clearInterval(qaTimerInterval); return; }
+    const durationSec = quickAssessmentDurationSeconds(item);
+    const elapsedSec = (Date.now() - new Date(state.startedAt).getTime())/1000;
+    const remainingSec = Math.max(0, Math.round(durationSec - elapsedSec));
+    const mins = Math.floor(remainingSec/60), secs = remainingSec%60;
+    el.textContent = `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
+    if(remainingSec<=0){ clearInterval(qaTimerInterval); submitQuickAssessment(dayId, idx, true); }
+  }, 1000);
+}
+async function submitQuickAssessment(dayId, idx, isAutoSubmit){
+  if(qaTimerInterval){ clearInterval(qaTimerInterval); qaTimerInterval = null; }
+  const item = contentOverrides[dayId].content[idx];
+  const dp = currentUserProgress[dayId];
+  const state = dp.quickAssessments[idx];
+  if(!state || state.justSubmittedAttempt) return; // prevent double-submit
+  const answers = (item.questions||[]).map((q,qi)=>{
+    const checked = document.querySelector(`input[name="qa-answer-${idx}-${qi}"]:checked`);
+    return checked ? parseInt(checked.value) : (state.currentAnswers[qi] ?? -1);
+  });
+  const total = (item.questions||[]).length;
+  const score = (item.questions||[]).reduce((sum,q,qi)=>sum + (answers[qi]===q.correct?1:0), 0);
+  const percent = total>0 ? Math.round((score/total)*100) : 0;
+  const passed = percent >= (item.passingPercent||70);
+  state.attempts.push({ answers, score, total, percent, passed, at:new Date().toISOString(), auto:!!isAutoSubmit });
+  state.passed = state.passed || passed;
+  state.startedAt = null;
+  state.currentAnswers = [];
+  state.justSubmittedAttempt = true;
+  await setProgress(currentUser.id, currentUserProgress);
+  updateTheoryCompleteButtonState(dayId);
+  renderApp();
+}
 function renderActivityUploadItem(dayId, item, idx){
   const mine = (myMediaCache[dayId]||[]).filter(m=>m.activityIndex===idx).sort((a,b)=>new Date(a.uploadedAt)-new Date(b.uploadedAt));
   const latest = mine.length ? mine[mine.length-1] : null;
@@ -7825,6 +7941,28 @@ function syncModuleDraftFromDOM(){
       if(g('c-mediatype-'+i)) item.mediaType = g('c-mediatype-'+i).value;
       if(g('c-instructions-'+i)) item.instructions = g('c-instructions-'+i).value;
       if(g('c-aicriteria-'+i)) item.aiCriteria = g('c-aicriteria-'+i).value;
+    } else if(item.type==='quickAssessment'){
+      if(g('c-qa-title-'+i)) item.title = g('c-qa-title-'+i).value;
+      if(g('c-qa-enabled-'+i)) item.enabled = g('c-qa-enabled-'+i).checked;
+      if(g('c-qa-mandatory-'+i)) item.mandatory = g('c-qa-mandatory-'+i).checked;
+      if(g('c-qa-reattempt-'+i)) item.allowReattempt = g('c-qa-reattempt-'+i).checked;
+      if(g('c-qa-passpct-'+i)) item.passingPercent = Math.max(0, Math.min(100, parseInt(g('c-qa-passpct-'+i).value)||0));
+      if(g('c-qa-maxattempts-'+i)) item.maxAttempts = Math.max(1, parseInt(g('c-qa-maxattempts-'+i).value)||1);
+      if(g('c-qa-timer-'+i)){
+        const tv = g('c-qa-timer-'+i).value;
+        item.timerMinutes = tv==='custom' ? 'custom' : parseInt(tv);
+      }
+      if(g('c-qa-customtimermins-'+i)) item.customTimerMinutes = Math.max(1, parseInt(g('c-qa-customtimermins-'+i).value)||30);
+      if(item.questions){
+        item.questions.forEach((q,qi)=>{
+          if(g(`qa-q-${i}-${qi}`)) q.question = g(`qa-q-${i}-${qi}`).value;
+          if(!q.options) q.options = ['','','',''];
+          q.options.forEach((o,oi)=>{ if(g(`qa-opt-${i}-${qi}-${oi}`)) q.options[oi] = g(`qa-opt-${i}-${qi}-${oi}`).value; });
+          const correctEl = document.querySelector(`input[name="qa-correct-${i}-${qi}"]:checked`);
+          if(correctEl) q.correct = parseInt(correctEl.value);
+          if(g(`qa-klp-${i}-${qi}`)) q.keyLearningPoint = g(`qa-klp-${i}-${qi}`).value;
+        });
+      }
     }
   });
   moduleDraft.tasks.forEach((t,i)=>{
@@ -7846,6 +7984,7 @@ const BLANK_CONTENT_ITEM = {
   text: ()=>({type:'text', body:'New text block'}),
   button: ()=>({type:'button', label:'Button', action:''}),
   uploadActivity: ()=>({type:'uploadActivity', activityLabel:'New upload activity', mediaType:'photo', instructions:'Upload a photo or video of your practical work for your trainer to review.', aiCriteria:''}),
+  quickAssessment: ()=>({type:'quickAssessment', title:'Quick Assessment', questions:[], passingPercent:70, mandatory:true, timerMinutes:10, customTimerMinutes:null, allowReattempt:true, maxAttempts:3, enabled:true}),
 };
 function insertContentItem(afterIndex, type){
   syncModuleDraftFromDOM();
@@ -7854,6 +7993,18 @@ function insertContentItem(afterIndex, type){
 }
 function removeContentItem(i){ syncModuleDraftFromDOM(); moduleDraft.content.splice(i,1); refreshModuleEditor(); }
 function duplicateContentItem(i){ syncModuleDraftFromDOM(); const copy = JSON.parse(JSON.stringify(moduleDraft.content[i])); moduleDraft.content.splice(i+1,0,copy); refreshModuleEditor(); }
+function addQuickAssessmentQuestion(i){
+  syncModuleDraftFromDOM();
+  const item = moduleDraft.content[i];
+  if(!item.questions) item.questions = [];
+  item.questions.push({ question:'New question', options:['','','',''], correct:0, keyLearningPoint:'' });
+  refreshModuleEditor();
+}
+function removeQuickAssessmentQuestion(i, qi){
+  syncModuleDraftFromDOM();
+  moduleDraft.content[i].questions.splice(qi,1);
+  refreshModuleEditor();
+}
 function moveContentItem(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.content.length) return; [moduleDraft.content[i],moduleDraft.content[j]]=[moduleDraft.content[j],moduleDraft.content[i]]; refreshModuleEditor(); }
 let dragFromIndex = null;
 function onContentDragStart(i){ dragFromIndex = i; }
@@ -8014,7 +8165,7 @@ async function resetModuleToDefault(){
     closeModuleEditor();
   });
 }
-function contentTypeLabel(type){ return {theory:'Theory', video:'Video', audio:'Audio', photo:'Photo', banner:'Banner', text:'Text', button:'Button', uploadActivity:'Upload Activity'}[type] || type; }
+function contentTypeLabel(type){ return {theory:'Theory', video:'Video', audio:'Audio', photo:'Photo', banner:'Banner', text:'Text', button:'Button', uploadActivity:'Upload Activity', quickAssessment:'Quick Assessment'}[type] || type; }
 function ccContentTypePermKey(item){
   if(item.type==='theory') return 'editTheory';
   if(item.type==='video') return 'editVideo';
@@ -8035,6 +8186,7 @@ function renderAddRow(afterIndex){
       ${btn('text',null,'Text')}
       ${btn('button',null,'Button')}
       <button class="btn small secondary" onclick="insertContentItem(${afterIndex},'uploadActivity')" ${(canCreate && (ccCan('editPhotoUpload')||ccCan('editVideoUpload')))?'':'disabled'}>+ Upload Activity</button>
+      ${btn('quickAssessment',null,'Quick Assessment')}
     </div>
   `;
 }
@@ -8137,6 +8289,49 @@ function renderContentItemCard(item, i, total){
       <textarea class="field-input reflect" id="c-aicriteria-${i}" style="min-height:70px;" placeholder="e.g. The multimeter probes should be correctly placed on the component terminals, and the display should show a visible reading.">${esc(item.aiCriteria||'')}</textarea>
       ${item.mediaType==='video' ? `<p style="font-size:12px;color:var(--danger);">Video review samples a few still frames — it can't see motion, technique, or anything that happens between frames. Treat it as a rough first pass, more so than for photos.</p>` : ''}
       ${currentAiSettings.enabled ? `<p style="font-size:12px;color:var(--ink-soft);">AI review is enabled — uploads here get an automatic first-pass result before your Trainer confirms it.</p>` : `<p style="font-size:12px;color:var(--danger);">AI review is currently OFF. Enable it in Theme &amp; Branding to use this. Until then, uploads here go straight to manual review.</p>`}
+    `;
+  } else if(item.type==='quickAssessment'){
+    const timerPresets = [5,10,15,20,30,45,60];
+    fields = `
+      <input class="field-input" id="c-qa-title-${i}" value="${esc(item.title||'')}" placeholder="Assessment title">
+      <div class="filter-row" style="margin-bottom:10px;">
+        <label style="display:flex;gap:6px;align-items:center;"><input type="checkbox" id="c-qa-enabled-${i}" ${item.enabled!==false?'checked':''}>Enabled</label>
+        <label style="display:flex;gap:6px;align-items:center;"><input type="checkbox" id="c-qa-mandatory-${i}" ${item.mandatory!==false?'checked':''}>Mandatory to proceed</label>
+        <label style="display:flex;gap:6px;align-items:center;"><input type="checkbox" id="c-qa-reattempt-${i}" ${item.allowReattempt!==false?'checked':''}>Allow reattempt</label>
+      </div>
+      <span class="field-label">Passing score (%)</span>
+      <input class="field-input" id="c-qa-passpct-${i}" type="number" min="0" max="100" value="${item.passingPercent??70}">
+      <span class="field-label">Maximum attempts</span>
+      <input class="field-input" id="c-qa-maxattempts-${i}" type="number" min="1" value="${item.maxAttempts??3}">
+      <span class="field-label">Timer duration</span>
+      <select class="field-input" id="c-qa-timer-${i}" onchange="document.getElementById('c-qa-customtimer-row-${i}').style.display=this.value==='custom'?'block':'none';">
+        ${timerPresets.map(m=>`<option value="${m}" ${String(item.timerMinutes)===String(m)?'selected':''}>${m<60?m+' minutes':'1 hour'}</option>`).join('')}
+        <option value="custom" ${item.timerMinutes==='custom'?'selected':''}>Custom duration</option>
+      </select>
+      <div id="c-qa-customtimer-row-${i}" style="display:${item.timerMinutes==='custom'?'block':'none'};">
+        <span class="field-label">Custom duration (minutes)</span>
+        <input class="field-input" id="c-qa-customtimermins-${i}" type="number" min="1" value="${item.customTimerMinutes||30}">
+      </div>
+      <span class="field-label" style="margin-top:10px;">Questions</span>
+      ${(item.questions||[]).length===0?`<div class="empty-state" style="padding:10px;">No questions yet — click "+ Add question" below.</div>`:''}
+      ${(item.questions||[]).map((q,qi)=>`
+        <div class="card" style="background:var(--porcelain);margin-bottom:8px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+            <span class="field-label" style="margin:0;">Question ${qi+1}</span>
+            <button class="btn small danger" onclick="removeQuickAssessmentQuestion(${i},${qi})">Remove</button>
+          </div>
+          <input class="field-input" id="qa-q-${i}-${qi}" value="${esc(q.question||'')}" placeholder="Question text">
+          ${(q.options||['','','','']).map((opt,oi)=>`
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
+              <input type="radio" name="qa-correct-${i}-${qi}" value="${oi}" ${q.correct===oi?'checked':''}>
+              <input class="field-input" style="margin-bottom:0;" id="qa-opt-${i}-${qi}-${oi}" value="${esc(opt)}" placeholder="Option ${oi+1}">
+            </div>
+          `).join('')}
+          <span class="field-label">Key learning point (shown if this question is answered incorrectly)</span>
+          <textarea class="field-input reflect" id="qa-klp-${i}-${qi}" style="min-height:50px;">${esc(q.keyLearningPoint||'')}</textarea>
+        </div>
+      `).join('')}
+      <button class="btn secondary small" onclick="addQuickAssessmentQuestion(${i})">+ Add question</button>
     `;
   }
   return `
