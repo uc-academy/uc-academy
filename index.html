@@ -1051,16 +1051,10 @@ async function listCourses(){
   return out;
 }
 async function seedDefaultCategoriesIfEmpty(){
-  const existing = await listCategories();
-  if(Object.keys(existing).length>0) return;
-  for(const cat of DEFAULT_CATEGORY_SEED){
-    const categoryId = uid();
-    await kvSet('category:'+categoryId, { name:cat.name, active:true, createdAt:new Date().toISOString() });
-    for(const courseName of cat.courses){
-      const courseId = uid();
-      await kvSet('course:'+courseId, { categoryId, name:courseName, active:true, createdAt:new Date().toISOString() });
-    }
-  }
+  // Intentionally a no-op: nothing should be auto-created. Categories and courses
+  // are created manually by the Admin only. Left in place so existing call sites
+  // throughout the app don't need to be touched individually.
+  return;
 }
 async function listTrainers(){
   const keys = await kvList('trainer:');
@@ -4171,7 +4165,6 @@ const ADMIN_TAB_KEYS_DEFAULT = [
   ['languages','Languages','Regional language content'],
   ['support','Support','Requests & issues'],
   ['history','History','Audit log'],
-  ['modules','Modules','Edit course content'],
   ['media','Media Review','Photo & video review'],
   ['aidoubts','AI Doubts','Student questions & AI answers'],
   ['batches','Batches','Track by batch'],
@@ -4419,6 +4412,8 @@ async function renderAdminMain(){
     else if(editingCourseId){
       await seedDefaultLanguageIfEmpty();
       adminLanguages = await listLanguages();
+      adminCategories = await listCategories();
+      adminCourses = await listCourses();
       courseEditorDays = await getDayRegistry(editingCourseId);
       courseEditorOverrideCache = {};
       await Promise.all(courseEditorDays.map(async dayId=>{ courseEditorOverrideCache[dayId] = await getContentOverride(dayId, editingCourseId, editingLanguage); }));
@@ -4996,7 +4991,7 @@ function renderCategoryManageTab(){
   return `
     <div class="crumb">Admin dashboard</div>
     <h1 class="page-title">Category Management</h1>
-    <p class="page-sub">Categories and their courses. This is the foundation for assigning Trainers, Content Creators, Zonal Managers, and Partners to specific categories and courses — course content itself isn't split up by category yet.</p>
+    <p class="page-sub">Categories and their courses. Each course has its own independent Home Page, days, and content — click "Edit modules" on any course below to manage them. Nothing is created by default; build categories, courses, Home Pages, and days manually, and nothing is visible to Trainers or Partners until you Save &amp; Publish.</p>
     <div class="card">
       <h3>Add a category</h3>
       <div style="display:flex;gap:10px;">
@@ -7748,7 +7743,7 @@ function renderCourseModulesListTab(){
     <div class="crumb">Admin dashboard &middot; Category Management${cat?' &middot; '+esc(cat.name):''}</div>
     <h1 class="page-title">${esc(course?.name||'Course')} — Modules</h1>
     <p class="page-sub">This course's own days, completely separate from any other course. Nothing changes for trainers or partners until you Save &amp; Publish each day.</p>
-    <button class="btn secondary small" onclick="editingCourseId=null; setAdminTab('modules');" style="margin-bottom:14px;">&larr; Back to Modules</button>
+    <button class="btn secondary small" onclick="editingCourseId=null; setAdminTab('categories');" style="margin-bottom:14px;">&larr; Back to Category Management</button>
     <div class="card">
       <span class="field-label">Editing language</span>
       <select class="field-input" id="course-modules-lang-select" onchange="setEditingLanguage(this.value)">
