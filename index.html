@@ -366,7 +366,7 @@
 
 <script src="https://www.youtube.com/iframe_api"></script>
 <script>
-let COURSE_NAME = "Urban Company Academy";
+let COURSE_NAME = "Urban Company Academy Expert Courses";
 let COURSE_SUB = "Professional Expert Courses";
 const CATEGORIES = ["RWM","AC","Native","OA"];
 const CITIES = ["Noida","Delhi","Mumbai","Kolkata","Chennai","Hyderabad","Bangalore","Growth"];
@@ -1213,7 +1213,7 @@ const NAV_LABEL_KEYS = [
 const DEFAULT_THEME = {
   brandColor: '#5B3FA3', logoText: 'UC', logoImageUrl: '',
   headingFont: 'Poppins', bodyFont: 'Inter',
-  courseName: 'Urban Company Academy', courseSub: 'Professional Expert Courses',
+  courseName: 'Urban Company Academy Expert Courses', courseSub: 'Professional Expert Courses',
   navLabels: {}
 };
 let currentTheme = { ...DEFAULT_THEME };
@@ -3095,7 +3095,7 @@ function renderQuickAssessmentBlock(dayId, item, idx, dp){
       <p style="font-size:22px;font-weight:700;color:${last.passed?'var(--success)':'var(--danger)'};margin:4px 0;">${last.score}/${last.total} (${last.percent}%) — ${last.passed?'Passed':'Failed'}</p>
       ${!last.passed ? `<div style="margin-top:10px;">
         <p style="font-weight:600;margin-bottom:6px;">Questions to review:</p>
-        ${(item.questions||[]).map((q,qi)=>last.answers[qi]!==q.correct?`<div class="save-note" style="margin-bottom:8px;"><strong>${esc(q.question)}</strong><br>Correct answer: ${esc(q.options[q.correct])}${q.keyLearningPoint?`<br><em>${esc(q.keyLearningPoint)}</em>`:''}</div>`:'').join('')}
+        ${(item.questions||[]).map((q,qi)=>last.answers[qi]!==q.correct?`<div class="save-note" style="margin-bottom:8px;"><strong>${esc(q.question)}</strong><br>Correct answer: ${esc(q.options[q.correct])}${q.keyLearningPoint?`<br><span class="rte-content ql-editor">${q.keyLearningPoint}</span>`:''}</div>`:'').join('')}
       </div>` : ''}
       ${!last.passed && canAttempt ? `<p style="font-size:12.5px;color:var(--ink-soft);margin-top:8px;">Attempt ${attemptCount} of ${maxAttempts} used.</p><button class="btn amber" onclick="startQuickAssessment(${jsDayId(dayId)},${idx})">Retry Assessment</button>` : ''}
       ${!last.passed && !canAttempt ? `<p style="color:var(--danger);font-size:13px;margin-top:8px;">No attempts remaining. Contact your Trainer.</p>` : ''}
@@ -3172,7 +3172,7 @@ function renderOptionQuestionBlock(dayId, item, idx, dp){
         return `<div style="margin-bottom:14px;">
           <p style="font-weight:600;margin-bottom:6px;">${qi+1}. ${esc(q.question)} ${isCorrect?'<span style="color:var(--success);">&#10003;</span>':'<span style="color:var(--danger);">&#10007;</span>'}</p>
           ${q.options.map((opt,oi)=>`<div style="padding:4px 8px;${opt.correct?'color:var(--success);font-weight:600;':(selected.includes(oi)?'color:var(--danger);':'color:var(--ink-soft);')}">${selected.includes(oi)?'&#9745;':'&#9744;'} ${esc(opt.text)}</div>`).join('')}
-          ${q.explanation?`<div class="save-note" style="margin-top:4px;"><em>${esc(q.explanation)}</em></div>`:''}
+          ${q.explanation?`<div class="save-note" style="margin-top:4px;"><span class="rte-content ql-editor">${q.explanation}</span></div>`:''}
         </div>`;
       }).join('')}
     </div>`;
@@ -3237,7 +3237,7 @@ function renderActivityUploadItem(dayId, item, idx){
       <h3 style="margin:0;">${esc(item.activityLabel||'Upload activity')}</h3>
       ${statusPill}
     </div>
-    <p style="color:var(--ink-soft);margin-bottom:10px;">${esc(item.instructions||'Upload photos or videos of your practical work for your trainer to review.')}</p>
+    <div class="rte-content ql-editor" style="margin-bottom:10px;">${item.instructions||'Upload photos or videos of your practical work for your trainer to review.'}</div>
     ${latest ? `<div style="margin-bottom:10px;">
       ${latest.type==='photo' ? `<img src="${esc(latest.url)}" style="max-width:100%;max-height:240px;border-radius:8px;">` : `<video src="${esc(latest.url)}" controls style="max-width:100%;max-height:240px;border-radius:8px;"></video>`}
       <div class="save-note">Submitted ${fmtDateTime(latest.uploadedAt)}</div>
@@ -3873,7 +3873,7 @@ function renderAssignment(day){
   const myMedia = myMediaCache[day.id] || [];
   const uploadEnabled = getEffectiveMediaUploadEnabled(day.id);
   return `
-    <div class="card"><h3>Hands-on assignment</h3><p>${esc(intro)}</p>
+    <div class="card"><h3>Hands-on assignment</h3><div class="rte-content ql-editor">${intro||''}</div>
       ${tasks.map((t,i)=>`<div class="task-row"><input type="checkbox" id="task-${i}" ${dp.tasksChecked[i]?'checked':''} onchange="toggleTask(${day.id},${i})"><label for="task-${i}">${esc(t)}</label></div>`).join('')}
       <div class="save-note">${dp.tasksChecked.filter(Boolean).length} of ${tasks.length} tasks checked off &middot; saved automatically</div>
     </div>
@@ -7992,6 +7992,27 @@ function rteMount(fieldId, initialHtml, placeholder, contextPath){
 function rteCurrentContext(){
   return [editingCourseId||'legacy', editingDayId||'x', editingLanguage||'default'].join('/');
 }
+function triggerPhotoBlockUpload(i){
+  document.getElementById('c-photo-upload-input-'+i).click();
+}
+async function handlePhotoBlockUpload(i){
+  const input = document.getElementById('c-photo-upload-input-'+i);
+  const file = input.files[0];
+  if(!file) return;
+  const btn = document.getElementById('c-photo-upload-btn-'+i);
+  const originalLabel = btn.textContent;
+  btn.textContent = 'Uploading...'; btn.disabled = true;
+  const result = await rteUploadImage(file, rteCurrentContext());
+  btn.textContent = originalLabel; btn.disabled = false;
+  input.value = '';
+  if(!result.ok){ showToast(result.reason, 'error'); return; }
+  const urlField = document.getElementById('c-url-'+i);
+  if(urlField) urlField.value = result.url;
+  const preview = document.getElementById('c-photo-preview-'+i);
+  if(preview) preview.innerHTML = `<img src="${esc(result.url)}" style="max-width:220px;max-height:160px;border-radius:8px;display:block;margin-bottom:8px;">`;
+  syncModuleDraftFromDOM();
+  showToast('Photo uploaded.', 'success');
+}
 async function rteInsertImageFile(quill, file, contextPath){
   const range = quill.getSelection(true) || { index: quill.getLength() };
   showToast('Uploading image...', 'info');
@@ -8427,7 +8448,7 @@ function syncModuleDraftFromDOM(){
   const g = id => document.getElementById(id);
   if(g('draft-title')) moduleDraft.title = g('draft-title').value;
   if(g('draft-sub')) moduleDraft.sub = g('draft-sub').value;
-  if(g('draft-assignment-intro')) moduleDraft.assignmentIntro = g('draft-assignment-intro').value;
+  { const ai = rteGetValue('draft-assignment-intro'); if(ai!==undefined) moduleDraft.assignmentIntro = ai; }
   if(g('draft-media-upload-enabled')) moduleDraft.mediaUploadEnabled = g('draft-media-upload-enabled').checked;
   if(g('draft-ai-assistant-disabled')) moduleDraft.aiAssistantDisabled = g('draft-ai-assistant-disabled').checked;
   moduleDraft.content.forEach((item,i)=>{
@@ -8479,7 +8500,7 @@ function syncModuleDraftFromDOM(){
     } else if(item.type==='uploadActivity'){
       if(g('c-activitylabel-'+i)) item.activityLabel = g('c-activitylabel-'+i).value;
       if(g('c-mediatype-'+i)) item.mediaType = g('c-mediatype-'+i).value;
-      if(g('c-instructions-'+i)) item.instructions = g('c-instructions-'+i).value;
+      { const iv = rteGetValue('c-instructions-'+i); if(iv!==undefined) item.instructions = iv; }
       if(g('c-aicriteria-'+i)) item.aiCriteria = g('c-aicriteria-'+i).value;
     } else if(item.type==='quickAssessment'){
       if(g('c-qa-title-'+i)) item.title = g('c-qa-title-'+i).value;
@@ -8500,7 +8521,7 @@ function syncModuleDraftFromDOM(){
           q.options.forEach((o,oi)=>{ if(g(`qa-opt-${i}-${qi}-${oi}`)) q.options[oi] = g(`qa-opt-${i}-${qi}-${oi}`).value; });
           const correctEl = document.querySelector(`input[name="qa-correct-${i}-${qi}"]:checked`);
           if(correctEl) q.correct = parseInt(correctEl.value);
-          if(g(`qa-klp-${i}-${qi}`)) q.keyLearningPoint = g(`qa-klp-${i}-${qi}`).value;
+          { const klp = rteGetValue(`qa-klp-${i}-${qi}`); if(klp!==undefined) q.keyLearningPoint = klp; }
         });
       }
     } else if(item.type==='checkboxQuestion' || item.type==='mcqQuestion'){
@@ -8519,7 +8540,7 @@ function syncModuleDraftFromDOM(){
             if(g(`${prefix}-correct-${i}-${qi}-${oi}`)) opt.correct = g(`${prefix}-correct-${i}-${qi}-${oi}`).checked;
           });
           if(isMcq && g(`${prefix}-marks-${i}-${qi}`)) q.marks = Math.max(0, parseInt(g(`${prefix}-marks-${i}-${qi}`).value)||0);
-          if(g(`${prefix}-explain-${i}-${qi}`)) q.explanation = g(`${prefix}-explain-${i}-${qi}`).value;
+          { const exp = rteGetValue(`${prefix}-explain-${i}-${qi}`); if(exp!==undefined) q.explanation = exp; }
         });
       }
     } else if(item.type==='pageBreak'){
@@ -8907,7 +8928,12 @@ function renderContentItemCard(item, i, total){
   } else if(item.type==='photo'){
     fields = `
       <input class="field-input" id="c-title-${i}" value="${esc(item.title)}" placeholder="Photo title">
-      <input class="field-input" id="c-url-${i}" value="${esc(item.url)}" placeholder="Image URL or Google Drive share link">
+      <div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;">
+        <input class="field-input" id="c-url-${i}" style="margin-bottom:0;flex:1;" value="${esc(item.url)}" placeholder="Image URL or Google Drive share link">
+        <button type="button" class="btn secondary small" id="c-photo-upload-btn-${i}" onclick="triggerPhotoBlockUpload(${i})" style="white-space:nowrap;">Upload</button>
+        <input type="file" id="c-photo-upload-input-${i}" accept="${RTE_IMAGE_ALLOWED_TYPES.join(',')}" style="display:none;" onchange="handlePhotoBlockUpload(${i})">
+      </div>
+      <div id="c-photo-preview-${i}">${item.url?`<img src="${esc(item.url)}" style="max-width:220px;max-height:160px;border-radius:8px;display:block;margin-bottom:8px;">`:''}</div>
       <input class="field-input" id="c-caption-${i}" value="${esc(item.caption||'')}" placeholder="Caption (optional)">
     `;
   } else if(item.type==='banner'){
@@ -8932,7 +8958,7 @@ function renderContentItemCard(item, i, total){
         <option value="video" ${item.mediaType==='video'?'selected':''}>Video</option>
       </select>
       <span class="field-label">Instructions shown to the partner</span>
-      <textarea class="field-input reflect" id="c-instructions-${i}" style="min-height:70px;">${esc(item.instructions||'')}</textarea>
+      ${rteMount('c-instructions-'+i, item.instructions||'', 'Instructions for this activity', rteCurrentContext())}
       <span class="field-label">AI grading criteria (what should the AI check for?)</span>
       <textarea class="field-input reflect" id="c-aicriteria-${i}" style="min-height:70px;" placeholder="e.g. The multimeter probes should be correctly placed on the component terminals, and the display should show a visible reading.">${esc(item.aiCriteria||'')}</textarea>
       ${item.mediaType==='video' ? `<p style="font-size:12px;color:var(--danger);">Video review samples a few still frames — it can't see motion, technique, or anything that happens between frames. Treat it as a rough first pass, more so than for photos.</p>` : ''}
@@ -8976,7 +9002,7 @@ function renderContentItemCard(item, i, total){
             </div>
           `).join('')}
           <span class="field-label">Key learning point (shown if this question is answered incorrectly)</span>
-          <textarea class="field-input reflect" id="qa-klp-${i}-${qi}" style="min-height:50px;">${esc(q.keyLearningPoint||'')}</textarea>
+          ${rteMount(`qa-klp-${i}-${qi}`, q.keyLearningPoint||'', 'Shown when this question is answered incorrectly', rteCurrentContext())}
         </div>
       `).join('')}
       <button class="btn secondary small" onclick="addQuickAssessmentQuestion(${i})">+ Add question</button>
@@ -9016,7 +9042,7 @@ function renderContentItemCard(item, i, total){
           <button class="btn secondary small" onclick="addOptionTo${isMcq?'Mcq':'Checkbox'}Question(${i},${qi})" style="margin-bottom:8px;">+ Add option</button>
           ${isMcq ? `<span class="field-label">Marks</span><input class="field-input" id="${prefix}-marks-${i}-${qi}" type="number" min="0" value="${q.marks??1}">` : ''}
           <span class="field-label">Explanation / feedback</span>
-          <textarea class="field-input reflect" id="${prefix}-explain-${i}-${qi}" style="min-height:50px;">${esc(q.explanation||'')}</textarea>
+          ${rteMount(`${prefix}-explain-${i}-${qi}`, q.explanation||'', 'Explanation or feedback for this question', rteCurrentContext())}
         </div>
       `).join('')}
       <button class="btn secondary small" onclick="add${isMcq?'Mcq':'Checkbox'}Question(${i})">+ Add question</button>
@@ -9076,7 +9102,7 @@ function renderModuleEditorTab(){
     <fieldset ${ccCan('canEdit')&&ccCan('editAssignment')?'':'disabled'} style="border:none;padding:0;margin:0;${ccCan('canEdit')&&ccCan('editAssignment')?'':'opacity:0.6;'}">
     <div class="card">
       <span class="field-label">Intro text</span>
-      <textarea class="field-input reflect" id="draft-assignment-intro" style="min-height:70px;">${esc(d.assignmentIntro)}</textarea>
+      ${rteMount('draft-assignment-intro', d.assignmentIntro||'', 'Introduce the assignment', rteCurrentContext())}
     </div>
     ${d.tasks.map((t,i)=>`
       <div class="card" style="display:flex;gap:10px;align-items:center;">
