@@ -1518,7 +1518,7 @@ window.onYouTubeIframeAPIReady = function(){ ytApiReady = true; };
 function defaultDayProgress(){
   return { theoryDone:false, audioPlayed:false, videoPct:0, videoDone:false,
     quizSubmitted:false, quizScore:0, quizTotal:0, quizPct:0, quizAnswers:[], quizDate:'',
-    tasksChecked:[], reflection:'', videoItemProgress:{}, videoRanges:[], videoLastTime:null, inVideoQuizAnswers:{}, quickAssessments:{}, checkboxQuestions:{}, mcqQuestions:{} };
+    tasksChecked:[], reflection:'', videoItemProgress:{}, videoRanges:[], videoLastTime:null, inVideoQuizAnswers:{}, quickAssessments:{}, checkboxQuestions:{}, mcqQuestions:{}, currentPageIndex:0 };
 }
 function ensureDay(d){
   if(!currentUserProgress[d]) currentUserProgress[d] = defaultDayProgress();
@@ -2853,10 +2853,17 @@ function renderTheory(day){
   let html='';
   if(ov){
     const items = ov.content || [];
-    const videoIndices = items.map((it,i)=>(it.type==='video' && it.url)?i:null).filter(i=>i!==null);
-    const hasAudio = items.some(i=>i.type==='audio');
+    const pageRanges = splitContentIntoPageRanges(items);
+    const isPaginated = pageRanges.length>1;
+    const pageIdx = Math.min(dp.currentPageIndex||0, pageRanges.length-1);
+    const visibleIndices = isPaginated ? new Set(pageRanges[pageIdx]) : null;
+    const videoIndices = items.map((it,i)=>(it.type==='video' && it.url && (!visibleIndices||visibleIndices.has(i)))?i:null).filter(i=>i!==null);
+    const hasAudio = items.some((it,i)=>it.type==='audio' && (!visibleIndices||visibleIndices.has(i)));
     items.forEach((item,idx)=>{
-      if(item.type==='theory'){
+      if(visibleIndices && !visibleIndices.has(idx)) return;
+      if(item.type==='pageBreak'){
+        return;
+      } else if(item.type==='theory'){
         html += `<div class="card"><h3>${esc(item.heading)}</h3><p style="white-space:pre-wrap;">${esc(item.body)}</p></div>`;
       } else if(item.type==='video'){
         if(item.url) html += renderOverrideVideoItem(day.id, item, idx, dp);
@@ -2864,6 +2871,12 @@ function renderTheory(day){
         if(item.url) html += `<div class="card"><h3>${esc(item.title||'Audio')}</h3>${renderAudioEmbed(item.url, 'markAudioPlayed('+day.id+')')}</div>`;
       } else if(item.type==='photo'){
         html += `<div class="card"><h3>${esc(item.title||'Photo')}</h3>${item.url?`<img src="${esc(item.url)}" style="max-width:100%;border-radius:8px;">`:'<div class="video-placeholder">No image linked yet.</div>'}${item.caption?`<p style="margin-top:8px;color:var(--ink-soft);font-size:12.5px;">${esc(item.caption)}</p>`:''}</div>`;
+      } else if(item.type==='banner'){
+        html += `<div class="card" style="text-align:center;background:linear-gradient(135deg,var(--brand-light),#fff);">${item.imageUrl?`<img src="${esc(item.imageUrl)}" style="max-width:100%;border-radius:8px;margin-bottom:10px;">`:''}<h2 style="margin:0 0 6px;">${esc(item.headline)}</h2>${item.subtext?`<p style="color:var(--ink-soft);margin:0;">${esc(item.subtext)}</p>`:''}</div>`;
+      } else if(item.type==='text'){
+        html += `<div class="card"><p style="white-space:pre-wrap;">${esc(item.body)}</p></div>`;
+      } else if(item.type==='button'){
+        html += `<div class="card" style="text-align:center;"><a class="btn amber" href="${esc(item.action||'#')}" target="_blank" rel="noopener" style="text-decoration:none;display:inline-block;">${esc(item.label||'Button')}</a></div>`;
       } else if(item.type==='uploadActivity'){
         html += renderActivityUploadItem(day.id, item, idx);
       } else if(item.type==='quickAssessment'){
@@ -2873,17 +2886,29 @@ function renderTheory(day){
       }
     });
     const allVideosDone = videoIndices.every(i => dp.videoItemProgress[i]?.done);
-    const mandatoryQAIndices = items.map((it,i)=>(it.type==='quickAssessment' && it.enabled!==false && it.mandatory!==false)?i:null).filter(i=>i!==null);
+    const mandatoryQAIndices = items.map((it,i)=>(it.type==='quickAssessment' && it.enabled!==false && it.mandatory!==false && (!visibleIndices||visibleIndices.has(i)))?i:null).filter(i=>i!==null);
     const allQAPassed = mandatoryQAIndices.every(i => dp.quickAssessments && dp.quickAssessments[i] && dp.quickAssessments[i].passed);
-    const mandatoryOptionQIndices = items.map((it,i)=>((it.type==='checkboxQuestion'||it.type==='mcqQuestion') && it.enabled!==false && it.mandatory!==false)?i:null).filter(i=>i!==null);
+    const mandatoryOptionQIndices = items.map((it,i)=>((it.type==='checkboxQuestion'||it.type==='mcqQuestion') && it.enabled!==false && it.mandatory!==false && (!visibleIndices||visibleIndices.has(i)))?i:null).filter(i=>i!==null);
     const allOptionQSubmitted = mandatoryOptionQIndices.every(i => (dp.checkboxQuestions&&dp.checkboxQuestions[i]&&dp.checkboxQuestions[i].submitted) || (dp.mcqQuestions&&dp.mcqQuestions[i]&&dp.mcqQuestions[i].submitted));
     const canComplete = allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed && allOptionQSubmitted;
     const fullyDone = dp.theoryDone && dp.videoDone;
+    const isLastPage = !isPaginated || pageIdx===pageRanges.length-1;
+    if(isPaginated){
+      html += `<div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+        <span style="font-size:12.5px;color:var(--ink-soft);">Page ${pageIdx+1} of ${pageRanges.length}</span>
+        <div style="display:flex;gap:8px;">
+          ${pageIdx>0 ? `<button class="btn secondary" onclick="goToTheoryPage(${day.id},${pageIdx-1})">&larr; Previous Page</button>` : ''}
+          ${!isLastPage ? `<button class="btn amber" id="theory-complete-btn" ${!canComplete?'disabled':''} onclick="goToTheoryPage(${day.id},${pageIdx+1})">Next Page &rarr;</button>` : ''}
+        </div>
+      </div>`;
+    }
+    if(isLastPage){
     html += `<div class="card">
       ${fullyDone ? `<p style="color:var(--success);font-weight:500;">Marked complete. Assignment and Assessment are unlocked below.</p>` :
       `<p>${videoIndices.length>0?'Watch '+(videoIndices.length>1?'all the videos':'the video')+' to 90%'+(hasAudio?', listen to the audio, ':' ')+'then mark this section complete to continue.':(hasAudio?'Listen to the audio, then mark this section complete to continue.':'Read through everything above, then mark it complete to continue.')}</p>
       <button class="btn amber" id="theory-complete-btn" ${!canComplete?'disabled':''} onclick="markTheoryDone(${day.id})">Mark complete</button>`}
     </div>`;
+    }
     return html;
   }
   const audioUrl = audiosCache[day.id];
@@ -2906,6 +2931,19 @@ function renderTheory(day){
   </div>`;
   return html;
 }
+function splitContentIntoPageRanges(items){
+  const pages = [[]];
+  items.forEach((item,idx)=>{
+    if(item.type==='pageBreak'){ pages.push([]); return; }
+    pages[pages.length-1].push(idx);
+  });
+  return pages;
+}
+async function goToTheoryPage(dayId, pageIdx){
+  currentUserProgress[dayId].currentPageIndex = pageIdx;
+  await setProgress(currentUser.id, currentUserProgress);
+  renderApp();
+}
 function markAudioPlayed(dayId){
   currentUserProgress[dayId].audioPlayed = true;
   updateTheoryCompleteButtonState(dayId);
@@ -2916,13 +2954,18 @@ function updateTheoryCompleteButtonState(dayId){
   const ov = contentOverrides[dayId];
   const dp = currentUserProgress[dayId];
   if(ov){
-    const items = ov.content || [];
-    const videoIndices = items.map((it,i)=>(it.type==='video' && it.url && (it.watchSettings?.mandatory!==false))?i:null).filter(i=>i!==null);
-    const hasAudio = items.some(i=>i.type==='audio');
+    const allItems = ov.content || [];
+    const pageRanges = splitContentIntoPageRanges(allItems);
+    const isPaginated = pageRanges.length>1;
+    const pageIdx = Math.min(dp.currentPageIndex||0, pageRanges.length-1);
+    const visibleIndices = isPaginated ? new Set(pageRanges[pageIdx]) : null;
+    const items = allItems;
+    const videoIndices = items.map((it,i)=>(it.type==='video' && it.url && (it.watchSettings?.mandatory!==false) && (!visibleIndices||visibleIndices.has(i)))?i:null).filter(i=>i!==null);
+    const hasAudio = items.some((it,i)=>it.type==='audio' && (!visibleIndices||visibleIndices.has(i)));
     const allVideosDone = videoIndices.every(i => dp.videoItemProgress[i]?.done);
-    const mandatoryQAIndices = items.map((it,i)=>(it.type==='quickAssessment' && it.enabled!==false && it.mandatory!==false)?i:null).filter(i=>i!==null);
+    const mandatoryQAIndices = items.map((it,i)=>(it.type==='quickAssessment' && it.enabled!==false && it.mandatory!==false && (!visibleIndices||visibleIndices.has(i)))?i:null).filter(i=>i!==null);
     const allQAPassed = mandatoryQAIndices.every(i => dp.quickAssessments && dp.quickAssessments[i] && dp.quickAssessments[i].passed);
-    const mandatoryOptionQIndices = items.map((it,i)=>((it.type==='checkboxQuestion'||it.type==='mcqQuestion') && it.enabled!==false && it.mandatory!==false)?i:null).filter(i=>i!==null);
+    const mandatoryOptionQIndices = items.map((it,i)=>((it.type==='checkboxQuestion'||it.type==='mcqQuestion') && it.enabled!==false && it.mandatory!==false && (!visibleIndices||visibleIndices.has(i)))?i:null).filter(i=>i!==null);
     const allOptionQSubmitted = mandatoryOptionQIndices.every(i => (dp.checkboxQuestions&&dp.checkboxQuestions[i]&&dp.checkboxQuestions[i].submitted) || (dp.mcqQuestions&&dp.mcqQuestions[i]&&dp.mcqQuestions[i].submitted));
     btn.disabled = !(allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed && allOptionQSubmitted);
   } else {
@@ -8099,6 +8142,8 @@ function syncModuleDraftFromDOM(){
           if(g(`${prefix}-explain-${i}-${qi}`)) q.explanation = g(`${prefix}-explain-${i}-${qi}`).value;
         });
       }
+    } else if(item.type==='pageBreak'){
+      if(g('c-pagebreak-label-'+i)) item.label = g('c-pagebreak-label-'+i).value;
     }
   });
   moduleDraft.tasks.forEach((t,i)=>{
@@ -8123,6 +8168,7 @@ const BLANK_CONTENT_ITEM = {
   quickAssessment: ()=>({type:'quickAssessment', title:'Quick Assessment', questions:[], passingPercent:70, mandatory:true, timerMinutes:10, customTimerMinutes:null, allowReattempt:true, maxAttempts:3, enabled:true}),
   checkboxQuestion: ()=>({type:'checkboxQuestion', title:'Checkbox Question', questions:[], mandatory:true, enabled:true}),
   mcqQuestion: ()=>({type:'mcqQuestion', title:'MCQ Question', questions:[], mandatory:true, enabled:true}),
+  pageBreak: ()=>({type:'pageBreak', label:'Page break'}),
 };
 function insertContentItem(afterIndex, type){
   syncModuleDraftFromDOM();
@@ -8162,6 +8208,69 @@ function moveMcqQuestion(i, qi, dir){ _moveOptionQuestion(i, qi, dir); }
 function addOptionToMcqQuestion(i, qi){ _addOption(i, qi); }
 function removeOptionFromMcqQuestion(i, qi, oi){ _removeOption(i, qi, oi); }
 function moveContentItem(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.content.length) return; [moduleDraft.content[i],moduleDraft.content[j]]=[moduleDraft.content[j],moduleDraft.content[i]]; refreshModuleEditor(); }
+async function openMoveToDayPanel(i){
+  syncModuleDraftFromDOM();
+  const courseId = editingCourseId || null;
+  const dayIds = await getDayRegistry(courseId);
+  const otherDays = dayIds.filter(id => id !== editingDayId);
+  const titles = {};
+  await Promise.all(otherDays.map(async id=>{
+    const ov = await getContentOverride(id, courseId, editingLanguage);
+    titles[id] = ov ? (ov.title || 'Untitled') : (courseId ? 'Untitled' : (BASE_DAYS.find(d=>d.id===id)?.title||'Untitled'));
+  }));
+  const overlay = document.createElement('div');
+  overlay.id = 'move-to-day-overlay';
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `<div class="confirm-box" style="max-width:480px;text-align:left;">
+    <h3 style="margin-top:0;">Move this block to another day</h3>
+    <p style="font-size:12.5px;color:var(--ink-soft);margin-top:-6px;">Only days that actually exist in this course are shown — nothing here is fixed.</p>
+    ${otherDays.length===0 ? `<div class="empty-state">No other days exist in this course yet.</div>` : `
+    <span class="field-label">Destination day</span>
+    <select class="field-input" id="move-to-day-select">
+      ${otherDays.map(id=>`<option value="${id}">Day ${id} — ${esc(titles[id])}</option>`).join('')}
+    </select>
+    <span class="field-label">Also duplicate to additional days (optional)</span>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:10px;">
+      ${otherDays.map(id=>`<label style="display:flex;gap:5px;align-items:center;"><input type="checkbox" class="move-to-day-extra" value="${id}">Day ${id}</label>`).join('')}
+    </div>
+    <div class="confirm-actions" style="flex-wrap:wrap;">
+      <button class="btn secondary" id="move-to-day-cancel">Cancel</button>
+      <button class="btn secondary" onclick="executeMoveToDay(${i},'copy')">Copy here, keep original</button>
+      <button class="btn amber" onclick="executeMoveToDay(${i},'move')">Move (remove from this day)</button>
+    </div>`}
+  </div>`;
+  document.body.appendChild(overlay);
+  const cancelBtn = overlay.querySelector('#move-to-day-cancel');
+  if(cancelBtn) cancelBtn.addEventListener('click', ()=> overlay.remove());
+  overlay.addEventListener('click', (e)=>{ if(e.target===overlay) overlay.remove(); });
+}
+async function executeMoveToDay(i, mode){
+  const select = document.getElementById('move-to-day-select');
+  const primaryTarget = parseInt(select.value);
+  const extraTargets = Array.from(document.querySelectorAll('.move-to-day-extra:checked')).map(el=>parseInt(el.value));
+  const targets = [...new Set([primaryTarget, ...extraTargets])];
+  const courseId = editingCourseId || null;
+  const block = JSON.parse(JSON.stringify(moduleDraft.content[i]));
+
+  for(const targetDay of targets){
+    const targetOv = await getContentOverride(targetDay, courseId, editingLanguage);
+    const base = targetOv ? JSON.parse(JSON.stringify(targetOv)) : { title:'Day '+targetDay, content:[] };
+    if(!base.content) base.content = [];
+    base.content.push(JSON.parse(JSON.stringify(block)));
+    await setContentOverride(targetDay, base, courseId, editingLanguage);
+    await logHistory('content_block_copied', `${contentTypeLabel(block.type)} block copied from Day ${editingDayId} to Day ${targetDay} by ${trainerIdentity.name}`, {fromDay:editingDayId, toDay:targetDay, courseId, blockType:block.type});
+  }
+
+  if(mode==='move'){
+    moduleDraft.content.splice(i,1);
+    await setContentOverride(editingDayId, moduleDraft, courseId, editingLanguage);
+    await logHistory('content_block_moved', `${contentTypeLabel(block.type)} block moved from Day ${editingDayId} to Day ${targets.join(', ')} by ${trainerIdentity.name}`, {fromDay:editingDayId, toDay:targets, courseId, blockType:block.type});
+  }
+
+  document.getElementById('move-to-day-overlay')?.remove();
+  showToast(mode==='move' ? `Moved to Day ${targets.join(', ')}.` : `Copied to Day ${targets.join(', ')}.`, 'success');
+  refreshModuleEditor();
+}
 let dragFromIndex = null;
 function onContentDragStart(i){ dragFromIndex = i; }
 function onContentDragOver(e){ e.preventDefault(); }
@@ -8321,7 +8430,7 @@ async function resetModuleToDefault(){
     closeModuleEditor();
   });
 }
-function contentTypeLabel(type){ return {theory:'Theory', video:'Video', audio:'Audio', photo:'Photo', banner:'Banner', text:'Text', button:'Button', uploadActivity:'Upload Activity', quickAssessment:'Quick Assessment', checkboxQuestion:'Checkbox Question', mcqQuestion:'MCQ Question'}[type] || type; }
+function contentTypeLabel(type){ return {theory:'Theory', video:'Video', audio:'Audio', photo:'Photo', banner:'Banner', text:'Text', button:'Button', uploadActivity:'Upload Activity', quickAssessment:'Quick Assessment', checkboxQuestion:'Checkbox Question', mcqQuestion:'MCQ Question', pageBreak:'Page Break'}[type] || type; }
 function ccContentTypePermKey(item){
   if(item.type==='theory') return 'editTheory';
   if(item.type==='video') return 'editVideo';
@@ -8345,6 +8454,7 @@ function renderAddRow(afterIndex){
       ${btn('quickAssessment',null,'Quick Assessment')}
       ${btn('checkboxQuestion',null,'Checkbox Questions')}
       ${btn('mcqQuestion',null,'MCQ Questions')}
+      ${btn('pageBreak',null,'End Page / Start New Page')}
     </div>
   `;
 }
@@ -8531,6 +8641,11 @@ function renderContentItemCard(item, i, total){
       `).join('')}
       <button class="btn secondary small" onclick="add${isMcq?'Mcq':'Checkbox'}Question(${i})">+ Add question</button>
     `;
+  } else if(item.type==='pageBreak'){
+    fields = `
+      <input class="field-input" id="c-pagebreak-label-${i}" value="${esc(item.label||'')}" placeholder="Page break label (optional, e.g. 'Page 2')">
+      <p style="font-size:12.5px;color:var(--ink-soft);margin-top:-6px;">Everything above this splits into one page; everything below starts the next page. The partner must complete every mandatory item on a page before "Next Page" unlocks.</p>
+    `;
   }
   return `
     <div class="card" draggable="true" ondragstart="onContentDragStart(${i})" ondragover="onContentDragOver(event)" ondrop="onContentDrop(${i})" style="cursor:grab;">
@@ -8540,6 +8655,7 @@ function renderContentItemCard(item, i, total){
           <button class="btn small secondary" onclick="moveContentItem(${i},-1)" ${i===0?'disabled':''} title="Move up">&uarr;</button>
           <button class="btn small secondary" onclick="moveContentItem(${i},1)" ${i===total-1?'disabled':''} title="Move down">&darr;</button>
           <button class="btn small secondary" onclick="duplicateContentItem(${i})" title="Duplicate">Duplicate</button>
+          <button class="btn small secondary" onclick="openMoveToDayPanel(${i})" title="Move, copy, or duplicate this block to another day">Move to Day &rarr;</button>
           <button class="btn small danger" onclick="removeContentItem(${i})" ${ccCan('canDelete')?'':'disabled'}>Delete</button>
         </div>
       </div>
