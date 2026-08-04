@@ -4434,10 +4434,11 @@ async function renderAdminMain(){
   }
   else if(adminTab==='languages'){ await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderLanguagesTab(); }
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
-  else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderSessionsTab(); }
+  else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderSessionsTab(); updateSessionDayOptions(); }
   else if(adminTab==='access'){
     await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses();
     adminLegacyCourseLabel = await getLegacyCourseLabel();
+    adminTrainers = await listTrainers();
     const allR = await listRoster();
     adminRoster = Object.fromEntries(Object.entries(allR).filter(([,r])=>isRosterEntryVisibleToViewer(r)));
     adminUnlocks = await listUnlocks(); adminAssessmentUnlocks = await listAssessmentUnlocks();
@@ -7149,17 +7150,16 @@ async function updateSessionDayOptions(){
   const daySelect = document.getElementById('s-day');
   const currentSelection = daySelect.value;
   daySelect.innerHTML = '<div class="empty-state" style="padding:4px;">Loading...</div>';
-  let dayIds, titles = {};
   if(!courseId){
-    dayIds = DAYS.map(d=>d.id);
-    DAYS.forEach(d=>{ titles[d.id] = d.title; });
-  } else {
-    dayIds = await getDayRegistry(courseId);
-    await Promise.all(dayIds.map(async id=>{
-      const ov = await getContentOverride(id, courseId, DEFAULT_LANGUAGE);
-      titles[id] = ov ? ov.title : 'Untitled';
-    }));
+    daySelect.innerHTML = '<option value="">— Select a course above first —</option>';
+    return;
   }
+  const dayIds = await getDayRegistry(courseId);
+  const titles = {};
+  await Promise.all(dayIds.map(async id=>{
+    const ov = await getContentOverride(id, courseId, DEFAULT_LANGUAGE);
+    titles[id] = ov ? ov.title : 'Untitled';
+  }));
   daySelect.innerHTML = dayIds.length===0
     ? '<option value="">— This course has no days yet —</option>'
     : dayIds.map(id=>`<option value="${id}" ${String(id)===currentSelection?'selected':''}>Day ${id} — ${esc(titles[id]||'Untitled')}</option>`).join('');
@@ -7177,7 +7177,7 @@ function renderSessionsTab(){
         <div><span class="field-label">City</span>${lockedFields ? `<div class="readonly-chip">${esc(trainerIdentity.city)}</div>` : `<select class="field-input" id="s-city">${CITIES.map(c=>`<option>${c}</option>`).join('')}</select>`}</div>
         <div><span class="field-label">Trainer name</span>${lockedFields ? `<div class="readonly-chip">${esc(trainerIdentity.name)}</div>` : `<input class="field-input" id="s-trainer">`}</div>
         <div><span class="field-label">Course</span><select class="field-input" id="s-course" onchange="updateSessionDayOptions()">${(!isTrainerRole() || (trainerIdentity.assignedCourses||[]).length===0) ? '<option value="">— No specific course —</option>' : ''}${Object.entries(adminCategories).flatMap(([catId,cat])=>Object.entries(adminCourses).filter(([cid,c])=>c.categoryId===catId && trainerCourseAllowed(cid)).map(([courseId,course])=>`<option value="${courseId}">${esc(cat.name)} — ${esc(course.name)}</option>`)).join('')}</select></div>
-        <div><span class="field-label">Day</span><select class="field-input" id="s-day">${DAYS.map(d=>`<option value="${d.id}">Day ${d.id} — ${d.title}</option>`).join('')}</select></div>
+        <div><span class="field-label">Day</span><select class="field-input" id="s-day"><option value="">— Select a course above first —</option></select></div>
         <div><span class="field-label">Date</span><input class="field-input" id="s-date" type="date" value="${todayStr()}"></div>
         <div><span class="field-label">Opens at</span><input class="field-input" id="s-open" type="time" value="09:00"></div>
         <div><span class="field-label">Closes at</span><input class="field-input" id="s-close" type="time" value="19:00"></div>
@@ -7229,6 +7229,7 @@ async function deleteSessionRow(id){ await kvDelete('session:'+id); renderAdminM
 function renderAccessTab(){
   const groups = {};
   Object.values(adminRoster).forEach(r=>{
+    if(r.trainerId && !adminTrainers[r.trainerId]) return; // trainer deleted - preserve history in storage, but don't surface for new access
     const courseKey = r.courseId || 'legacy';
     const k = r.city+'__'+r.trainer+'__'+courseKey;
     groups[k] = {city:r.city, trainer:r.trainer, courseId:r.courseId||null};
