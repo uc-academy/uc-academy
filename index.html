@@ -560,6 +560,7 @@ function nowHM(){ const d=new Date(); return String(d.getHours()).padStart(2,'0'
 function fmtDate(s){ if(!s) return ''; const d=new Date(s+'T00:00:00'); return d.toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'}); }
 function fmtDateTime(iso){ if(!iso) return ''; try{ return new Date(iso).toLocaleString('en-IN',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}); }catch(e){ return iso; } }
 function esc(s){ return (s||'').toString().replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function jsDayId(dayId){ return typeof dayId==='string' ? `'${dayId}'` : dayId; }
 function slug(s){ return (s||'').trim().toUpperCase().replace(/\s+/g,'_').replace(/[^A-Z0-9_-]/g,''); }
 function ratingFromPct(pct){
   if(pct>=90) return {label:'Excellent', pass:true};
@@ -2749,11 +2750,13 @@ function renderMainOnly(){
   document.getElementById('main').innerHTML = renderCurrentPage();
   if(currentDay>0 && currentDay<98 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay));
   if(currentDay>0 && currentDay<98 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
+  if(currentDay===0 && contentOverrides['home']) initOverrideVideoPlayers({id:'home'});
 }
 function renderMain(){
   document.getElementById('main').innerHTML = renderCurrentPage();
   if(currentDay>0 && currentDay<98 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay));
   if(currentDay>0 && currentDay<98 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
+  if(currentDay===0 && contentOverrides['home']) initOverrideVideoPlayers({id:'home'});
 }
 function renderCurrentPage(){
   if(currentDay===0) return renderHome();
@@ -2762,28 +2765,42 @@ function renderCurrentPage(){
   return renderDayShell(DAYS.find(d=>d.id===currentDay));
 }
 
-function renderHomeContentItem(item){
+function renderHomeContentItem(item, idx, dp, items){
   if(item.type==='theory') return `<div class="card"><h3>${esc(item.heading)}</h3><p style="white-space:pre-wrap;">${esc(item.body)}</p></div>`;
   if(item.type==='text') return `<div class="card"><p style="white-space:pre-wrap;">${esc(item.body)}</p></div>`;
   if(item.type==='video'){
-    const n = normalizeUrl(item.url);
-    const inner = n.embedUrl ? `<iframe src="${esc(n.embedUrl)}" allowfullscreen></iframe>` : `<div class="video-placeholder">${item.url?'Video link not recognised.':'No video linked yet.'}</div>`;
-    return `<div class="card"><h3>${esc(item.title||'Video')}</h3><div class="video-frame">${inner}</div></div>`;
+    if(!item.url) return `<div class="card"><h3>${esc(item.title||'Video')}</h3><div class="video-placeholder">No video linked yet.</div></div>`;
+    return renderOverrideVideoItem('home', item, idx, dp);
   }
-  if(item.type==='audio') return `<div class="card"><h3>${esc(item.title||'Audio')}</h3>${renderAudioEmbed(item.url)}</div>`;
+  if(item.type==='audio') return `<div class="card"><h3>${esc(item.title||'Audio')}</h3>${renderAudioEmbed(item.url, "markAudioPlayed('home')")}</div>`;
   if(item.type==='photo') return `<div class="card"><h3>${esc(item.title||'Photo')}</h3>${item.url?`<img src="${esc(item.url)}" style="max-width:100%;border-radius:8px;">`:'<div class="video-placeholder">No image linked yet.</div>'}${item.caption?`<p style="margin-top:8px;color:var(--ink-soft);font-size:12.5px;">${esc(item.caption)}</p>`:''}</div>`;
   if(item.type==='banner') return `<div class="card" style="text-align:center;background:linear-gradient(135deg,var(--brand-light),#fff);">${item.imageUrl?`<img src="${esc(item.imageUrl)}" style="max-width:100%;border-radius:8px;margin-bottom:10px;">`:''}<h2 style="margin:0 0 6px;">${esc(item.headline)}</h2>${item.subtext?`<p style="color:var(--ink-soft);margin:0;">${esc(item.subtext)}</p>`:''}</div>`;
   if(item.type==='button') return `<div class="card" style="text-align:center;"><a class="btn amber" href="${esc(item.action||'#')}" target="_blank" rel="noopener" style="text-decoration:none;display:inline-block;">${esc(item.label||'Button')}</a></div>`;
+  if(item.type==='uploadActivity') return renderActivityUploadItem('home', item, idx);
+  if(item.type==='quickAssessment' || item.type==='checkboxQuestion' || item.type==='mcqQuestion'){
+    if(item.enabled===false) return '';
+    // Video-gates-quiz: any mandatory video earlier in the same content list must reach its required watch % first
+    const priorVideoIndices = items.map((it,i)=>(it.type==='video' && it.url && i<idx && (it.watchSettings?.mandatory!==false))?i:null).filter(i=>i!==null);
+    const priorVideosReady = priorVideoIndices.every(i=>dp.videoItemProgress[i]?.done);
+    if(!priorVideosReady){
+      return `<div class="card" style="opacity:0.6;"><h3 style="margin-top:0;">${esc(item.title||'Quiz')}</h3><p style="color:var(--ink-soft);font-size:13px;">Watch the video above to unlock this.</p></div>`;
+    }
+    if(item.type==='quickAssessment') return renderQuickAssessmentBlock('home', item, idx, dp);
+    return renderOptionQuestionBlock('home', item, idx, dp);
+  }
   return '';
 }
 function renderHome(){
   const s = overallStats();
   const ov = contentOverrides['home'];
   if(ov){
+    ensureDay('home');
+    const dp = currentUserProgress['home'];
     let html = `<div class="crumb">Welcome, ${esc(currentUser.name)}</div><h1 class="page-title">${esc(ov.title||COURSE_NAME)}</h1>${ov.sub?`<p class="page-sub">${esc(ov.sub)}</p>`:''}`;
     html += `<div class="today-banner"><b>Class today:</b> Day ${currentUser.day} &middot; ${esc(currentUser.city)} &middot; Trainer ${esc(currentUser.trainer)} &middot; Check-in window ${esc(currentUser.open)}&ndash;${esc(currentUser.close)}</div>`;
     html += `<div class="home-grid"><div class="stat-card"><div class="n">${s.done}/${s.total}</div><div class="l">Days complete</div></div><div class="stat-card"><div class="n">${s.pct}%</div><div class="l">Course progress</div></div><div class="stat-card"><div class="n">${currentUserUnlockedDays.length}</div><div class="l">Days unlocked</div></div></div>`;
-    (ov.content||[]).forEach(item=>{ html += renderHomeContentItem(item); });
+    const items = ov.content||[];
+    items.forEach((item,idx)=>{ html += renderHomeContentItem(item, idx, dp, items); });
     html += currentUserUnlockedDays.length ? `<button class="btn amber" onclick="goTo(${nextDayForPartner()},'theory')">Go to Day ${nextDayForPartner()} &rarr;</button>` : `<div class="lock-banner">No days are unlocked yet. Your trainer will unlock Day 1 to begin class.</div>`;
     return html;
   }
@@ -3026,7 +3043,7 @@ function renderQuickAssessmentBlock(dayId, item, idx, dp){
           `).join('')}
         </div>
       `).join('')}
-      <button class="btn amber" onclick="submitQuickAssessment(${dayId},${idx},false)">Submit Now</button>
+      <button class="btn amber" onclick="submitQuickAssessment(${jsDayId(dayId)},${idx},false)">Submit Now</button>
     </div>`;
   }
 
@@ -3040,7 +3057,7 @@ function renderQuickAssessmentBlock(dayId, item, idx, dp){
         <p style="font-weight:600;margin-bottom:6px;">Questions to review:</p>
         ${(item.questions||[]).map((q,qi)=>last.answers[qi]!==q.correct?`<div class="save-note" style="margin-bottom:8px;"><strong>${esc(q.question)}</strong><br>Correct answer: ${esc(q.options[q.correct])}${q.keyLearningPoint?`<br><em>${esc(q.keyLearningPoint)}</em>`:''}</div>`:'').join('')}
       </div>` : ''}
-      ${!last.passed && canAttempt ? `<p style="font-size:12.5px;color:var(--ink-soft);margin-top:8px;">Attempt ${attemptCount} of ${maxAttempts} used.</p><button class="btn amber" onclick="startQuickAssessment(${dayId},${idx})">Retry Assessment</button>` : ''}
+      ${!last.passed && canAttempt ? `<p style="font-size:12.5px;color:var(--ink-soft);margin-top:8px;">Attempt ${attemptCount} of ${maxAttempts} used.</p><button class="btn amber" onclick="startQuickAssessment(${jsDayId(dayId)},${idx})">Retry Assessment</button>` : ''}
       ${!last.passed && !canAttempt ? `<p style="color:var(--danger);font-size:13px;margin-top:8px;">No attempts remaining. Contact your Trainer.</p>` : ''}
     </div>`;
   }
@@ -3049,7 +3066,7 @@ function renderQuickAssessmentBlock(dayId, item, idx, dp){
   return `<div class="card" id="qa-block-${idx}">
     <h3 style="margin-top:0;">${esc(item.title||'Quick Assessment')}</h3>
     <p style="color:var(--ink-soft);font-size:13px;">${(item.questions||[]).length} question${(item.questions||[]).length===1?'':'s'} &middot; ${item.timerMinutes==='custom'?item.customTimerMinutes:item.timerMinutes} minute timer &middot; ${item.passingPercent||70}% to pass${item.mandatory!==false?' &middot; Required to continue':''}</p>
-    <button class="btn amber" onclick="startQuickAssessment(${dayId},${idx})">Start Your Assessment</button>
+    <button class="btn amber" onclick="startQuickAssessment(${jsDayId(dayId)},${idx})">Start Your Assessment</button>
   </div>`;
 }
 async function startQuickAssessment(dayId, idx){
@@ -3135,7 +3152,7 @@ function renderOptionQuestionBlock(dayId, item, idx, dp){
         `).join('')}
       </div>
     `).join('')}
-    <button class="btn amber" onclick="submitOptionQuestionBlock(${dayId},${idx})">Submit</button>
+    <button class="btn amber" onclick="submitOptionQuestionBlock(${jsDayId(dayId)},${idx})">Submit</button>
   </div>`;
 }
 async function submitOptionQuestionBlock(dayId, idx){
@@ -3283,7 +3300,7 @@ function renderOverrideVideoItem(dayId, item, idx, dp){
         <div class="video-progress-wrap">
           <div class="video-progress-label">${itemProgress.done ? '<span style="color:var(--success);">Confirmed watched</span>' : "We can't auto-track this video type. Watch it fully, then confirm below."}</div>
         </div>
-        ${!itemProgress.done ? `<button class="btn amber small" onclick="manualOverrideVideoComplete(${dayId},${idx})">I've watched this video</button>` : ''}`;
+        ${!itemProgress.done ? `<button class="btn amber small" onclick="manualOverrideVideoComplete(${jsDayId(dayId)},${idx})">I've watched this video</button>` : ''}`;
     }
   }
   return `<div class="card"><h3>${esc(item.title||'Video')}</h3><div class="video-frame">${inner}</div>${progressBlock}</div>`;
