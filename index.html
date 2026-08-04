@@ -677,7 +677,26 @@ async function kvSet(key, val){ try{ await window.__fbReady; return await window
 async function kvDelete(key){ try{ await window.__fbReady; await window.__fbDelete(key); }catch(e){} }
 async function kvList(prefix){ try{ await window.__fbReady; return await window.__fbList(prefix); }catch(e){ return []; } }
 async function uploadFile(path, file){
-  try{ await window.__fbReady; if(typeof window.__fbUploadFile!=='function') return null; return await window.__fbUploadFile(path, file); }catch(e){ return null; }
+  try{
+    await window.__fbReady;
+    if(typeof window.__fbUploadFile!=='function') return { ok:false, url:null, error:'File storage is not available right now.' };
+    const url = await window.__fbUploadFile(path, file);
+    return { ok:true, url };
+  }catch(e){
+    console.error('uploadFile failed:', e);
+    const friendly = uploadErrorToFriendlyMessage(e);
+    return { ok:false, url:null, error:friendly };
+  }
+}
+function uploadErrorToFriendlyMessage(e){
+  const code = e && e.code;
+  if(code==='storage/unauthorized') return "Upload blocked by storage permissions. Contact your Admin.";
+  if(code==='storage/canceled') return "Upload was canceled.";
+  if(code==='storage/quota-exceeded') return "Storage quota exceeded. Contact your Admin.";
+  if(code==='storage/retry-limit-exceeded') return "Upload timed out — check your connection and try again.";
+  if(code==='storage/unauthenticated') return "Your session may have expired. Please log in again.";
+  if(e && e.message) return e.message;
+  return "Upload failed for an unknown reason. Please try again.";
 }
 async function deleteUploadedFile(path){
   try{ await window.__fbReady; if(typeof window.__fbDeleteFile==='function') await window.__fbDeleteFile(path); }catch(e){}
@@ -1973,7 +1992,9 @@ async function submitSosEscalation(){
   let attachmentUrl = null;
   if(file){
     const path = `sos-escalations/${partnerId}_${Date.now()}_${file.name}`;
-    attachmentUrl = await uploadFile(path, file);
+    const uploadResult = await uploadFile(path, file);
+    if(uploadResult.ok) attachmentUrl = uploadResult.url;
+    else showToast('Attachment upload failed: '+uploadResult.error+' — sending the escalation without it.', 'error');
   }
   await createEscalation({
     source:'sos',
@@ -3334,8 +3355,9 @@ async function handleActivityUpload(event){
 
   showToast('Uploading...', 'info');
   const path = `activity/${currentUser.id}/${dayId}/${idx}/${Date.now()}_${file.name}`;
-  const url = await uploadFile(path, file);
-  if(!url){ showToast("Upload failed — check your connection.", 'error'); return; }
+  const uploadResult = await uploadFile(path, file);
+  if(!uploadResult.ok){ showToast(`Upload failed — try again. (${uploadResult.error})`, 'error'); return; }
+  const url = uploadResult.url;
 
   let aiResult = null;
   if(currentAiSettings.enabled && currentAiSettings.proxyUrl){
@@ -3992,8 +4014,9 @@ async function handleMediaUpload(event, dayId, type){
 
   showToast('Uploading...', 'info');
   const path = `media/${currentUser.id}/${dayId}/${Date.now()}_${file.name}`;
-  const url = await uploadFile(path, file);
-  if(!url){ showToast("Upload failed — check your connection.", 'error'); return; }
+  const uploadResult = await uploadFile(path, file);
+  if(!uploadResult.ok){ showToast(`Upload failed — try again. (${uploadResult.error})`, 'error'); return; }
+  const url = uploadResult.url;
   const record = await createMediaRecord({
     partnerId: currentUser.id, partnerName: currentUser.name, trainerName: currentUser.trainer, trainerId: currentUser.trainerId, city: currentUser.city,
     dayId, activityLabel: `Day ${dayId} practical`, type, storagePath: path, url
@@ -4010,8 +4033,9 @@ async function handleResubmission(event, originalId){
   if(!original) return;
   showToast('Uploading replacement...', 'info');
   const path = `media/${currentUser.id}/${original.dayId}/${Date.now()}_${file.name}`;
-  const url = await uploadFile(path, file);
-  if(!url){ showToast("Upload failed — check your connection.", 'error'); return; }
+  const uploadResult = await uploadFile(path, file);
+  if(!uploadResult.ok){ showToast(`Upload failed — try again. (${uploadResult.error})`, 'error'); return; }
+  const url = uploadResult.url;
   const record = await createMediaRecord({
     partnerId: currentUser.id, partnerName: currentUser.name, trainerName: currentUser.trainer, city: currentUser.city,
     dayId: original.dayId, activityLabel: original.activityLabel, type: original.type, storagePath: path, url,
@@ -6035,8 +6059,9 @@ function openEscalationForm(partnerId){
     let attachmentUrl = null;
     if(file){
       const path = `escalations/${partnerId}_${Date.now()}_${file.name}`;
-      attachmentUrl = await uploadFile(path, file);
-      if(!attachmentUrl) showToast('Attachment upload failed — sending the escalation without it.', 'error');
+      const uploadResult = await uploadFile(path, file);
+      if(uploadResult.ok) attachmentUrl = uploadResult.url;
+      else showToast('Attachment upload failed: '+uploadResult.error+' — sending the escalation without it.', 'error');
     }
     await createEscalation({ partnerId, partnerName: r.name, courseId: r.courseId||null, dayId, activity, description, attachmentUrl, trainerId: trainerIdentity.trainerId, trainerName: trainerIdentity.name });
     cleanup();
@@ -6978,9 +7003,9 @@ async function handleLogoUpload(event){
   if(!file) return;
   showToast('Uploading logo...', 'info');
   const path = `branding/logo_${Date.now()}_${file.name}`;
-  const url = await uploadFile(path, file);
-  if(!url){ showToast("Upload failed — check your connection.", 'error'); return; }
-  themeDraft.logoImageUrl = url;
+  const uploadResult = await uploadFile(path, file);
+  if(!uploadResult.ok){ showToast(`Upload failed — try again. (${uploadResult.error})`, 'error'); return; }
+  themeDraft.logoImageUrl = uploadResult.url;
   showToast('Logo uploaded. Click Save & Publish to apply it.', 'success');
   renderThemeTabOnly();
 }
@@ -6990,9 +7015,9 @@ async function handleFaviconUpload(event){
   if(!file) return;
   showToast('Uploading favicon...', 'info');
   const path = `branding/favicon_${Date.now()}_${file.name}`;
-  const url = await uploadFile(path, file);
-  if(!url){ showToast("Upload failed — check your connection.", 'error'); return; }
-  themeDraft.faviconUrl = url;
+  const uploadResult = await uploadFile(path, file);
+  if(!uploadResult.ok){ showToast(`Upload failed — try again. (${uploadResult.error})`, 'error'); return; }
+  themeDraft.faviconUrl = uploadResult.url;
   showToast('Favicon uploaded. Click Save & Publish to apply it.', 'success');
   renderThemeTabOnly();
 }
@@ -8195,9 +8220,9 @@ async function rteUploadImage(file, contextPath){
   try{ processed = await rteCompressImage(file, 1600); }
   catch(e){ return { ok:false, reason:`"${file.name}" appears to be damaged or unreadable.` }; }
   const path = `theory-images/${contextPath}/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g,'_')}`;
-  const url = await uploadFile(path, processed);
-  if(!url) return { ok:false, reason:'Upload failed — check your connection and try again.' };
-  return { ok:true, url, path };
+  const uploadResult = await uploadFile(path, processed);
+  if(!uploadResult.ok) return { ok:false, reason:`Upload failed — try again. (${uploadResult.error})` };
+  return { ok:true, url:uploadResult.url, path };
 }
 function rteMount(fieldId, initialHtml, placeholder, contextPath, readonly){
   return `<div class="rte-wrap" id="${fieldId}-wrap" data-field="${fieldId}" data-initial="${rteEncode(initialHtml)}" data-placeholder="${esc(placeholder||'')}" data-context="${esc(contextPath||'general')}" data-readonly="${readonly?'1':''}"><div class="rte-mount" id="${fieldId}"></div></div>`;
@@ -8222,7 +8247,7 @@ async function handlePhotoBlockUpload(i){
   const urlField = document.getElementById('c-url-'+i);
   if(urlField) urlField.value = result.url;
   const preview = document.getElementById('c-photo-preview-'+i);
-  if(preview) preview.innerHTML = `<img src="${esc(result.url)}" style="max-width:220px;max-height:160px;border-radius:8px;display:block;margin-bottom:8px;">`;
+  if(preview) preview.innerHTML = `<img src="${esc(result.url)}" style="max-width:220px;max-height:160px;border-radius:8px;display:block;margin-bottom:8px;" onerror="this.style.display='none'; this.nextElementSibling.style.display='block';"><p style="display:none;color:var(--danger);font-size:12px;">Image saved but preview could not be loaded.</p>`;
   syncModuleDraftFromDOM();
   showToast('Photo uploaded.', 'success');
 }
@@ -9147,7 +9172,7 @@ function renderContentItemCard(item, i, total){
         <button type="button" class="btn secondary small" id="c-photo-upload-btn-${i}" onclick="triggerPhotoBlockUpload(${i})" style="white-space:nowrap;">Upload</button>
         <input type="file" id="c-photo-upload-input-${i}" accept="${RTE_IMAGE_ALLOWED_TYPES.join(',')}" style="display:none;" onchange="handlePhotoBlockUpload(${i})">
       </div>
-      <div id="c-photo-preview-${i}">${item.url?`<img src="${esc(item.url)}" style="max-width:220px;max-height:160px;border-radius:8px;display:block;margin-bottom:8px;">`:''}</div>
+      <div id="c-photo-preview-${i}">${item.url?`<img src="${esc(item.url)}" style="max-width:220px;max-height:160px;border-radius:8px;display:block;margin-bottom:8px;" onerror="this.style.display='none'; this.nextElementSibling.style.display='block';"><p style="display:none;color:var(--danger);font-size:12px;">Image saved but preview could not be loaded.</p>`:''}</div>
       <input class="field-input" id="c-caption-${i}" value="${esc(item.caption||'')}" placeholder="Caption (optional)">
     `;
   } else if(item.type==='banner'){
