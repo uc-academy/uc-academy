@@ -4136,7 +4136,25 @@ async function renderAdminMain(){
   else if(adminTab==='languages'){ await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderLanguagesTab(); }
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
   else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderSessionsTab(); }
-  else if(adminTab==='access'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); const allR = await listRoster(); adminRoster = Object.fromEntries(Object.entries(allR).filter(([,r])=>isRosterEntryVisibleToViewer(r))); adminUnlocks = await listUnlocks(); adminAssessmentUnlocks = await listAssessmentUnlocks(); adminProgressCache = {}; await Promise.all(Object.keys(adminRoster).map(async id=>{ adminProgressCache[id] = await getProgress(id); })); await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id); if(ov) contentOverrides[d.id] = migrateOldOverrideToUnified(ov); })); el.innerHTML = renderAccessTab(); }
+  else if(adminTab==='access'){
+    await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses();
+    const allR = await listRoster();
+    adminRoster = Object.fromEntries(Object.entries(allR).filter(([,r])=>isRosterEntryVisibleToViewer(r)));
+    adminUnlocks = await listUnlocks(); adminAssessmentUnlocks = await listAssessmentUnlocks();
+    adminProgressCache = {};
+    await Promise.all(Object.keys(adminRoster).map(async id=>{ adminProgressCache[id] = await getProgress(id); }));
+    await Promise.all(DAYS.map(async d=>{ const ov = await getContentOverride(d.id); if(ov) contentOverrides[d.id] = migrateOldOverrideToUnified(ov); }));
+    const distinctCourseIds = [...new Set(Object.values(adminRoster).map(r=>r.courseId||null))];
+    adminAccessCourseDays = {};
+    await Promise.all(distinctCourseIds.map(async courseId=>{
+      if(!courseId){ adminAccessCourseDays['legacy'] = { dayIds: DAYS.map(d=>d.id), titles: Object.fromEntries(DAYS.map(d=>[d.id,d.title])) }; return; }
+      const ids = await getDayRegistry(courseId);
+      const titles = {};
+      await Promise.all(ids.map(async id=>{ const ov = await getContentOverride(id, courseId, DEFAULT_LANGUAGE); titles[id] = ov ? ov.title : 'Untitled'; }));
+      adminAccessCourseDays[courseId] = { dayIds: ids, titles };
+    }));
+    el.innerHTML = renderAccessTab();
+  }
   else if(adminTab==='partners'){
     await seedDefaultCategoriesIfEmpty();
     adminCategories = await listCategories();
@@ -6817,6 +6835,26 @@ async function submitReportedIssue(){
 }
 
 /* ---- SESSIONS ---- */
+async function updateSessionDayOptions(){
+  const courseId = document.getElementById('s-course').value;
+  const daySelect = document.getElementById('s-day');
+  const currentSelection = daySelect.value;
+  daySelect.innerHTML = '<div class="empty-state" style="padding:4px;">Loading...</div>';
+  let dayIds, titles = {};
+  if(!courseId){
+    dayIds = DAYS.map(d=>d.id);
+    DAYS.forEach(d=>{ titles[d.id] = d.title; });
+  } else {
+    dayIds = await getDayRegistry(courseId);
+    await Promise.all(dayIds.map(async id=>{
+      const ov = await getContentOverride(id, courseId, DEFAULT_LANGUAGE);
+      titles[id] = ov ? ov.title : 'Untitled';
+    }));
+  }
+  daySelect.innerHTML = dayIds.length===0
+    ? '<option value="">— This course has no days yet —</option>'
+    : dayIds.map(id=>`<option value="${id}" ${String(id)===currentSelection?'selected':''}>Day ${id} — ${esc(titles[id]||'Untitled')}</option>`).join('');
+}
 function renderSessionsTab(){
   const rows = adminSessions.slice().sort((a,b)=>b.date.localeCompare(a.date));
   const lockedFields = !isAdminRole();
@@ -6829,8 +6867,8 @@ function renderSessionsTab(){
       <div class="form-grid">
         <div><span class="field-label">City</span>${lockedFields ? `<div class="readonly-chip">${esc(trainerIdentity.city)}</div>` : `<select class="field-input" id="s-city">${CITIES.map(c=>`<option>${c}</option>`).join('')}</select>`}</div>
         <div><span class="field-label">Trainer name</span>${lockedFields ? `<div class="readonly-chip">${esc(trainerIdentity.name)}</div>` : `<input class="field-input" id="s-trainer">`}</div>
+        <div><span class="field-label">Course</span><select class="field-input" id="s-course" onchange="updateSessionDayOptions()"><option value="">— No specific course —</option>${Object.entries(adminCategories).flatMap(([catId,cat])=>Object.entries(adminCourses).filter(([,c])=>c.categoryId===catId).map(([courseId,course])=>`<option value="${courseId}">${esc(cat.name)} — ${esc(course.name)}</option>`)).join('')}</select></div>
         <div><span class="field-label">Day</span><select class="field-input" id="s-day">${DAYS.map(d=>`<option value="${d.id}">Day ${d.id} — ${d.title}</option>`).join('')}</select></div>
-        <div><span class="field-label">Course</span><select class="field-input" id="s-course"><option value="">— No specific course —</option>${Object.entries(adminCategories).flatMap(([catId,cat])=>Object.entries(adminCourses).filter(([,c])=>c.categoryId===catId).map(([courseId,course])=>`<option value="${courseId}">${esc(cat.name)} — ${esc(course.name)}</option>`)).join('')}</select></div>
         <div><span class="field-label">Date</span><input class="field-input" id="s-date" type="date" value="${todayStr()}"></div>
         <div><span class="field-label">Opens at</span><input class="field-input" id="s-open" type="time" value="09:00"></div>
         <div><span class="field-label">Closes at</span><input class="field-input" id="s-close" type="time" value="19:00"></div>
@@ -6881,20 +6919,28 @@ async function deleteSessionRow(id){ await kvDelete('session:'+id); renderAdminM
 /* ---- DAY ACCESS ---- */
 function renderAccessTab(){
   const groups = {};
-  Object.values(adminRoster).forEach(r=>{ const k = r.city+'__'+r.trainer; groups[k] = {city:r.city, trainer:r.trainer}; });
-  if(!isAdminRole()){ groups[trainerIdentity.city+'__'+trainerIdentity.name] = {city:trainerIdentity.city, trainer:trainerIdentity.name}; }
+  Object.values(adminRoster).forEach(r=>{
+    const courseKey = r.courseId || 'legacy';
+    const k = r.city+'__'+r.trainer+'__'+courseKey;
+    groups[k] = {city:r.city, trainer:r.trainer, courseId:r.courseId||null};
+  });
+  if(!isAdminRole() && Object.keys(groups).length===0){
+    groups[trainerIdentity.city+'__'+trainerIdentity.name+'__legacy'] = {city:trainerIdentity.city, trainer:trainerIdentity.name, courseId:null};
+  }
   const groupList = Object.values(groups);
   const awaitingConfirmation = [];
   Object.entries(adminRoster).forEach(([pid,r])=>{
     const prog = adminProgressCache[pid] || {};
-    DAYS.forEach(d=>{
-      const dp = prog[d.id];
+    const courseDays = adminAccessCourseDays[r.courseId || 'legacy'];
+    const dayIds = courseDays ? courseDays.dayIds : DAYS.map(d=>d.id);
+    dayIds.forEach(dayId=>{
+      const dp = prog[dayId];
       if(!dp || !dp.videoItemProgress) return;
-      const ov = contentOverrides[d.id];
+      const ov = contentOverrides[dayId];
       Object.entries(dp.videoItemProgress).forEach(([idx,vp])=>{
         if(vp.readyForUnlock && !vp.done){
           const item = ov && ov.content ? ov.content[idx] : null;
-          awaitingConfirmation.push({ pid, partnerName:r.name, dayId:d.id, idx, videoTitle: item?item.title:'Video' });
+          awaitingConfirmation.push({ pid, partnerName:r.name, dayId, idx, videoTitle: item?item.title:'Video' });
         }
       });
     });
@@ -6902,7 +6948,7 @@ function renderAccessTab(){
   return `
     <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'}</div>
     <h1 class="page-title">Day access</h1>
-    <p class="page-sub">Control which days are visible to your partners — like a certificate lock. Nothing is visible until you unlock it here. Assessments have their own separate unlock below — partners can't attempt one until you unlock it, even after finishing the day's video and assignment.</p>
+    <p class="page-sub">Control which days are visible to your partners — like a certificate lock. Nothing is visible until you unlock it here. Assessments have their own separate unlock below — partners can't attempt one until you unlock it, even after finishing the day's video and assignment. Each course shows only its own days — nothing here is fixed to a specific day count.</p>
     ${awaitingConfirmation.length>0 ? `<div class="card">
       <h3>Videos awaiting your confirmation</h3>
       <p style="margin-bottom:10px;">These videos are set to require manual unlock instead of unlocking automatically at the required percentage.</p>
@@ -6916,15 +6962,20 @@ function renderAccessTab(){
       const key = slug(g.city)+'__'+slug(g.trainer);
       const unlocked = adminUnlocks[key] || [];
       const assessUnlocked = adminAssessmentUnlocks[key] || [];
+      const courseDays = adminAccessCourseDays[g.courseId || 'legacy'] || { dayIds: DAYS.map(d=>d.id), titles: {} };
+      const courseName = g.courseId && adminCourses[g.courseId] ? adminCourses[g.courseId].name : 'Original Washing Machine course';
+      if(courseDays.dayIds.length===0){
+        return `<div class="card"><h3>${esc(g.city)} &middot; ${esc(g.trainer)} &middot; ${esc(courseName)}</h3><div class="empty-state">This course has no days yet — add days in Modules before unlocking anything.</div></div>`;
+      }
       return `<div class="card">
-        <h3>${esc(g.city)} &middot; ${esc(g.trainer)}</h3>
+        <h3>${esc(g.city)} &middot; ${esc(g.trainer)} <span style="font-weight:400;color:var(--ink-soft);">&middot; ${esc(courseName)}</span></h3>
         <span class="field-label">Day access</span>
         <div class="day-unlock-grid">
-          ${DAYS.map(d=>`<button class="day-toggle ${unlocked.includes(d.id)?'on':''}" onclick="toggleDayUnlock('${esc(g.city)}','${esc(g.trainer)}',${d.id})">Day ${d.id} ${unlocked.includes(d.id)?'&#10003;':''}</button>`).join('')}
+          ${courseDays.dayIds.map(id=>`<button class="day-toggle ${unlocked.includes(id)?'on':''}" onclick="toggleDayUnlock('${esc(g.city)}','${esc(g.trainer)}',${id})">Day ${id} ${unlocked.includes(id)?'&#10003;':''}</button>`).join('')}
         </div>
         <span class="field-label" style="margin-top:14px;">Assessment access <span style="font-weight:400;color:var(--ink-soft);text-transform:none;">— locked by default, even after Day Access is on</span></span>
         <div class="day-unlock-grid">
-          ${DAYS.map(d=>`<button class="day-toggle ${assessUnlocked.includes(d.id)?'on':''}" onclick="toggleAssessmentUnlock('${esc(g.city)}','${esc(g.trainer)}',${d.id})">Day ${d.id} ${assessUnlocked.includes(d.id)?'&#10003;':''}</button>`).join('')}
+          ${courseDays.dayIds.map(id=>`<button class="day-toggle ${assessUnlocked.includes(id)?'on':''}" onclick="toggleAssessmentUnlock('${esc(g.city)}','${esc(g.trainer)}',${id})">Day ${id} ${assessUnlocked.includes(id)?'&#10003;':''}</button>`).join('')}
         </div>
       </div>`;
     }).join('')}
@@ -7498,6 +7549,7 @@ function blankCourseModuleDraft(){
 }
 let moduleDraft = null;
 let adminModuleStatus = {};
+let adminAccessCourseDays = {};
 let adminDayEnabledMap = {};
 let adminModuleOverrideCache = {};
 
