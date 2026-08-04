@@ -4289,6 +4289,7 @@ async function renderAdminMain(){
       courseEditorDays = await getDayRegistry(editingCourseId);
       courseEditorOverrideCache = {};
       await Promise.all(courseEditorDays.map(async dayId=>{ courseEditorOverrideCache[dayId] = await getContentOverride(dayId, editingCourseId, editingLanguage); }));
+      adminDayEnabledMap = await getDayEnabledMap(editingCourseId);
       el.innerHTML = renderCourseModulesListTab();
     }
     else{
@@ -7616,13 +7617,17 @@ function renderCourseModulesListTab(){
       </select>
     </div>
     ${courseEditorDays.length===0 ? `<div class="card"><div class="empty-state">No days yet for this course — add the first one below.</div></div>` : ''}
-    ${courseEditorDays.map(dayId=>`
-      <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+    ${courseEditorDays.map((dayId,i)=>`
+      <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;${adminDayEnabledMap[dayId]===false?'opacity:0.55;':''}">
         <div>
-          <h3 style="margin-bottom:2px;">Day ${dayId} &middot; ${esc(courseEditorOverrideCache[dayId]?.title || 'Untitled')}</h3>
+          <h3 style="margin-bottom:2px;">Day ${dayId} &middot; ${esc(courseEditorOverrideCache[dayId]?.title || 'Untitled')} ${adminDayEnabledMap[dayId]===false?'<span class="pill closed">Disabled</span>':''}</h3>
           <span class="pill ${courseEditorOverrideCache[dayId]?'open':'scheduled'}">${courseEditorOverrideCache[dayId]?'Has content':'Empty'}</span>
         </div>
-        <div style="display:flex;gap:8px;">
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <button class="btn small secondary" onclick="moveCourseDayRow(${dayId},'up')" ${i===0?'disabled':''} title="Move up">&uarr;</button>
+          <button class="btn small secondary" onclick="moveCourseDayRow(${dayId},'down')" ${i===courseEditorDays.length-1?'disabled':''} title="Move down">&darr;</button>
+          <button class="btn small secondary" onclick="toggleCourseDayEnabledRow(${dayId})">${adminDayEnabledMap[dayId]===false?'Enable':'Disable'}</button>
+          <button class="btn small secondary" onclick="duplicateCourseDayRow(${dayId})">Duplicate</button>
           <button class="btn danger small" onclick="deleteCourseDay(${dayId})">Delete</button>
           <button class="btn amber small" onclick="openModuleEditor(${dayId}, '${editingCourseId}')">Edit &rarr;</button>
         </div>
@@ -7650,6 +7655,45 @@ async function deleteCourseDay(dayId){
     openCourseModuleEditor(editingCourseId);
   });
 }
+async function toggleCourseDayEnabledRow(dayId){
+  const nowEnabled = await toggleDayEnabledState(dayId, editingCourseId);
+  await logHistory('course_day_enabled_toggled', `Day ${dayId} ${nowEnabled?'enabled':'disabled'} in course ${adminCourses[editingCourseId]?.name||editingCourseId} by ${trainerIdentity.name}`, {dayId, courseId:editingCourseId});
+  showToast(`Day ${dayId} ${nowEnabled?'enabled':'disabled'}.`, 'success');
+  openCourseModuleEditor(editingCourseId);
+}
+async function moveCourseDayRow(dayId, direction){
+  const ids = await getDayRegistry(editingCourseId);
+  const idx = ids.indexOf(dayId);
+  if(idx<0) return;
+  const swapIdx = direction==='up' ? idx-1 : idx+1;
+  if(swapIdx<0 || swapIdx>=ids.length) return;
+  [ids[idx], ids[swapIdx]] = [ids[swapIdx], ids[idx]];
+  const ok = await setDayRegistry(ids, editingCourseId);
+  if(!ok){ showToast("Couldn't reorder — check your connection.", 'error'); return; }
+  await logHistory('course_day_reordered', `Day ${dayId} moved ${direction} in course ${adminCourses[editingCourseId]?.name||editingCourseId} by ${trainerIdentity.name}`, {dayId, direction, courseId:editingCourseId});
+  openCourseModuleEditor(editingCourseId);
+}
+async function duplicateCourseDayRow(dayId){
+  showConfirmModal(`Duplicate Day ${dayId}? This creates a new day with a copy of its content, right after the original.`, async ()=>{
+    const ids = await getDayRegistry(editingCourseId);
+    const newId = Math.max(0, ...ids) + 1;
+    const idx = ids.indexOf(dayId);
+    const newIds = [...ids];
+    newIds.splice(idx+1, 0, newId);
+    const ok = await setDayRegistry(newIds, editingCourseId);
+    if(!ok){ showToast("Couldn't duplicate — check your connection.", 'error'); return; }
+    const langsToCopy = await listLanguages();
+    await Promise.all(Object.values(langsToCopy).filter(l=>l.active!==false).map(async l=>{
+      const ov = await getContentOverride(dayId, editingCourseId, l.name);
+      if(ov) await setContentOverride(newId, JSON.parse(JSON.stringify(ov)), editingCourseId, l.name);
+    }));
+    const enabledMap = await getDayEnabledMap(editingCourseId);
+    if(enabledMap[dayId]===false){ enabledMap[newId] = false; await setDayEnabledMap(editingCourseId, enabledMap); }
+    await logHistory('course_day_duplicated', `Day ${dayId} duplicated as Day ${newId} in course ${adminCourses[editingCourseId]?.name||editingCourseId} by ${trainerIdentity.name}`, {dayId, newId, courseId:editingCourseId});
+    showToast(`Day ${newId} created as a copy of Day ${dayId}.`, 'success');
+    openCourseModuleEditor(editingCourseId);
+  });
+}
 let editingDayId = null;
 let editingCourseId = null;
 let editingLanguage = DEFAULT_LANGUAGE;
@@ -7661,6 +7705,7 @@ let moduleDraft = null;
 let adminModuleStatus = {};
 let adminAccessCourseDays = {};
 let adminDayEnabledMap = {};
+let adminLegacyDaysExpanded = false;
 let adminModuleOverrideCache = {};
 
 function renderModulesListTab(){
@@ -7670,11 +7715,11 @@ function renderModulesListTab(){
   const coursesInLastCat = catStillValid ? Object.entries(adminCourses).filter(([,c])=>c.categoryId===lastCatId) : [];
   return `
     <div class="crumb">Admin dashboard</div>
-    <h1 class="page-title">Modules</h1>
-    <p class="page-sub">Edit the theory, videos, audio, assignment, and assessment for each day. Nothing changes for partners until you click Save &amp; Publish.</p>
+    <h1 class="page-title">Modules — Day Management</h1>
+    <p class="page-sub">Manage the days inside a course. Nothing is shown until you pick a course below — there's no fixed default course or day list here anymore. Home Pages are managed separately under "Home Pages" in the sidebar.</p>
     <div class="card">
-      <h3>Jump to a course</h3>
-      <p style="margin-bottom:10px;">Pick a category and course to edit its own modules. Leave both blank to keep editing the original Washing Machine course below.</p>
+      <h3>Pick a course</h3>
+      <p style="margin-bottom:10px;">Select a category and course to manage its days.</p>
       <div class="form-grid">
         <div>
           <span class="field-label">Category</span>
@@ -7691,8 +7736,17 @@ function renderModulesListTab(){
           </select>
         </div>
       </div>
-      <p style="font-size:12px;color:var(--ink-soft);margin-top:8px;">Selecting a course opens its Modules editor right away.</p>
+      <p style="font-size:12px;color:var(--ink-soft);margin-top:8px;">Selecting a course opens its day editor right away.</p>
     </div>
+    <div class="card" style="text-align:center;">
+      <p style="margin-bottom:8px;color:var(--ink-soft);font-size:13px;">Looking for the original Washing Machine course instead? It isn't shown by default anymore — open it explicitly below.</p>
+      <button class="btn secondary" onclick="adminLegacyDaysExpanded=true; renderAdminMain();">Manage the Original Washing Machine course's days</button>
+    </div>
+    ${adminLegacyDaysExpanded ? renderLegacyDayManagement() : ''}
+  `;
+}
+function renderLegacyDayManagement(){
+  return `
     <div class="card">
       <span class="field-label">Editing language</span>
       <select class="field-input" id="modules-lang-select" onchange="setEditingLanguage(this.value)">
@@ -7700,19 +7754,8 @@ function renderModulesListTab(){
       </select>
       <p style="font-size:12px;color:var(--ink-soft);margin-top:6px;">${editingLanguage===DEFAULT_LANGUAGE ? `This is the fallback version partners see if a day isn't translated into their chosen language.` : `Editing the ${esc(editingLanguage)} version. Days shown here as "Default content" have no ${esc(editingLanguage)} translation yet — partners using ${esc(editingLanguage)} will see ${esc(DEFAULT_LANGUAGE)} instead until you add one.`}</p>
     </div>
-    <h2 class="page-title" style="font-size:20px;">Original Washing Machine course</h2>
-    <p style="font-size:12.5px;color:var(--ink-soft);margin-top:-8px;">Nothing here is fixed — Home and every day can be reordered, disabled, duplicated, or deleted.</p>
-    <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;${adminDayEnabledMap['home']===false?'opacity:0.55;':''}">
-      <div>
-        <h3 style="margin-bottom:2px;">Home Page ${adminDayEnabledMap['home']===false?'<span class="pill closed">Disabled</span>':''}</h3>
-        <span class="pill ${adminModuleStatus['home']?'open':'scheduled'}">${adminModuleStatus['home']?'Customized':'Default content'}</span>
-      </div>
-      <div style="display:flex;gap:8px;">
-        <button class="btn secondary small" onclick="toggleHomeEnabledRow()">${adminDayEnabledMap['home']===false?'Enable':'Disable'}</button>
-        ${adminModuleStatus['home']?`<button class="btn danger small" onclick="deleteHomeOverrideRow()">Delete customization</button>`:''}
-        <button class="btn amber small" onclick="openModuleEditor('home')">Edit &rarr;</button>
-      </div>
-    </div>
+    <h2 class="page-title" style="font-size:20px;">Original Washing Machine course — Days</h2>
+    <p style="font-size:12.5px;color:var(--ink-soft);margin-top:-8px;">Nothing here is fixed — every day can be reordered, disabled, duplicated, or deleted. Manage the Home Page for this course under "Home Pages" in the sidebar.</p>
     ${DAYS.map((d,i)=>`
       <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;${adminDayEnabledMap[d.id]===false?'opacity:0.55;':''}">
         <div>
