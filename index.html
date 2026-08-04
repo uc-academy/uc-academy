@@ -1849,11 +1849,11 @@ function renderSosSolutionScreen(){
     <h2 style="margin:0 0 10px;font-size:19px;">${esc(tr.title)}</h2>
     ${tr.shortDescription?`<p style="font-size:13px;color:var(--ink-soft);margin:-6px 0 12px;">${esc(tr.shortDescription)}</p>`:''}
     ${embedUrl?`<div style="position:relative;padding-bottom:56.25%;height:0;border-radius:10px;overflow:hidden;margin-bottom:14px;">${isYouTube?`<div id="sos-yt-player" style="position:absolute;top:0;left:0;width:100%;height:100%;"></div>`:`<iframe src="${esc(embedUrl)}" style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;" allowfullscreen></iframe>`}</div>`:''}
-    ${tr.theory?`<div style="white-space:pre-wrap;font-size:14px;line-height:1.6;margin-bottom:14px;">${esc(tr.theory)}</div>`:''}
+    ${tr.theory?`<div class="rte-content ql-editor" style="font-size:14px;line-height:1.6;margin-bottom:14px;">${tr.theory}</div>`:''}
     ${tr.audioUrl?`<audio controls style="width:100%;margin-bottom:14px;"><source src="${esc(tr.audioUrl)}"></audio>`:''}
     ${(tr.images||[]).length?`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">${tr.images.map(src=>`<img src="${esc(src)}" style="max-width:140px;border-radius:8px;">`).join('')}</div>`:''}
     ${(tr.documents||[]).length?`<div style="margin-bottom:14px;"><span class="field-label">Downloads</span>${tr.documents.map((d,i)=>`<a href="${esc(d)}" target="_blank" style="display:block;font-size:13px;color:var(--brand);margin-bottom:4px;">📄 Document ${i+1}</a>`).join('')}</div>`:''}
-    ${tr.nextAction?`<div class="save-note" style="margin-bottom:14px;"><strong>Recommended next step:</strong> ${esc(tr.nextAction)}</div>`:''}
+    ${tr.nextAction?`<div class="save-note" style="margin-bottom:14px;"><strong>Recommended next step:</strong> <span class="rte-content ql-editor" style="display:inline;">${tr.nextAction}</span></div>`:''}
     ${related.length?`<div style="margin-bottom:14px;"><span class="field-label">Related topics</span><div style="display:flex;flex-direction:column;gap:6px;">${related.map(r=>{ const rid = Object.keys(sosProblems).find(k=>sosProblems[k]===r); return `<button class="btn secondary small" style="text-align:left;" onclick="openSosProblem('${rid}')">${esc(sosProblemTranslated(r, sosSelectedLanguage).title)}</button>`; }).join('')}</div></div>`:''}
     <div style="display:flex;gap:8px;margin-top:16px;">
       <button class="btn secondary" style="flex:1;" onclick="markSosResolved(true)">✓ This solved it</button>
@@ -2339,7 +2339,7 @@ async function submitCCLogin(){
   const [ccId, c] = match;
   if(c.failedAttempts) await kvSet('cc:'+ccId, { ...c, failedAttempts:0 });
   await loginAsCC(ccId);
-  adminTab='modules';
+  adminTab='categories';
   renderAdmin();
 }
 async function loginAsZT(ztId, opts){
@@ -2421,11 +2421,28 @@ function ztEffectiveAssignedCities(){
   const viaZones = citiesInZones(trainerIdentity.assignedZones || []);
   return [...new Set([...direct, ...viaZones])];
 }
-function renderZTScopePicker(){
+function renderZTScopePicker(forceShow){
   const root = document.getElementById('root');
   document.getElementById('hamburger').style.display='none';
   const myCategories = (trainerIdentity.assignedCategories||[]).map(id=>[id, adminCategories[id]]).filter(([,c])=>c);
   const myCities = ztEffectiveAssignedCities();
+  if(myCategories.length===0 || myCities.length===0){
+    root.innerHTML = `<div class="gate-wrap"><div class="gate-card" style="text-align:center;">
+      <div class="gate-brand" style="justify-content:center;">${renderLogoMark('gate-mark')}<div class="gate-brand-text"><div class="t1">${esc(COURSE_NAME)}</div><div class="t2">${esc(COURSE_SUB)}</div></div></div>
+      <h3 style="margin-top:14px;">No Category or City has been assigned to your account.</h3>
+      <p style="font-size:13px;color:var(--ink-soft);">Please contact the Admin.</p>
+      <button class="btn secondary" style="margin-top:14px;" onclick="doZTLogout()">Log out</button>
+    </div></div>`;
+    return;
+  }
+  if(!forceShow && myCategories.length===1 && myCities.length===1){
+    ztSessionCategory = myCategories[0][0];
+    ztSessionCity = myCities[0];
+    ztSessionCluster = CITY_ZONE[ztSessionCity]||'';
+    adminTab='partners';
+    renderAdmin();
+    return;
+  }
   root.innerHTML = `
     <div class="gate-wrap">
       <div class="gate-card">
@@ -2437,13 +2454,11 @@ function renderZTScopePicker(){
         <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">Confirm what you're working on this session. You can switch anytime from the sidebar.</p>
         <span class="field-label">Select your category</span>
         <select class="field-input" id="zt-scope-category">
-          ${myCategories.length===0?`<option value="">No categories assigned yet</option>`:''}
           ${myCategories.length>1?`<option value="">All my assigned categories</option>`:''}
           ${myCategories.map(([id,cat])=>`<option value="${id}">${esc(cat.name)}</option>`).join('')}
         </select>
         <span class="field-label">Select your city</span>
         <select class="field-input" id="zt-scope-city">
-          ${myCities.length===0?`<option value="">No cities assigned yet</option>`:''}
           ${myCities.length>1?`<option value="">All my assigned cities</option>`:''}
           ${myCities.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('')}
         </select>
@@ -2451,6 +2466,11 @@ function renderZTScopePicker(){
       </div>
     </div>
   `;
+}
+function doZTLogout(){
+  clearSession();
+  trainerIdentity = null;
+  renderGate();
 }
 function confirmZTScope(){
   const catEl = document.getElementById('zt-scope-category');
@@ -2462,7 +2482,7 @@ function confirmZTScope(){
   renderAdmin();
 }
 function changeZTScope(){
-  renderZTScopePicker();
+  renderZTScopePicker(true);
 }
 
 async function submitAdminLogin(){
@@ -2545,7 +2565,7 @@ async function tryRestoreSession(){
     if(saved.role==='cc'){
       const result = await loginAsCC(saved.ccId, { silent:true, sessionToken: saved.sessionToken });
       if(!result.ok){ clearSession(); sessionReplacedNotice = result.reason==='session_replaced'; return false; }
-      adminTab='modules';
+      adminTab='categories';
       renderAdmin();
       startSessionWatch();
       return true;
@@ -4243,8 +4263,7 @@ const TRAINER_TAB_KEYS_DEFAULT = [
   ['report','Report an Issue','Get help from Admin'],
 ];
 const CC_TAB_KEYS_DEFAULT = [
-  ['modules','Modules','Edit course content'],
-  ['soscontent','SOS Content','Manage help problems & solutions'],
+  ['categories','Category Management','Your assigned categories & courses'],
 ];
 const ZT_TAB_KEYS_DEFAULT = [
   ['partners','Partners','Create & manage'],
@@ -4430,7 +4449,7 @@ async function renderAdminMain(){
     sosLanguages = Object.values(langs).filter(l=>l.active!==false).map(l=>l.name);
     if(!sosLanguages.includes(DEFAULT_LANGUAGE)) sosLanguages.unshift(DEFAULT_LANGUAGE);
     adminSosActivityLogs = await listSosActivityLogs(300);
-    el.innerHTML = renderSosContentTab();
+    el.innerHTML = renderSosContentTab(); initRichTextEditors();
   }
   else if(adminTab==='languages'){ await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderLanguagesTab(); }
   else if(adminTab==='history'){ adminHistoryCache = await listHistory(300); el.innerHTML = renderHistoryTab(); }
@@ -5052,54 +5071,57 @@ async function removeZT(ztId){
 
 /* ---- CATEGORY MANAGEMENT (admin only) ---- */
 function renderCategoryManageTab(){
-  const categories = Object.entries(adminCategories);
+  const isCC = isCCRole();
+  const myAssignedCats = isCC ? (trainerIdentity.assignedCategories||[]) : null;
+  const categories = Object.entries(adminCategories).filter(([catId])=> !isCC || myAssignedCats.includes(catId));
   return `
-    <div class="crumb">Admin dashboard</div>
+    <div class="crumb">${isCC?'Content Creator dashboard':'Admin dashboard'}</div>
     <h1 class="page-title">Category Management</h1>
-    <p class="page-sub">Categories and their courses. Each course has its own independent Home Page, days, and content — click "Edit modules" on any course below to manage them. Nothing is created by default; build categories, courses, Home Pages, and days manually, and nothing is visible to Trainers or Partners until you Save &amp; Publish.</p>
-    <div class="card">
+    <p class="page-sub">${isCC ? `Your assigned categories and courses. Click "Edit modules" on any course below to manage its Home Page and days. Nothing is visible to Trainers or Partners until you Save &amp; Publish.` : `Categories and their courses. Each course has its own independent Home Page, days, and content — click "Edit modules" on any course below to manage them. Nothing is created by default; build categories, courses, Home Pages, and days manually, and nothing is visible to Trainers or Partners until you Save &amp; Publish.`}</p>
+    ${(isCC && categories.length===0) ? `<div class="card"><div class="empty-state">No categories have been assigned to your account yet. Contact your Admin.</div></div>` : ''}
+    ${isCC ? '' : `<div class="card">
       <h3>Add a category</h3>
       <div style="display:flex;gap:10px;">
         <input class="field-input" id="new-category-name" style="margin-bottom:0;flex:1;" placeholder="e.g. AC">
         <button class="btn amber" onclick="createCategory()">Add category</button>
       </div>
-    </div>
-    ${categories.length===0 ? `<div class="card"><div class="empty-state">No categories yet — add one above.</div></div>` :
+    </div>`}
+    ${categories.length===0 ? (isCC ? '' : `<div class="card"><div class="empty-state">No categories yet — add one above.</div></div>`) :
     categories.map(([catId,cat])=>{
       const courses = Object.entries(adminCourses).filter(([,c])=>c.categoryId===catId);
       return `<div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
           <h3 style="margin:0;">${esc(cat.name)} <span class="pill ${cat.active!==false?'open':'closed'}" style="font-size:10px;">${cat.active!==false?'Active':'Disabled'}</span></h3>
-          <div style="display:flex;gap:6px;">
+          ${isCC ? '' : `<div style="display:flex;gap:6px;">
             <button class="btn small secondary" onclick="renameCategory('${catId}')">Rename</button>
             <button class="btn small secondary" onclick="toggleCategoryActive('${catId}')">${cat.active!==false?'Disable':'Enable'}</button>
             <button class="btn small danger" onclick="removeCategory('${catId}')">Remove</button>
-          </div>
+          </div>`}
         </div>
         <table class="data-table">
-          <tr><th>Course</th><th>Status</th><th>Content</th><th></th></tr>
+          <tr><th>Course</th><th>Status</th><th>Content</th>${isCC?'':'<th></th>'}</tr>
           ${courses.map(([courseId,course])=>{
             const st = effectiveCourseStatus(course);
             const pillClass = st==='Live'?'open':st==='Draft'?'scheduled':st==='Archived'?'closed':'warn';
             return `<tr>
             <td>${esc(course.name)}</td>
             <td>
-              <span class="pill ${pillClass}" style="margin-right:8px;">${st}</span>
+              ${isCC ? `<span class="pill ${pillClass}">${st}</span>` : `<span class="pill ${pillClass}" style="margin-right:8px;">${st}</span>
               <select style="display:inline-block;width:auto;padding:4px 8px;font-size:12px;" onchange="setCourseStatus('${courseId}', this.value)">
                 ${COURSE_STATUSES.map(s=>`<option value="${s}" ${st===s?'selected':''}>${s}</option>`).join('')}
-              </select>
+              </select>`}
             </td>
             <td><button class="btn small secondary" onclick="openCourseModuleEditor('${courseId}')">Edit modules</button></td>
-            <td style="display:flex;gap:6px;flex-wrap:wrap;">
+            ${isCC ? '' : `<td style="display:flex;gap:6px;flex-wrap:wrap;">
               <button class="btn small secondary" onclick="renameCourse('${courseId}')">Rename</button>
               <button class="btn small danger" onclick="removeCourse('${courseId}')">Remove</button>
-            </td>
+            </td>`}
           </tr>`;}).join('')}
         </table>
-        <div style="display:flex;gap:10px;margin-top:10px;">
+        ${isCC ? '' : `<div style="display:flex;gap:10px;margin-top:10px;">
           <input class="field-input" id="new-course-name-${catId}" style="margin-bottom:0;flex:1;" placeholder="New course name">
           <button class="btn secondary" onclick="createCourse('${catId}')">Add course</button>
-        </div>
+        </div>`}
       </div>`;
     }).join('')}
   `;
@@ -6433,8 +6455,8 @@ function renderSosProblemEditor(){
       <input class="field-input" id="sos-ed-shortdesc" value="${esc(tr.shortDescription||'')}" placeholder="One line summary shown in the problem list" ${!canEdit?'disabled':''}>
 
       <span class="field-label">Step-by-step theory</span>
-      <textarea class="field-input reflect" id="sos-ed-theory" style="min-height:100px;" ${!canEditTheory?'disabled':''}>${esc(tr.theory||'')}</textarea>
-      <p style="font-size:11.5px;color:var(--ink-soft);margin:-8px 0 10px;">Leave blank to hide the theory section from partners entirely.</p>
+      ${rteMount('sos-ed-theory', tr.theory||'', 'Step-by-step solution', 'sos/'+(editingSosProblemId||'new'), !canEditTheory)}
+      <p style="font-size:11.5px;color:var(--ink-soft);margin:-2px 0 10px;">Leave blank to hide the theory section from partners entirely.</p>
 
       <span class="field-label">Video link (YouTube, Drive, or direct link)</span>
       <input class="field-input" id="sos-ed-video" value="${esc(tr.videoUrl||'')}" placeholder="https://..." ${!canUploadVideo?'disabled':''} oninput="previewSosVideo()">
@@ -6451,10 +6473,10 @@ function renderSosProblemEditor(){
       <textarea class="field-input reflect" id="sos-ed-documents" style="min-height:60px;" ${!canEdit?'disabled':''}>${esc((tr.documents||[]).join('\n'))}</textarea>
 
       <span class="field-label">Recommended action</span>
-      <textarea class="field-input reflect" id="sos-ed-nextaction" style="min-height:50px;" ${!canEdit?'disabled':''}>${esc(tr.nextAction||'')}</textarea>
+      ${rteMount('sos-ed-nextaction', tr.nextAction||'', '', 'sos/'+(editingSosProblemId||'new'), !canEdit)}
 
       <span class="field-label">Escalation instructions</span>
-      <textarea class="field-input reflect" id="sos-ed-escalation" style="min-height:50px;" placeholder="What should the partner mention when escalating this specific issue?" ${!canEdit?'disabled':''}>${esc(tr.escalationInstructions||'')}</textarea>
+      ${rteMount('sos-ed-escalation', tr.escalationInstructions||'', 'What should the partner mention when escalating this specific issue?', 'sos/'+(editingSosProblemId||'new'), !canEdit)}
 
       ${isDefault ? `
       <span class="field-label">Search keywords (comma separated)</span>
@@ -6485,13 +6507,13 @@ function syncSosEditorFromDOM(){
   const fields = {
     title: document.getElementById('sos-ed-title').value.trim(),
     shortDescription: document.getElementById('sos-ed-shortdesc').value.trim(),
-    theory: document.getElementById('sos-ed-theory').value,
+    theory: rteGetValue('sos-ed-theory') ?? '',
     videoUrl: document.getElementById('sos-ed-video').value.trim(),
     audioUrl: document.getElementById('sos-ed-audio').value.trim(),
     images: document.getElementById('sos-ed-images').value.split('\n').map(s=>s.trim()).filter(Boolean),
     documents: document.getElementById('sos-ed-documents').value.split('\n').map(s=>s.trim()).filter(Boolean),
-    nextAction: document.getElementById('sos-ed-nextaction').value.trim(),
-    escalationInstructions: document.getElementById('sos-ed-escalation').value.trim(),
+    nextAction: rteGetValue('sos-ed-nextaction') ?? '',
+    escalationInstructions: rteGetValue('sos-ed-escalation') ?? '',
   };
   if(isDefault){
     Object.assign(p, fields);
@@ -7986,8 +8008,8 @@ async function rteUploadImage(file, contextPath){
   if(!url) return { ok:false, reason:'Upload failed — check your connection and try again.' };
   return { ok:true, url, path };
 }
-function rteMount(fieldId, initialHtml, placeholder, contextPath){
-  return `<div class="rte-wrap" id="${fieldId}-wrap" data-field="${fieldId}" data-initial="${rteEncode(initialHtml)}" data-placeholder="${esc(placeholder||'')}" data-context="${esc(contextPath||'general')}"><div class="rte-mount" id="${fieldId}"></div></div>`;
+function rteMount(fieldId, initialHtml, placeholder, contextPath, readonly){
+  return `<div class="rte-wrap" id="${fieldId}-wrap" data-field="${fieldId}" data-initial="${rteEncode(initialHtml)}" data-placeholder="${esc(placeholder||'')}" data-context="${esc(contextPath||'general')}" data-readonly="${readonly?'1':''}"><div class="rte-mount" id="${fieldId}"></div></div>`;
 }
 function rteCurrentContext(){
   return [editingCourseId||'legacy', editingDayId||'x', editingLanguage||'default'].join('/');
@@ -8047,6 +8069,7 @@ function initRichTextEditors(){
       } } }
     });
     if(initialHtml) quill.clipboard.dangerouslyPasteHTML(initialHtml);
+    if(wrap.dataset.readonly==='1'){ quill.enable(false); wrap.style.opacity='0.65'; }
     quillInstances[fieldId] = quill;
 
     // Drag-and-drop image support
