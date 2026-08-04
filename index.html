@@ -496,12 +496,12 @@ const BASE_DAYS = [
 }
 ];
 let DAYS = [...BASE_DAYS];
-function rebuildDaysList(registryIds){
+function rebuildDaysList(registryIds, courseId){
   DAYS = registryIds.map(id=>{
-    const base = BASE_DAYS.find(d=>d.id===id);
+    const base = !courseId ? BASE_DAYS.find(d=>d.id===id) : null;
     if(base) return base;
     return {
-      id, machine:'BOTH', title:'New Day', sub:'Custom day added by Admin — edit this in Modules.',
+      id, machine:'BOTH', title:'Day '+id, sub:courseId?'Course day — content loads from the course editor.':'Custom day added by Admin — edit this in Modules.',
       theory:[], video:{title:'Video'}, assignment:{intro:'', tasks:[]},
       quiz:[{q:'Question 1', opts:['Option A','Option B','Option C','Option D'], correct:0}]
     };
@@ -929,7 +929,9 @@ async function getOrCreateActiveBatch(trainerId, trainerName, city, courseId){
   let active = batches.find(b=>b.status==='Active');
   const today = todayStr();
   if(active){
-    const endBy = addDays(active.startDate, 7);
+    const activeCourseDayIds = await getDayRegistry(active.courseId||null);
+    const rotationDays = Math.max(1, activeCourseDayIds.length);
+    const endBy = addDays(active.startDate, rotationDays);
     if(today > endBy){
       await updateBatch(active.id, { status:'Completed', endDate: endBy });
       await logHistory('batch_completed', `Batch ${active.batchNumber} for ${trainerName} (${city}) auto-completed`, {batchId:active.id, trainerId});
@@ -1440,9 +1442,9 @@ async function getDayRegistry(courseId){
   return v ? v.days : BASE_DAYS.map(d=>d.id);
 }
 async function setDayRegistry(days, courseId){ return await kvSet(courseId ? 'courseDayRegistry:'+courseId : 'dayRegistry', {days}); }
-async function loadAndApplyDayRegistry(){
-  const ids = await getDayRegistry();
-  rebuildDaysList(ids);
+async function loadAndApplyDayRegistry(courseId){
+  const ids = await getDayRegistry(courseId||null);
+  rebuildDaysList(ids, courseId||null);
   return ids;
 }
 
@@ -2097,7 +2099,7 @@ async function loginAsPartner(id, opts){
   currentUserDisabledDayIds = Object.entries(partnerDayEnabledMap).filter(([k,v])=>v===false && k!=='home').map(([k])=>parseInt(k));
   currentUserAssessmentUnlockedDays = await getAssessmentUnlock(r.city, r.trainer);
   currentUserProgress = await getProgress(id);
-  await loadAndApplyDayRegistry();
+  await loadAndApplyDayRegistry(r.courseId||null);
   for(const d of DAYS) ensureDay(d.id);
   videosCache = {}; audiosCache = {}; contentOverrides = {}; extraVideosCache = {}; extraAudiosCache = {};
   await Promise.all(DAYS.map(async d=>{
@@ -2597,17 +2599,8 @@ function renderSidebar(){
       <div class="nav-text"><div class="nav-title">Home</div><div class="nav-sub">Welcome & Safety</div></div>
     </div>` : ''}
   `;
-  if(DAYS.length===7 && DAYS.every((d,i)=>d.id===i+1) && currentUserDisabledDayIds.length===0){
-    html += `<div class="nav-section-label">Semi-Automatic</div>`;
-    DAYS.slice(0,3).forEach(d=>html+=knobRow(d));
-    html += `<div class="nav-section-label">Top-Load</div>`;
-    DAYS.slice(3,6).forEach(d=>html+=knobRow(d));
-    html += `<div class="nav-section-label">Final Assessment</div>`;
-    html += knobRow(DAYS[6]);
-  } else {
-    html += `<div class="nav-section-label">Course Days</div>`;
-    DAYS.filter(d=>!currentUserDisabledDayIds.includes(d.id)).forEach(d=>html+=knobRow(d));
-  }
+  html += `<div class="nav-section-label">Course Days</div>`;
+  DAYS.filter(d=>!currentUserDisabledDayIds.includes(d.id)).forEach(d=>html+=knobRow(d));
   html += `
     <div class="knob-row ${currentDay===98?'active':''}" onclick="goTo(98,'theory')">
       <div class="knob"></div>
@@ -2648,7 +2641,7 @@ async function refreshPartnerData(){
   currentUserDisabledDayIds = Object.entries(partnerDayEnabledMap).filter(([k,v])=>v===false && k!=='home').map(([k])=>parseInt(k));
   currentUserAssessmentUnlockedDays = await getAssessmentUnlock(r.city, r.trainer);
   currentUserProgress = await getProgress(currentUser.id);
-  await loadAndApplyDayRegistry();
+  await loadAndApplyDayRegistry(r.courseId||null);
   for(const d of DAYS) ensureDay(d.id);
   await Promise.all(DAYS.map(async d=>{
     videosCache[d.id]=await getVideoUrl(d.id);
@@ -2791,10 +2784,11 @@ function renderHome(){
     html += currentUserUnlockedDays.length ? `<button class="btn amber" onclick="goTo(${nextDayForPartner()},'theory')">Go to Day ${nextDayForPartner()} &rarr;</button>` : `<div class="lock-banner">No days are unlocked yet. Your trainer will unlock Day 1 to begin class.</div>`;
     return html;
   }
+  const isLegacyPartner = !currentUser.courseId;
   return `
     <div class="crumb">Welcome, ${esc(currentUser.name)}</div>
     <h1 class="page-title">${esc(COURSE_NAME)}</h1>
-    <p class="page-sub">${esc(COURSE_SUB)} — a 7-day, fresher-friendly certification track covering Semi-Automatic and Top-Load machines.</p>
+    <p class="page-sub">${esc(COURSE_SUB)} — ${s.total} day${s.total===1?'':'s'}.</p>
     <div class="today-banner"><b>Class today:</b> Day ${currentUser.day} &middot; ${esc(currentUser.city)} &middot; Trainer ${esc(currentUser.trainer)} &middot; Check-in window ${esc(currentUser.open)}&ndash;${esc(currentUser.close)}</div>
     <div class="home-grid">
       <div class="stat-card"><div class="n">${s.done}/${s.total}</div><div class="l">Days complete</div></div>
@@ -2804,10 +2798,10 @@ function renderHome(){
     <div class="card"><h3>Learning flow for each day</h3>
       <ul class="list"><li><b>1. Theory (+ audio if provided)</b> — read and mark complete.</li><li><b>2. Video</b> — unlocks after theory; you need to reach 90% watched.</li><li><b>3. Assignment & Assessment</b> — unlock after the video is done. The assessment can only be submitted once.</li></ul>
     </div>
-    <div class="card"><h3>Daily rhythm (9 AM – 6 PM)</h3>
+    ${isLegacyPartner ? `<div class="card"><h3>Daily rhythm (9 AM – 6 PM)</h3>
       <table class="value-table"><tr><th>Time</th><th>Block</th><th>Duration</th></tr>${HOME_SCHEDULE.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td><td class="mono">${r[2]}</td></tr>`).join('')}</table>
     </div>
-    <div class="card"><h3>Non-negotiable safety rules</h3><ul class="list">${HOME_SAFETY.map(x=>`<li>${x}</li>`).join('')}</ul></div>
+    <div class="card"><h3>Non-negotiable safety rules</h3><ul class="list">${HOME_SAFETY.map(x=>`<li>${x}</li>`).join('')}</ul></div>` : ''}
     ${currentUserUnlockedDays.length ? `<button class="btn amber" onclick="goTo(${nextDayForPartner()},'theory')">Go to Day ${nextDayForPartner()} &rarr;</button>` : `<div class="lock-banner">No days are unlocked yet. Your trainer will unlock Day 1 to begin class.</div>`}
   `;
 }
@@ -2835,7 +2829,7 @@ function renderDayShell(day){
   `;
   const showAiButton = currentAiSettings.chatEnabled && currentAiSettings.apiKey && currentTab!=='quiz' && !(ov && ov.aiAssistantDisabled);
   return `
-    <div class="crumb">Day ${day.id} &middot; ${day.machine==='SA'?'Semi-Automatic':day.machine==='TL'?'Top-Load':'Semi-Automatic & Top-Load'}</div>
+    <div class="crumb">Day ${day.id}${currentUser.courseId ? '' : ' &middot; '+(day.machine==='SA'?'Semi-Automatic':day.machine==='TL'?'Top-Load':'Semi-Automatic & Top-Load')}</div>
     <h1 class="page-title">${esc(displayTitle)}</h1>
     <p class="page-sub">${esc(displaySub)}</p>
     <div class="tabs">${tabsHtml}</div>
@@ -3902,14 +3896,14 @@ function renderResult(){
     <div class="card">
       <h3>Final result</h3>
       <p>Overall score: <b class="mono">${s.overall.pct}%</b> &middot; Rating: <span class="rating-pill ${s.overall.ratingKey}">${s.overall.rating}</span> &middot; ${s.overall.pass?'<b style="color:var(--success);">PASS</b>':'<b style="color:var(--danger);">FAIL</b>'}</p>
-      <p style="font-size:12.5px;color:var(--ink-soft);">This reflects your online knowledge checks only. Your trainer's hands-on practical assessment on Day 7 is scored separately and offline.</p>
+      <p style="font-size:12.5px;color:var(--ink-soft);">This reflects your online knowledge checks only. Your trainer's hands-on practical assessment on the final day is scored separately and offline.</p>
       <button class="btn amber small" onclick="downloadReportCard()" style="margin-top:8px;">Download Report Card</button>
-    </div>` : `<div class="lock-banner">Complete and submit all 7 assessments to see your final rating.</div>`}
+    </div>` : `<div class="lock-banner">Complete and submit all ${s.total} assessment${s.total===1?'':'s'} to see your final rating.</div>`}
     <div class="cert-page"><div class="cert-box">
       <div class="eyebrow">${esc(COURSE_NAME)} certifies that</div>
       <div class="cname">${ready?esc(currentUser.name):'— locked —'}</div>
       <h2>has completed the ${esc(COURSE_SUB)}</h2>
-      <p style="max-width:480px;margin:0 auto;color:var(--ink-soft);font-size:13px;">Covering Semi-Automatic and Top-Load machine working principles, dismantling and assembling, troubleshooting, and final assessment.</p>
+      <p style="max-width:480px;margin:0 auto;color:var(--ink-soft);font-size:13px;">${currentUser.courseId ? '' : 'Covering Semi-Automatic and Top-Load machine working principles, dismantling and assembling, troubleshooting, and final assessment.'}</p>
       <div class="cert-meta">Trainer: ${esc(currentUser.trainer)} &middot; City: ${esc(currentUser.city)}<br>Issued ${new Date().toLocaleDateString('en-IN',{year:'numeric',month:'long',day:'numeric'})}</div>
     </div>${ready?`<div style="margin-top:18px;"><button class="btn amber" onclick="window.print()">Print / save certificate</button></div>`:(allSubmittedButFailed?`<div class="lock-banner" style="margin-top:18px;">Your overall result is a Fail, so the certificate isn't available. Speak with your trainer about resubmission or additional practice.</div>`:'')}</div>
   `;
@@ -6684,7 +6678,7 @@ function renderBatchesListTab(){
   return `
     <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'}</div>
     <h1 class="page-title">Batches</h1>
-    <p class="page-sub">Every 7-day batch, auto-numbered per trainer. A new batch starts automatically once the previous one's 7 days are up — or you can close one early.</p>
+    <p class="page-sub">Batches are auto-numbered per trainer. A new batch starts automatically once the previous one's course days are up — or you can close one early. The rotation length follows each batch's own course, not a fixed number.</p>
     ${adminBatchesCache.length===0?`<div class="card"><div class="empty-state">No batches yet — the first one is created automatically as soon as a partner is added.</div></div>`:''}
     ${adminBatchesCache.map(b=>`
       <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
