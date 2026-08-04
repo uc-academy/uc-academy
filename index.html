@@ -7193,7 +7193,7 @@ function renderAccessTab(){
   return `
     <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'}</div>
     <h1 class="page-title">Day access</h1>
-    <p class="page-sub">Control which days are visible to your partners — like a certificate lock. Nothing is visible until you unlock it here. Assessments have their own separate unlock below — partners can't attempt one until you unlock it, even after finishing the day's video and assignment. Each course shows only its own days — nothing here is fixed to a specific day count.</p>
+    <p class="page-sub">Control which days are visible to your partners — like a certificate lock. Nothing is visible until you unlock it here. Assessments have their own separate unlock below — partners can't attempt one until you unlock it, even after finishing the day's video and assignment.</p>
     ${awaitingConfirmation.length>0 ? `<div class="card">
       <h3>Videos awaiting your confirmation</h3>
       <p style="margin-bottom:10px;">These videos are set to require manual unlock instead of unlocking automatically at the required percentage.</p>
