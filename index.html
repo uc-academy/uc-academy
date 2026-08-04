@@ -2213,7 +2213,7 @@ async function loginAsTrainer(trainerId, opts){
       if(stored && opts.sessionToken!==stored) return { ok:false, reason:'session_replaced' };
     }
   }
-  trainerIdentity = { isAdmin:false, trainerId, name:t.name, phone:t.phone, category:t.category, city:t.city };
+  trainerIdentity = { isAdmin:false, trainerId, name:t.name, phone:t.phone, category:t.category, city:t.city, assignedCourses:t.assignedCourses||[] };
   let sessionToken = opts.sessionToken;
   if(!opts.silent){
     sessionToken = newSessionToken();
@@ -4367,6 +4367,13 @@ function setAdminTab(t){
 async function renderAdminMain(){
   const el = document.getElementById('main');
   el.innerHTML = `<div class="spinner-note">Loading...</div>`;
+  if(isTrainerRole() && !trainerHasAnyAssignment()){
+    el.innerHTML = `<div class="card" style="text-align:center;padding:40px 24px;">
+      <h2 style="margin-bottom:8px;">No access has been assigned to your account.</h2>
+      <p style="color:var(--ink-soft);">Please contact the Admin.</p>
+    </div>`;
+    return;
+  }
   if(adminTab==='overview'){ el.innerHTML = await renderOverviewTabAsync(); }
   else if(adminTab==='trainers'){ adminTrainers = await listTrainers(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderTrainersTab(); }
   else if(adminTab==='ccmanage'){ adminCCs = await listCCs(); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); await seedDefaultLanguageIfEmpty(); adminLanguages = await listLanguages(); sosCategories = await listSosCategories(); el.innerHTML = renderCCManageTab(); }
@@ -7169,7 +7176,7 @@ function renderSessionsTab(){
       <div class="form-grid">
         <div><span class="field-label">City</span>${lockedFields ? `<div class="readonly-chip">${esc(trainerIdentity.city)}</div>` : `<select class="field-input" id="s-city">${CITIES.map(c=>`<option>${c}</option>`).join('')}</select>`}</div>
         <div><span class="field-label">Trainer name</span>${lockedFields ? `<div class="readonly-chip">${esc(trainerIdentity.name)}</div>` : `<input class="field-input" id="s-trainer">`}</div>
-        <div><span class="field-label">Course</span><select class="field-input" id="s-course" onchange="updateSessionDayOptions()"><option value="">— No specific course —</option>${Object.entries(adminCategories).flatMap(([catId,cat])=>Object.entries(adminCourses).filter(([,c])=>c.categoryId===catId).map(([courseId,course])=>`<option value="${courseId}">${esc(cat.name)} — ${esc(course.name)}</option>`)).join('')}</select></div>
+        <div><span class="field-label">Course</span><select class="field-input" id="s-course" onchange="updateSessionDayOptions()">${(!isTrainerRole() || (trainerIdentity.assignedCourses||[]).length===0) ? '<option value="">— No specific course —</option>' : ''}${Object.entries(adminCategories).flatMap(([catId,cat])=>Object.entries(adminCourses).filter(([cid,c])=>c.categoryId===catId && trainerCourseAllowed(cid)).map(([courseId,course])=>`<option value="${courseId}">${esc(cat.name)} — ${esc(course.name)}</option>`)).join('')}</select></div>
         <div><span class="field-label">Day</span><select class="field-input" id="s-day">${DAYS.map(d=>`<option value="${d.id}">Day ${d.id} — ${d.title}</option>`).join('')}</select></div>
         <div><span class="field-label">Date</span><input class="field-input" id="s-date" type="date" value="${todayStr()}"></div>
         <div><span class="field-label">Opens at</span><input class="field-input" id="s-open" type="time" value="09:00"></div>
@@ -7331,7 +7338,7 @@ function renderPartnersTab(){
         <div><span class="field-label">Partner office ID</span><input class="field-input" id="p-office"></div>
         ${(isAdminRole()||isZTRole()) ? `<div class="full"><span class="field-label">Trainer name</span><select class="field-input" id="p-trainer-select"><option value="">Select trainer</option>${trainerOptions}</select></div>`
         : `<div class="full"><span class="field-label">Trainer name</span><div class="readonly-chip">${esc(trainerIdentity.name)} — ${esc(trainerIdentity.city)}</div></div>`}
-        <div class="full"><span class="field-label">Course</span><select class="field-input" id="p-course-select"><option value="">Select course</option>${Object.entries(adminCategories).flatMap(([catId,cat])=>Object.entries(adminCourses).filter(([,c])=>c.categoryId===catId && c.active!==false).map(([courseId,course])=>`<option value="${courseId}">${esc(cat.name)} — ${esc(course.name)}</option>`)).join('')}</select></div>
+        <div class="full"><span class="field-label">Course</span><select class="field-input" id="p-course-select"><option value="">Select course</option>${Object.entries(adminCategories).flatMap(([catId,cat])=>Object.entries(adminCourses).filter(([cid,c])=>c.categoryId===catId && c.active!==false && trainerCourseAllowed(cid)).map(([courseId,course])=>`<option value="${courseId}">${esc(cat.name)} — ${esc(course.name)}</option>`)).join('')}</select></div>
       </div>
       <button class="btn amber" onclick="createPartner()">Generate partner password</button>
     </div>
@@ -7631,6 +7638,17 @@ let courseEditorOverrideCache = {};
 function ccCourseAllowed(courseId){
   const list = trainerIdentity.assignedCourses || [];
   return list.length===0 || list.includes(courseId);
+}
+function trainerCourseAllowed(courseId){
+  if(isAdminRole()) return true;
+  if(!isTrainerRole()) return true; // scoping for other roles handled by their own helpers
+  const list = trainerIdentity.assignedCourses || [];
+  return list.includes(courseId);
+}
+function trainerHasAnyAssignment(){
+  if(isAdminRole()) return true;
+  if(!isTrainerRole()) return true;
+  return (trainerIdentity.assignedCourses||[]).length > 0;
 }
 function ccSosCategoryAllowed(categoryId){
   if(isAdminRole()) return true;
