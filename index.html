@@ -1127,6 +1127,15 @@ function contentKey(dayId, courseId, lang){
 }
 function dayEnabledKey(courseId){ return 'dayEnabled:'+(courseId||'legacy'); }
 async function getDayEnabledMap(courseId){ const v = await kvGet(dayEnabledKey(courseId)); return (v && v.map) || {}; }
+async function getLegacyCourseLabel(){ return await kvGet('legacyCourseLabel:global'); }
+async function setLegacyCourseLabel(categoryId, courseId){ return await kvSet('legacyCourseLabel:global', { categoryId: categoryId||null, courseId: courseId||null }); }
+function computeLegacyCourseTitle(label, categories, courses){
+  if(!label || !label.categoryId || !label.courseId) return null;
+  const cat = categories[label.categoryId];
+  const course = courses[label.courseId];
+  if(!cat || !course) return null;
+  return `${cat.name} → ${course.name}`;
+}
 async function setDayEnabledMap(courseId, map){ return await kvSet(dayEnabledKey(courseId), { map }); }
 async function isDayEnabled(dayId, courseId, cachedMap){
   const map = cachedMap || await getDayEnabledMap(courseId);
@@ -4371,6 +4380,7 @@ async function renderAdminMain(){
   else if(adminTab==='sessions'){ const all = await listSessions(); adminSessions = myScopeFilter(all,'city','trainer'); await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); el.innerHTML = renderSessionsTab(); }
   else if(adminTab==='access'){
     await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses();
+    adminLegacyCourseLabel = await getLegacyCourseLabel();
     const allR = await listRoster();
     adminRoster = Object.fromEntries(Object.entries(allR).filter(([,r])=>isRosterEntryVisibleToViewer(r)));
     adminUnlocks = await listUnlocks(); adminAssessmentUnlocks = await listAssessmentUnlocks();
@@ -4430,6 +4440,7 @@ async function renderAdminMain(){
         adminModuleStatus['home'] = !!homeOv;
         adminModuleOverrideCache['home'] = homeOv;
         adminDayEnabledMap = await getDayEnabledMap(null);
+        adminLegacyCourseLabel = await getLegacyCourseLabel();
         el.innerHTML = renderModulesListTab();
       }
     }
@@ -7197,7 +7208,7 @@ function renderAccessTab(){
       const unlocked = adminUnlocks[key] || [];
       const assessUnlocked = adminAssessmentUnlocks[key] || [];
       const courseDays = adminAccessCourseDays[g.courseId || 'legacy'] || { dayIds: DAYS.map(d=>d.id), titles: {} };
-      const courseName = g.courseId && adminCourses[g.courseId] ? adminCourses[g.courseId].name : 'Original Washing Machine course';
+      const courseName = g.courseId && adminCourses[g.courseId] ? adminCourses[g.courseId].name : legacyCourseDisplayTitle();
       if(courseDays.dayIds.length===0){
         return `<div class="card"><h3>${esc(g.city)} &middot; ${esc(g.trainer)} &middot; ${esc(courseName)}</h3><div class="empty-state">This course has no days yet — add days in Modules before unlocking anything.</div></div>`;
       }
@@ -7829,6 +7840,7 @@ let adminModuleStatus = {};
 let adminAccessCourseDays = {};
 let adminDayEnabledMap = {};
 let adminLegacyDaysExpanded = false;
+let adminLegacyCourseLabel = null;
 let adminModuleOverrideCache = {};
 
 function renderModulesListTab(){
@@ -7861,12 +7873,45 @@ function renderModulesListTab(){
       </div>
       <p style="font-size:12px;color:var(--ink-soft);margin-top:8px;">Selecting a course opens its day editor right away.</p>
     </div>
-    <div class="card" style="text-align:center;">
-      <p style="margin-bottom:8px;color:var(--ink-soft);font-size:13px;">Looking for the original Washing Machine course instead? It isn't shown by default anymore — open it explicitly below.</p>
-      <button class="btn secondary" onclick="adminLegacyDaysExpanded=true; renderAdminMain();">Manage the Original Washing Machine course's days</button>
+    <div class="card">
+      <p style="margin-bottom:8px;color:var(--ink-soft);font-size:13px;">This course isn't shown by default anymore — open it explicitly below. Give it a Category and Course label so it shows up like any other course instead of a fixed name.</p>
+      <div class="form-grid">
+        <div>
+          <span class="field-label">Category</span>
+          <select class="field-input" id="legacy-label-category" onchange="onLegacyLabelCategoryChange()">
+            <option value="">— Unassigned —</option>
+            ${Object.entries(adminCategories).map(([id,cat])=>`<option value="${id}" ${adminLegacyCourseLabel?.categoryId===id?'selected':''}>${esc(cat.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <span class="field-label">Course</span>
+          <select class="field-input" id="legacy-label-course" onchange="saveLegacyCourseLabel()">
+            <option value="">— Unassigned —</option>
+            ${Object.entries(adminCourses).filter(([,c])=>c.categoryId===adminLegacyCourseLabel?.categoryId).map(([id,course])=>`<option value="${id}" ${adminLegacyCourseLabel?.courseId===id?'selected':''}>${esc(course.name)}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <button class="btn secondary" onclick="adminLegacyDaysExpanded=true; renderAdminMain();" style="margin-top:10px;">Manage this course's days</button>
     </div>
     ${adminLegacyDaysExpanded ? renderLegacyDayManagement() : ''}
   `;
+}
+function legacyCourseDisplayTitle(){
+  return computeLegacyCourseTitle(adminLegacyCourseLabel, adminCategories, adminCourses) || 'Unassigned course';
+}
+async function onLegacyLabelCategoryChange(){
+  await saveLegacyCourseLabel();
+  renderAdminMain();
+}
+async function saveLegacyCourseLabel(){
+  const catId = document.getElementById('legacy-label-category').value;
+  const courseSelect = document.getElementById('legacy-label-course');
+  const courseId = courseSelect ? courseSelect.value : '';
+  const ok = await setLegacyCourseLabel(catId||null, courseId||null);
+  if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
+  adminLegacyCourseLabel = { categoryId: catId||null, courseId: courseId||null };
+  await logHistory('legacy_course_labeled', `Original course labeled as ${legacyCourseDisplayTitle()} by ${trainerIdentity.name}`, {categoryId:catId, courseId});
+  showToast('Label updated.', 'success');
 }
 function renderLegacyDayManagement(){
   return `
@@ -7877,7 +7922,7 @@ function renderLegacyDayManagement(){
       </select>
       <p style="font-size:12px;color:var(--ink-soft);margin-top:6px;">${editingLanguage===DEFAULT_LANGUAGE ? `This is the fallback version partners see if a day isn't translated into their chosen language.` : `Editing the ${esc(editingLanguage)} version. Days shown here as "Default content" have no ${esc(editingLanguage)} translation yet — partners using ${esc(editingLanguage)} will see ${esc(DEFAULT_LANGUAGE)} instead until you add one.`}</p>
     </div>
-    <h2 class="page-title" style="font-size:20px;">Original Washing Machine course — Days</h2>
+    <h2 class="page-title" style="font-size:20px;">${esc(legacyCourseDisplayTitle())} — Days</h2>
     <p style="font-size:12.5px;color:var(--ink-soft);margin-top:-8px;">Nothing here is fixed — every day can be reordered, disabled, duplicated, or deleted. Manage the Home Page for this course under "Home Pages" in the sidebar.</p>
     ${DAYS.map((d,i)=>`
       <div class="card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;${adminDayEnabledMap[d.id]===false?'opacity:0.55;':''}">
