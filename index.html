@@ -786,9 +786,9 @@ async function listSosActivityLogs(limit){
 async function saveSosProblem(id, data){ await kvSet('sosProblem:'+id, data); }
 async function deleteSosProblem(id){ await kvDelete('sosProblem:'+id); }
 
-async function logSosSearch(query, categoryId, resultCount){
+async function logSosSearch(query, categoryId, resultCount, city, trainerId){
   const id = String(Date.now()).padStart(14,'0')+'_'+uid();
-  await kvSet('sosSearchLog:'+id, { query, categoryId: categoryId||null, resultCount, at: new Date().toISOString() });
+  await kvSet('sosSearchLog:'+id, { query, categoryId: categoryId||null, resultCount, city: city||null, trainerId: trainerId||null, at: new Date().toISOString() });
 }
 async function logSosView(data){
   const id = String(Date.now()).padStart(14,'0')+'_'+uid();
@@ -1769,7 +1769,7 @@ async function openSosProblem(id){
   const tr = sosProblemTranslated(p, sosSelectedLanguage);
   const r = sosPartnerRecord;
   if(!sosPreviewMode){
-    await logSosSearch(sosSearchQuery, sosSelectedCategory, 1);
+    await logSosSearch(sosSearchQuery, sosSelectedCategory, 1, r ? r.city : null, r ? r.trainerId : null);
     sosCurrentViewLogId = await logSosView({
       problemId: id,
       problemTitle: tr.title,
@@ -2322,6 +2322,7 @@ async function loginAsZT(ztId, opts){
 }
 let ztSessionCategory = '';
 let ztSessionCluster = '';
+let ztSessionCity = '';
 async function submitZTLogin(){
   if(gateBusy) return;
   const name = document.getElementById('zt-name-input').value.trim();
@@ -2364,25 +2365,21 @@ async function submitZTLogin(){
   const [ztId, z] = match;
   if(z.failedAttempts) await kvSet('zt:'+ztId, { ...z, failedAttempts:0 });
   await loginAsZT(ztId);
-  ztSessionCategory = ''; ztSessionCluster = '';
-  const needsCategoryPick = (trainerIdentity.assignedCategories||[]).length > 1;
-  const needsClusterPick = (trainerIdentity.assignedZones||[]).length > 1;
-  if(needsCategoryPick || needsClusterPick){
-    await seedDefaultCategoriesIfEmpty();
-    adminCategories = await listCategories();
-    renderZTScopePicker();
-    return;
-  }
-  if((trainerIdentity.assignedCategories||[]).length===1) ztSessionCategory = trainerIdentity.assignedCategories[0];
-  if((trainerIdentity.assignedZones||[]).length===1) ztSessionCluster = trainerIdentity.assignedZones[0];
-  adminTab='partners';
-  renderAdmin();
+  ztSessionCategory = ''; ztSessionCluster = ''; ztSessionCity = '';
+  await seedDefaultCategoriesIfEmpty();
+  adminCategories = await listCategories();
+  renderZTScopePicker();
+}
+function ztEffectiveAssignedCities(){
+  const direct = trainerIdentity.assignedCities || [];
+  const viaZones = citiesInZones(trainerIdentity.assignedZones || []);
+  return [...new Set([...direct, ...viaZones])];
 }
 function renderZTScopePicker(){
   const root = document.getElementById('root');
   document.getElementById('hamburger').style.display='none';
   const myCategories = (trainerIdentity.assignedCategories||[]).map(id=>[id, adminCategories[id]]).filter(([,c])=>c);
-  const myClusters = trainerIdentity.assignedZones||[];
+  const myCities = ztEffectiveAssignedCities();
   root.innerHTML = `
     <div class="gate-wrap">
       <div class="gate-card">
@@ -2391,17 +2388,19 @@ function renderZTScopePicker(){
           <div class="gate-brand-text"><div class="t1">${esc(COURSE_NAME)}</div><div class="t2">${esc(COURSE_SUB)}</div></div>
         </div>
         <h3 style="margin-top:6px;">Welcome, ${esc(trainerIdentity.name)}</h3>
-        <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">Pick what you're focused on this session. You can switch anytime from the sidebar.</p>
-        ${myCategories.length>1 ? `<span class="field-label">Category</span>
+        <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">Confirm what you're working on this session. You can switch anytime from the sidebar.</p>
+        <span class="field-label">Select your category</span>
         <select class="field-input" id="zt-scope-category">
-          <option value="">All my assigned categories</option>
+          ${myCategories.length===0?`<option value="">No categories assigned yet</option>`:''}
+          ${myCategories.length>1?`<option value="">All my assigned categories</option>`:''}
           ${myCategories.map(([id,cat])=>`<option value="${id}">${esc(cat.name)}</option>`).join('')}
-        </select>` : ''}
-        ${myClusters.length>1 ? `<span class="field-label">Cluster</span>
-        <select class="field-input" id="zt-scope-cluster">
-          <option value="">All my assigned clusters</option>
-          ${myClusters.map(z=>`<option value="${esc(z)}">${esc(z)}</option>`).join('')}
-        </select>` : ''}
+        </select>
+        <span class="field-label">Select your city</span>
+        <select class="field-input" id="zt-scope-city">
+          ${myCities.length===0?`<option value="">No cities assigned yet</option>`:''}
+          ${myCities.length>1?`<option value="">All my assigned cities</option>`:''}
+          ${myCities.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('')}
+        </select>
         <button class="gate-submit" onclick="confirmZTScope()">Continue</button>
       </div>
     </div>
@@ -2409,9 +2408,10 @@ function renderZTScopePicker(){
 }
 function confirmZTScope(){
   const catEl = document.getElementById('zt-scope-category');
-  const clusterEl = document.getElementById('zt-scope-cluster');
+  const cityEl = document.getElementById('zt-scope-city');
   ztSessionCategory = catEl ? catEl.value : (trainerIdentity.assignedCategories||[])[0] || '';
-  ztSessionCluster = clusterEl ? clusterEl.value : (trainerIdentity.assignedZones||[])[0] || '';
+  ztSessionCity = cityEl ? cityEl.value : '';
+  ztSessionCluster = ztSessionCity ? (CITY_ZONE[ztSessionCity]||'') : '';
   adminTab='partners';
   renderAdmin();
 }
@@ -3879,9 +3879,11 @@ let mediaFilterStatus = '';
 function isAdminRole(){ return trainerIdentity && trainerIdentity.isAdmin; }
 function isCCRole(){ return trainerIdentity && trainerIdentity.isCC; }
 function isZTRole(){ return trainerIdentity && trainerIdentity.isZT; }
+function isTrainerRole(){ return trainerIdentity && !!trainerIdentity.trainerId && !trainerIdentity.isAdmin && !trainerIdentity.isCC && !trainerIdentity.isZT; }
 function cityVisibleToViewer(city){
   if(isAdminRole()) return true;
   if(isZTRole()){
+    if(ztSessionCity && city!==ztSessionCity) return false;
     if(ztSessionCluster && CITY_ZONE[city]!==ztSessionCluster) return false;
     const directCities = trainerIdentity.assignedCities||[];
     const zoneCities = citiesInZones(trainerIdentity.assignedZones||[]);
@@ -3893,9 +3895,17 @@ function isRosterEntryVisibleToViewer(r){
   if(isAdminRole()) return true;
   if(isZTRole()){
     if(!cityVisibleToViewer(r.city)) return false;
-    if(ztSessionCategory && Object.keys(adminCourses).length>0){
-      const course = r.courseId ? adminCourses[r.courseId] : null;
-      if(!course || course.categoryId!==ztSessionCategory) return false;
+    if(ztSessionCategory){
+      if(r.courseId && Object.keys(adminCourses).length>0){
+        const course = adminCourses[r.courseId];
+        if(!course || course.categoryId!==ztSessionCategory) return false;
+      } else {
+        // Legacy (non-course-scoped) partner: bridge via their trainer's legacy category code,
+        // since legacy trainers use plain codes ('RWM','AC', etc.) that match the seeded category names.
+        const wantedName = adminCategories[ztSessionCategory] ? adminCategories[ztSessionCategory].name : null;
+        const trainerRecord = Object.values(adminTrainers||{}).find(t=>t.name===r.trainer);
+        if(wantedName && trainerRecord && trainerRecord.category && trainerRecord.category!==wantedName) return false;
+      }
     }
     return true;
   }
@@ -3937,6 +3947,7 @@ const TRAINER_TAB_KEYS_DEFAULT = [
   ['media','Media Review','Photo & video review'],
   ['aidoubts','AI Doubts','Student questions & AI answers'],
   ['batches','Batches','Your batch history'],
+  ['sosanalytics','SOS Help Analytics','Search, video & escalation insights'],
   ['report','Report an Issue','Get help from Admin'],
 ];
 const CC_TAB_KEYS_DEFAULT = [
@@ -3947,6 +3958,7 @@ const ZT_TAB_KEYS_DEFAULT = [
   ['partners','Partners','Create & manage'],
   ['batches','Batches','Track by batch'],
   ['tracking','Tracking','Scores & attendance'],
+  ['sosanalytics','SOS Help Analytics','Search, video & escalation insights'],
 ];
 function adminTabDefs(){
   let tabs = isAdminRole() ? [...ADMIN_TAB_KEYS_DEFAULT] : isCCRole() ? [...CC_TAB_KEYS_DEFAULT] : isZTRole() ? [...ZT_TAB_KEYS_DEFAULT] : [...TRAINER_TAB_KEYS_DEFAULT];
@@ -4016,8 +4028,8 @@ function renderAdminSidebar(){
       <div class="who-role">${isAdminRole()?'Welcome':'Trainer'}</div>
       ${nameBlock}
       <div class="who-meta">${roleLabel}</div>
-      <div class="who-actions"><span onclick="switchId()">Exit &rarr;</span><span onclick="refreshAdminData()">Refresh</span>${isZTRole()?'<span onclick="changeZTScope()">Change Scope</span>':''}</div>
-      ${isZTRole() && (ztSessionCategory || ztSessionCluster) ? `<div style="padding:0 16px 10px;font-size:11px;color:rgba(255,255,255,0.55);">${ztSessionCategory && adminCategories[ztSessionCategory] ? esc(adminCategories[ztSessionCategory].name) : 'All categories'} &middot; ${ztSessionCluster ? esc(ztSessionCluster) : 'All clusters'}</div>` : ''}
+      <div class="who-actions"><span onclick="switchId()">Exit &rarr;</span><span onclick="refreshAdminData()">Refresh</span>${isZTRole()?'<span onclick="changeZTScope()">Change Category/City</span>':''}</div>
+      ${isZTRole() && (ztSessionCategory || ztSessionCity) ? `<div style="padding:0 16px 10px;font-size:11px;color:rgba(255,255,255,0.55);">${ztSessionCategory && adminCategories[ztSessionCategory] ? esc(adminCategories[ztSessionCategory].name) : 'All categories'} &middot; ${ztSessionCity ? esc(ztSessionCity) : 'All cities'}</div>` : ''}
     </div>
     ${storageAvailable===false ? `<div class="gate-msg error" style="margin-bottom:10px;font-size:11px;"><b>Can't reach the database.</b> Check your connection and reload.</div>` : ''}
   `;
@@ -4129,13 +4141,13 @@ async function renderAdminMain(){
     await seedDefaultCategoriesIfEmpty();
     adminCategories = await listCategories();
     adminCourses = await listCourses();
+    adminTrainers = await listTrainers();
     const allR2 = await listRoster();
     let scoped = Object.fromEntries(Object.entries(allR2).filter(([,r])=>isRosterEntryVisibleToViewer(r)));
     const allBatchesForFilter = await listAllBatches();
     const completedBatchIds = new Set(allBatchesForFilter.filter(b=>b.status==='Completed').map(b=>b.id));
     partnersHiddenCompletedCount = Object.values(scoped).filter(r=>r.batchId && completedBatchIds.has(r.batchId)).length;
     adminRoster = Object.fromEntries(Object.entries(scoped).filter(([,r])=>!(r.batchId && completedBatchIds.has(r.batchId))));
-    adminTrainers = await listTrainers();
     if(isZTRole()) adminTrainers = Object.fromEntries(Object.entries(adminTrainers).filter(([,t])=>cityVisibleToViewer(t.city)));
     el.innerHTML = renderPartnersTab();
   }
@@ -4170,7 +4182,7 @@ async function renderAdminMain(){
       }
     }
   }
-  else if(adminTab==='tracking'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); await loadTrackingData(); adminUnlocks = await listUnlocks(); el.innerHTML = renderTrackingTab(); }
+  else if(adminTab==='tracking'){ await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses(); adminTrainers = await listTrainers(); await loadTrackingData(); adminUnlocks = await listUnlocks(); el.innerHTML = renderTrackingTab(); }
   else if(adminTab==='media'){
     const all = await listAllMedia();
     adminMediaCache = isAdminRole() ? all : all.filter(m=>m.trainerId ? m.trainerId===trainerIdentity.trainerId : m.trainerName===trainerIdentity.name);
@@ -4188,8 +4200,17 @@ async function renderAdminMain(){
       el.innerHTML = await renderBatchDetailAsync();
     }
     else{
+      await seedDefaultCategoriesIfEmpty();
+      adminCategories = await listCategories();
       const all = await listAllBatches();
-      adminBatchesCache = isAdminRole() ? all : isZTRole() ? all.filter(b=>cityVisibleToViewer(b.city)) : all.filter(b=>b.trainerId===trainerIdentity.trainerId);
+      adminTrainers = await listTrainers();
+      adminBatchesCache = isAdminRole() ? all : isZTRole()
+        ? all.filter(b=>cityVisibleToViewer(b.city) && (!ztSessionCategory || (()=>{
+            const wantedName = adminCategories[ztSessionCategory] ? adminCategories[ztSessionCategory].name : null;
+            const trainerRecord = adminTrainers[b.trainerId];
+            return !wantedName || !trainerRecord || trainerRecord.category===wantedName;
+          })()))
+        : all.filter(b=>b.trainerId===trainerIdentity.trainerId);
       el.innerHTML = renderBatchesListTab();
     }
   }
@@ -5617,6 +5638,14 @@ async function resolveEscalationRow(id){
 function sosFilteredLogs(){
   const f = sosAnalyticsFilters;
   return adminSosViewLogs.filter(l=>{
+    if(isZTRole()){
+      if(l.city && !cityVisibleToViewer(l.city)) return false;
+      if(ztSessionCategory && l.categoryId && l.categoryId!==ztSessionCategory) return false;
+    }
+    if(isTrainerRole()){
+      if(l.trainerId && l.trainerId!==trainerIdentity.trainerId) return false;
+      if(!l.trainerId && l.city && l.city!==trainerIdentity.city) return false;
+    }
     if(f.dateFrom && new Date(l.at) < new Date(f.dateFrom)) return false;
     if(f.dateTo && new Date(l.at) > new Date(f.dateTo+'T23:59:59')) return false;
     if(f.category && l.categoryId!==f.category) return false;
@@ -5709,6 +5738,14 @@ function computeSosInsights(logs, buckets){
 function renderSosAnalyticsTab(){
   const logs = sosFilteredLogs();
   const searchLogsFiltered = adminSosSearchLogs.filter(s=>{
+    if(isZTRole()){
+      if(s.city && !cityVisibleToViewer(s.city)) return false;
+      if(ztSessionCategory && s.categoryId && s.categoryId!==ztSessionCategory) return false;
+    }
+    if(isTrainerRole()){
+      if(s.trainerId && s.trainerId!==trainerIdentity.trainerId) return false;
+      if(!s.trainerId && s.city && s.city!==trainerIdentity.city) return false;
+    }
     const f = sosAnalyticsFilters;
     if(f.dateFrom && new Date(s.at) < new Date(f.dateFrom)) return false;
     if(f.dateTo && new Date(s.at) > new Date(f.dateTo+'T23:59:59')) return false;
@@ -5717,10 +5754,10 @@ function renderSosAnalyticsTab(){
   });
   const buckets = computeSosBuckets(logs, searchLogsFiltered);
   const insights = computeSosInsights(logs, buckets);
-  const trainerNames = [...new Set(adminSosViewLogs.map(l=>l.trainerName).filter(Boolean))];
-  const cityNames = [...new Set(adminSosViewLogs.map(l=>l.city).filter(Boolean))];
-  const clusterNames = [...new Set(adminSosViewLogs.map(l=>l.cluster).filter(Boolean))];
-  const batchNumbers = [...new Set(adminSosViewLogs.map(l=>l.batchNumber).filter(Boolean))];
+  const trainerNames = [...new Set(logs.map(l=>l.trainerName).filter(Boolean))];
+  const cityNames = [...new Set(logs.map(l=>l.city).filter(Boolean))];
+  const clusterNames = [...new Set(logs.map(l=>l.cluster).filter(Boolean))];
+  const batchNumbers = [...new Set(logs.map(l=>l.batchNumber).filter(Boolean))];
   const problemList = Object.entries(sosProblems);
 
   if(sosAnalyticsOpenBucket) return renderSosBucketDetail(sosAnalyticsOpenBucket, logs, searchLogsFiltered);
