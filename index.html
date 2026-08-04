@@ -676,11 +676,15 @@ async function kvGet(key){ try{ await window.__fbReady; return await window.__fb
 async function kvSet(key, val){ try{ await window.__fbReady; return await window.__fbSet(key, val); }catch(e){ return false; } }
 async function kvDelete(key){ try{ await window.__fbReady; await window.__fbDelete(key); }catch(e){} }
 async function kvList(prefix){ try{ await window.__fbReady; return await window.__fbList(prefix); }catch(e){ return []; } }
+let UPLOAD_TIMEOUT_MS = 45000;
 async function uploadFile(path, file){
   try{
     await window.__fbReady;
     if(typeof window.__fbUploadFile!=='function') return { ok:false, url:null, error:'File storage is not available right now.' };
-    const url = await window.__fbUploadFile(path, file);
+    const url = await Promise.race([
+      window.__fbUploadFile(path, file),
+      new Promise((_, reject) => setTimeout(()=>reject(Object.assign(new Error('Upload timed out.'), { code:'client/upload-timeout' })), UPLOAD_TIMEOUT_MS))
+    ]);
     return { ok:true, url };
   }catch(e){
     console.error('uploadFile failed:', e);
@@ -690,6 +694,7 @@ async function uploadFile(path, file){
 }
 function uploadErrorToFriendlyMessage(e){
   const code = e && e.code;
+  if(code==='client/upload-timeout') return "Upload timed out after 45 seconds. Check your connection, or the file may be too large for your network speed.";
   if(code==='storage/unauthorized') return "Upload blocked by storage permissions. Contact your Admin.";
   if(code==='storage/canceled') return "Upload was canceled.";
   if(code==='storage/quota-exceeded') return "Storage quota exceeded. Contact your Admin.";
