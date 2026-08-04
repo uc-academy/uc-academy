@@ -1244,7 +1244,7 @@ function isCardVisible(key){ return currentLayout.overviewCards[key] !== false; 
 function isColumnVisible(key){ return currentLayout.trackingColumns[key] !== false; }
 
 /* ---- AI PHOTO REVIEW SETTINGS ---- */
-const DEFAULT_AI_SETTINGS = { enabled:false, apiKey:'', chatEnabled:false };
+const DEFAULT_AI_SETTINGS = { enabled:false, chatEnabled:false, proxyUrl:'', appSecret:'', dailyLimit:0 };
 let currentAiSettings = { ...DEFAULT_AI_SETTINGS };
 async function getAiSettings(){ const v = await kvGet('aiSettings:config'); return v ? { ...DEFAULT_AI_SETTINGS, ...v } : { ...DEFAULT_AI_SETTINGS }; }
 async function setAiSettings(s){ return await kvSet('aiSettings:config', s); }
@@ -1256,35 +1256,40 @@ function fileToBase64(file){
     reader.readAsDataURL(file);
   });
 }
+async function callAiProxy({ model, max_tokens, messages, system }){
+  if(!currentAiSettings.proxyUrl) throw new Error('AI proxy URL is not configured. Set it in Theme & Branding.');
+  const resp = await fetch(currentAiSettings.proxyUrl, {
+    method:'POST',
+    headers: {
+      'Content-Type':'application/json',
+      'x-app-secret': currentAiSettings.appSecret||'',
+    },
+    body: JSON.stringify({ model, max_tokens, messages, system, dailyLimit: currentAiSettings.dailyLimit||0 })
+  });
+  if(!resp.ok){
+    const errBody = await resp.json().catch(()=>({}));
+    throw new Error(errBody.error || ('AI proxy returned status '+resp.status));
+  }
+  return await resp.json();
+}
 async function runAIPhotoReview(base64, mimeType, activityLabel, criteria){
   try{
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method:'POST',
-      headers: {
-        'Content-Type':'application/json',
-        'x-api-key': currentAiSettings.apiKey,
-        'anthropic-version':'2023-06-01',
-        'anthropic-dangerous-direct-browser-access':'true'
-      },
-      body: JSON.stringify({
-        model:'claude-sonnet-4-6',
-        max_tokens:800,
-        messages:[{
-          role:'user',
-          content:[
-            {type:'image', source:{type:'base64', media_type: mimeType||'image/jpeg', data: base64}},
-            {type:'text', text: `You are reviewing a washing machine repair training photo for this activity: "${activityLabel||'practical activity'}".
+    const data = await callAiProxy({
+      model:'claude-sonnet-4-6',
+      max_tokens:800,
+      messages:[{
+        role:'user',
+        content:[
+          {type:'image', source:{type:'base64', media_type: mimeType||'image/jpeg', data: base64}},
+          {type:'text', text: `You are reviewing a washing machine repair training photo for this activity: "${activityLabel||'practical activity'}".
 Grading criteria: ${criteria || 'General correctness and safety of the work shown.'}
 Respond with ONLY raw JSON, no markdown formatting, no other text, in exactly this shape:
 {"result":"Pass","score":4,"mistakes":[],"feedback":"short improvement note"}
 "result" must be exactly one of: "Pass", "Fail", "Manual Review". Score is out of 5.
 Use "Manual Review" whenever the photo is unclear, doesn't clearly show the activity, or you are not confident enough to give a Pass/Fail.` }
-          ]
-        }]
-      })
+        ]
+      }]
     });
-    if(!resp.ok) throw new Error('AI API returned status '+resp.status);
-    const data = await resp.json();
     const textBlock = (data.content||[]).find(c=>c.type==='text');
     if(!textBlock) throw new Error('No text content in AI response');
     const clean = textBlock.text.replace(/```json|```/g,'').trim();
@@ -1347,18 +1352,7 @@ Respond with ONLY raw JSON, no markdown formatting, no other text, in exactly th
 {"result":"Pass","score":4,"mistakes":[],"feedback":"short improvement note"}
 "result" must be exactly one of: "Pass", "Fail", "Manual Review". Score is out of 5.
 Use "Manual Review" whenever the frames are unclear, don't clearly show the activity, or you are not confident enough to give a Pass/Fail from still frames alone.` });
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method:'POST',
-      headers: {
-        'Content-Type':'application/json',
-        'x-api-key': currentAiSettings.apiKey,
-        'anthropic-version':'2023-06-01',
-        'anthropic-dangerous-direct-browser-access':'true'
-      },
-      body: JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:800, messages:[{ role:'user', content }] })
-    });
-    if(!resp.ok) throw new Error('AI API returned status '+resp.status);
-    const data = await resp.json();
+    const data = await callAiProxy({ model:'claude-sonnet-4-6', max_tokens:800, messages:[{ role:'user', content }] });
     const textBlock = (data.content||[]).find(c=>c.type==='text');
     if(!textBlock) throw new Error('No text content in AI response');
     const clean = textBlock.text.replace(/```json|```/g,'').trim();
@@ -1418,13 +1412,7 @@ Your behavior:
 - ALWAYS emphasize safety precautions relevant to electrical/appliance repair (unplugging power, water safety, etc.) when relevant
 - You cannot change scores, mark anything complete, or unlock locked content — if asked, say only their Trainer can do that`;
 
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method:'POST',
-      headers: { 'Content-Type':'application/json', 'x-api-key': currentAiSettings.apiKey, 'anthropic-version':'2023-06-01', 'anthropic-dangerous-direct-browser-access':'true' },
-      body: JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:400, system:systemPrompt, messages:[...history, {role:'user', content:question}] })
-    });
-    if(!resp.ok) throw new Error('AI API returned status '+resp.status);
-    const data = await resp.json();
+    const data = await callAiProxy({ model:'claude-sonnet-4-6', max_tokens:400, system:systemPrompt, messages:[...history, {role:'user', content:question}] });
     const textBlock = (data.content||[]).find(c=>c.type==='text');
     if(!textBlock) throw new Error('No text content in AI response');
     return { ok:true, text: textBlock.text.trim() };
@@ -2154,8 +2142,8 @@ async function loginAsPartner(id, opts){
     const result = await getContentOverrideWithFallback(d.id, currentUser.courseId, currentUser.preferredLanguage);
     if(result.data) contentOverrides[d.id] = migrateOldOverrideToUnified(result.data);
   }));
-  const homeOv = await getContentOverride('home');
-  if(homeOv) contentOverrides['home'] = migrateOldOverrideToUnified(homeOv);
+  const homeResult = await getContentOverrideWithFallback('home', currentUser.courseId, currentUser.preferredLanguage);
+  if(homeResult.data) contentOverrides['home'] = migrateOldOverrideToUnified(homeResult.data);
   await logCheckin(s);
   let sessionToken = opts.sessionToken;
   if(!opts.silent){
@@ -2907,7 +2895,7 @@ function renderDayShell(day){
       <button class="tab-btn ${currentTab==='assignment'?'active':''} ${laterLocked?'locked':''}" onclick="setTab('assignment')">Assignment${doneTasks===totalTasks && totalTasks>0?'<span class="dot"></span>':(laterLocked?'<span class="lk">&#128274;</span>':'')}</button>
       <button class="tab-btn ${currentTab==='quiz'?'active':''} ${quizLocked?'locked':''}" onclick="setTab('quiz')" title="${esc(quizLockReason)}">${isFinalDay(day.id)?'Final Assessment':'Assessment'}${dp.quizSubmitted?'<span class="dot"></span>':(quizLocked?'<span class="lk">&#128274;</span>':'')}</button>
   `;
-  const showAiButton = currentAiSettings.chatEnabled && currentAiSettings.apiKey && currentTab!=='quiz' && !(ov && ov.aiAssistantDisabled);
+  const showAiButton = currentAiSettings.chatEnabled && currentAiSettings.proxyUrl && currentTab!=='quiz' && !(ov && ov.aiAssistantDisabled);
   return `
     <div class="crumb">Day ${day.id}${currentUser.courseId ? '' : ' &middot; '+(day.machine==='SA'?'Semi-Automatic':day.machine==='TL'?'Top-Load':'Semi-Automatic & Top-Load')}</div>
     <h1 class="page-title">${esc(displayTitle)}</h1>
@@ -3082,7 +3070,8 @@ function renderQuickAssessmentBlock(dayId, item, idx, dp){
     const durationSec = quickAssessmentDurationSeconds(item);
     const elapsedSec = (Date.now() - new Date(state.startedAt).getTime())/1000;
     const remainingSec = Math.max(0, Math.round(durationSec - elapsedSec));
-    if(remainingSec<=0){
+    const timerDone = remainingSec<=0;
+    if(timerDone){
       // Time's up - auto submit on next tick after render
       setTimeout(()=>submitQuickAssessment(dayId, idx, true), 50);
     }
@@ -3092,18 +3081,19 @@ function renderQuickAssessmentBlock(dayId, item, idx, dp){
         <h3 style="margin:0;">${esc(item.title||'Quick Assessment')}</h3>
         <div id="qa-timer-${idx}" style="font-family:monospace;font-size:20px;font-weight:700;color:${remainingSec<60?'var(--danger)':'var(--brand)'};">${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}</div>
       </div>
+      <p style="font-size:12px;color:var(--ink-soft);margin-top:-4px;margin-bottom:12px;">${timerDone ? 'Time is up — submit when ready.' : 'You can answer now, but Submit unlocks only once the timer reaches 00:00. This is a minimum duration, not a time limit.'}</p>
       ${(item.questions||[]).map((q,qi)=>`
         <div style="margin-bottom:16px;">
           <p style="font-weight:600;margin-bottom:8px;">${qi+1}. ${esc(q.question)}</p>
           ${(q.options||[]).map((opt,oi)=>`
             <label style="display:flex;gap:8px;align-items:center;padding:8px;border-radius:8px;cursor:pointer;" class="qa-option-label">
-              <input type="radio" name="qa-answer-${idx}-${qi}" value="${oi}" ${state.currentAnswers[qi]===oi?'checked':''}>
+              <input type="radio" name="qa-answer-${idx}-${qi}" value="${oi}" ${state.currentAnswers[qi]===oi?'checked':''} onchange="saveQuickAssessmentAnswer(${jsDayId(dayId)},${idx},${qi},${oi})">
               ${esc(opt)}
             </label>
           `).join('')}
         </div>
       `).join('')}
-      <button class="btn amber" onclick="submitQuickAssessment(${jsDayId(dayId)},${idx},false)">Submit Now</button>
+      <button class="btn amber" id="qa-submit-btn-${idx}" ${!timerDone?'disabled':''} onclick="submitQuickAssessment(${jsDayId(dayId)},${idx},false)">${timerDone?'Submit Now':'Submit (unlocks at 00:00)'}</button>
     </div>`;
   }
 
@@ -3147,8 +3137,17 @@ async function startQuickAssessment(dayId, idx){
     const remainingSec = Math.max(0, Math.round(durationSec - elapsedSec));
     const mins = Math.floor(remainingSec/60), secs = remainingSec%60;
     el.textContent = `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
+    const submitBtn = document.getElementById('qa-submit-btn-'+idx);
+    if(submitBtn && remainingSec<=0) submitBtn.disabled = false;
     if(remainingSec<=0){ clearInterval(qaTimerInterval); submitQuickAssessment(dayId, idx, true); }
   }, 1000);
+}
+async function saveQuickAssessmentAnswer(dayId, idx, qi, oi){
+  const dp = currentUserProgress[dayId];
+  const state = dp.quickAssessments && dp.quickAssessments[idx];
+  if(!state || !state.startedAt) return;
+  state.currentAnswers[qi] = oi;
+  await setProgress(currentUser.id, currentUserProgress);
 }
 async function submitQuickAssessment(dayId, idx, isAutoSubmit){
   if(qaTimerInterval){ clearInterval(qaTimerInterval); qaTimerInterval = null; }
@@ -3164,12 +3163,19 @@ async function submitQuickAssessment(dayId, idx, isAutoSubmit){
   const score = (item.questions||[]).reduce((sum,q,qi)=>sum + (answers[qi]===q.correct?1:0), 0);
   const percent = total>0 ? Math.round((score/total)*100) : 0;
   const passed = percent >= (item.passingPercent||70);
-  state.attempts.push({ answers, score, total, percent, passed, at:new Date().toISOString(), auto:!!isAutoSubmit });
+  const startedAt = state.startedAt;
+  const endedAt = new Date().toISOString();
+  const requiredDurationSec = quickAssessmentDurationSeconds(item);
+  const actualDurationSec = startedAt ? Math.round((new Date(endedAt).getTime() - new Date(startedAt).getTime())/1000) : null;
+  state.attempts.push({ answers, score, total, percent, passed, at:endedAt, startedAt, endedAt, durationSec:actualDurationSec, auto:!!isAutoSubmit });
   state.passed = state.passed || passed;
   state.startedAt = null;
   state.currentAnswers = [];
   state.justSubmittedAttempt = true;
   await setProgress(currentUser.id, currentUserProgress);
+  await logHistory('quick_assessment_submitted', `${currentUser.name} ${isAutoSubmit?'auto-':''}submitted "${item.title||'Quick Assessment'}" (Day ${dayId}) — ${score}/${total} (${percent}%), ${passed?'passed':'failed'}`, {
+    partnerId: currentUser.id, dayId, blockIndex: idx, startedAt, endedAt, requiredDurationSec, actualDurationSec, score, total, percent, passed, auto: !!isAutoSubmit
+  });
   updateTheoryCompleteButtonState(dayId);
   renderApp();
 }
@@ -3295,7 +3301,7 @@ async function handleActivityUpload(event){
   if(!url){ showToast("Upload failed — check your connection.", 'error'); return; }
 
   let aiResult = null;
-  if(currentAiSettings.enabled && currentAiSettings.apiKey){
+  if(currentAiSettings.enabled && currentAiSettings.proxyUrl){
     if(mediaType==='photo'){
       showToast('Uploaded — running AI review...', 'info');
       try{
@@ -5814,8 +5820,8 @@ async function openPartnerPreview(partnerId){
     const result = await getContentOverrideWithFallback(d.id, currentUser.courseId, currentUser.preferredLanguage);
     if(result.data) contentOverrides[d.id] = migrateOldOverrideToUnified(result.data);
   }));
-  const homeOv = await getContentOverride('home');
-  if(homeOv) contentOverrides['home'] = migrateOldOverrideToUnified(homeOv);
+  const homeResult = await getContentOverrideWithFallback('home', currentUser.courseId, currentUser.preferredLanguage);
+  if(homeResult.data) contentOverrides['home'] = migrateOldOverrideToUnified(homeResult.data);
   currentDay = s.currentDay;
   currentTab = 'theory';
   previewPartnerId = partnerId;
@@ -6781,9 +6787,9 @@ function renderThemeTab(){
 
     <div class="card">
       <h3>AI Photo &amp; Video Review <span class="pill scheduled" style="font-size:10px;">Beta</span></h3>
-      <div class="gate-msg error" style="margin-bottom:12px;">
-        <b>Security warning — read before enabling.</b>
-        <p style="margin-top:6px;">This app has no private backend. Your API key is stored in the open database and used directly from partners' and trainers' browsers. Anyone who opens this site's developer tools could see and copy it, and use it to run up charges on your account. Only enable this with a key you're comfortable being exposed — for example, one with a strict spending limit set in your Anthropic account.</p>
+      <div class="gate-msg" style="margin-bottom:12px;background:var(--success-light,#EAF7EE);border-color:var(--success,#2E9E4F);">
+        <b>This now runs through a server-side proxy — no API key is stored here or sent to any browser.</b>
+        <p style="margin-top:6px;">The Anthropic key lives only in your Cloud Function's server-side secrets. This app only needs the proxy's URL below, which is safe to store — it can't be used to make AI calls on its own. See the deployment guide bundled with this app for one-time setup (deploying the Cloud Function, which requires Firebase's Blaze plan). Until a proxy URL is set below, AI features stay off.</p>
       </div>
       <label style="display:flex;gap:10px;align-items:center;margin-bottom:12px;cursor:pointer;">
         <input type="checkbox" id="ai-enabled" ${aiDraft.enabled?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
@@ -6793,8 +6799,15 @@ function renderThemeTab(){
         <input type="checkbox" id="ai-chat-enabled" ${aiDraft.chatEnabled?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
         <span>Enable the AI Trainer Assistant ("Hello Trainer" chat) for partners</span>
       </label>
-      <span class="field-label">Anthropic API key</span>
-      <input class="field-input" id="ai-api-key" type="password" value="${esc(aiDraft.apiKey)}" placeholder="sk-ant-...">
+      <span class="field-label">AI proxy URL</span>
+      <input class="field-input" id="ai-proxy-url" value="${esc(aiDraft.proxyUrl||'')}" placeholder="https://asia-south1-your-project.cloudfunctions.net/aiProxy">
+      <p style="font-size:11.5px;color:var(--ink-soft);margin-top:-4px;margin-bottom:10px;">The URL Firebase gives you after deploying the included Cloud Function.</p>
+      <span class="field-label">App secret</span>
+      <input class="field-input" id="ai-app-secret" type="password" value="${esc(aiDraft.appSecret||'')}" placeholder="Must match APP_SHARED_SECRET set on the function">
+      <p style="font-size:11.5px;color:var(--ink-soft);margin-top:-4px;margin-bottom:10px;">A basic deterrent against casual abuse of the proxy URL — not a substitute for a spending limit on the Anthropic key itself. See the deployment guide.</p>
+      <span class="field-label">Daily request limit (optional)</span>
+      <input class="field-input" id="ai-daily-limit" type="number" min="0" value="${aiDraft.dailyLimit||0}" placeholder="0 = no limit">
+      <p style="font-size:11.5px;color:var(--ink-soft);margin-top:-4px;margin-bottom:10px;">Enforced by the proxy itself, across all partners combined. A hard stop that resets at midnight UTC — separate from, and in addition to, any spending limit on the Anthropic key.</p>
       <p style="font-size:12px;color:var(--ink-soft);margin-top:6px;">Photos are reviewed directly. Videos are reviewed by sampling a few still frames — it can't see motion or technique, so treat video results as a rougher first pass than photos. Either way, this is always a suggestion for your Trainer to confirm, never a final decision on its own. The AI Trainer Assistant answers course questions in chat — it can't change scores, unlock content, or mark anything complete, and it always defers assessment answers back to the student. It can still occasionally get something wrong, so treat it as a helpful first line of support, not a replacement for your Trainers.</p>
     </div>
 
@@ -6867,10 +6880,14 @@ async function saveThemeDraft(){
   syncThemeDraftFromDOM();
   const enabledEl = document.getElementById('ai-enabled');
   const chatEnabledEl = document.getElementById('ai-chat-enabled');
-  const keyEl = document.getElementById('ai-api-key');
+  const proxyUrlEl = document.getElementById('ai-proxy-url');
+  const appSecretEl = document.getElementById('ai-app-secret');
+  const dailyLimitEl = document.getElementById('ai-daily-limit');
   if(enabledEl) aiDraft.enabled = enabledEl.checked;
   if(chatEnabledEl) aiDraft.chatEnabled = chatEnabledEl.checked;
-  if(keyEl) aiDraft.apiKey = keyEl.value.trim();
+  if(proxyUrlEl) aiDraft.proxyUrl = proxyUrlEl.value.trim();
+  if(appSecretEl) aiDraft.appSecret = appSecretEl.value.trim();
+  if(dailyLimitEl) aiDraft.dailyLimit = Math.max(0, parseInt(dailyLimitEl.value)||0);
   const ok = await setTheme(themeDraft);
   const layoutOk = await setLayout(layoutDraft);
   const aiOk = await setAiSettings(aiDraft);
