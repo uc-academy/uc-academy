@@ -1518,7 +1518,7 @@ window.onYouTubeIframeAPIReady = function(){ ytApiReady = true; };
 function defaultDayProgress(){
   return { theoryDone:false, audioPlayed:false, videoPct:0, videoDone:false,
     quizSubmitted:false, quizScore:0, quizTotal:0, quizPct:0, quizAnswers:[], quizDate:'',
-    tasksChecked:[], reflection:'', videoItemProgress:{}, videoRanges:[], videoLastTime:null, inVideoQuizAnswers:{}, quickAssessments:{} };
+    tasksChecked:[], reflection:'', videoItemProgress:{}, videoRanges:[], videoLastTime:null, inVideoQuizAnswers:{}, quickAssessments:{}, checkboxQuestions:{}, mcqQuestions:{} };
 }
 function ensureDay(d){
   if(!currentUserProgress[d]) currentUserProgress[d] = defaultDayProgress();
@@ -2868,12 +2868,16 @@ function renderTheory(day){
         html += renderActivityUploadItem(day.id, item, idx);
       } else if(item.type==='quickAssessment'){
         if(item.enabled!==false) html += renderQuickAssessmentBlock(day.id, item, idx, dp);
+      } else if(item.type==='checkboxQuestion' || item.type==='mcqQuestion'){
+        if(item.enabled!==false) html += renderOptionQuestionBlock(day.id, item, idx, dp);
       }
     });
     const allVideosDone = videoIndices.every(i => dp.videoItemProgress[i]?.done);
     const mandatoryQAIndices = items.map((it,i)=>(it.type==='quickAssessment' && it.enabled!==false && it.mandatory!==false)?i:null).filter(i=>i!==null);
     const allQAPassed = mandatoryQAIndices.every(i => dp.quickAssessments && dp.quickAssessments[i] && dp.quickAssessments[i].passed);
-    const canComplete = allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed;
+    const mandatoryOptionQIndices = items.map((it,i)=>((it.type==='checkboxQuestion'||it.type==='mcqQuestion') && it.enabled!==false && it.mandatory!==false)?i:null).filter(i=>i!==null);
+    const allOptionQSubmitted = mandatoryOptionQIndices.every(i => (dp.checkboxQuestions&&dp.checkboxQuestions[i]&&dp.checkboxQuestions[i].submitted) || (dp.mcqQuestions&&dp.mcqQuestions[i]&&dp.mcqQuestions[i].submitted));
+    const canComplete = allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed && allOptionQSubmitted;
     const fullyDone = dp.theoryDone && dp.videoDone;
     html += `<div class="card">
       ${fullyDone ? `<p style="color:var(--success);font-weight:500;">Marked complete. Assignment and Assessment are unlocked below.</p>` :
@@ -2918,7 +2922,9 @@ function updateTheoryCompleteButtonState(dayId){
     const allVideosDone = videoIndices.every(i => dp.videoItemProgress[i]?.done);
     const mandatoryQAIndices = items.map((it,i)=>(it.type==='quickAssessment' && it.enabled!==false && it.mandatory!==false)?i:null).filter(i=>i!==null);
     const allQAPassed = mandatoryQAIndices.every(i => dp.quickAssessments && dp.quickAssessments[i] && dp.quickAssessments[i].passed);
-    btn.disabled = !(allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed);
+    const mandatoryOptionQIndices = items.map((it,i)=>((it.type==='checkboxQuestion'||it.type==='mcqQuestion') && it.enabled!==false && it.mandatory!==false)?i:null).filter(i=>i!==null);
+    const allOptionQSubmitted = mandatoryOptionQIndices.every(i => (dp.checkboxQuestions&&dp.checkboxQuestions[i]&&dp.checkboxQuestions[i].submitted) || (dp.mcqQuestions&&dp.mcqQuestions[i]&&dp.mcqQuestions[i].submitted));
+    btn.disabled = !(allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed && allOptionQSubmitted);
   } else {
     const audioUrl = audiosCache[dayId];
     btn.disabled = !!(audioUrl && !dp.audioPlayed);
@@ -3040,6 +3046,80 @@ async function submitQuickAssessment(dayId, idx, isAutoSubmit){
   state.startedAt = null;
   state.currentAnswers = [];
   state.justSubmittedAttempt = true;
+  await setProgress(currentUser.id, currentUserProgress);
+  updateTheoryCompleteButtonState(dayId);
+  renderApp();
+}
+function renderOptionQuestionBlock(dayId, item, idx, dp){
+  const isMcq = item.type==='mcqQuestion';
+  const stateKey = isMcq ? 'mcqQuestions' : 'checkboxQuestions';
+  if(!dp[stateKey]) dp[stateKey] = {};
+  const state = dp[stateKey][idx] || { answers:{}, submitted:false, score:0, totalMarks:0 };
+  dp[stateKey][idx] = state;
+  const questions = item.questions||[];
+
+  if(state.submitted){
+    return `<div class="card" id="oq-block-${idx}">
+      <h3 style="margin-top:0;">${esc(item.title||(isMcq?'MCQ Question':'Checkbox Question'))}</h3>
+      ${isMcq ? `<p style="font-size:16px;font-weight:700;color:var(--brand);margin:4px 0;">${state.score}/${state.totalMarks} marks</p>` : ''}
+      ${questions.map((q,qi)=>{
+        const selected = state.answers[qi]||[];
+        const correctIdx = q.options.map((o,oi)=>o.correct?oi:null).filter(x=>x!==null);
+        const isCorrect = selected.length===correctIdx.length && selected.every(s=>correctIdx.includes(s));
+        return `<div style="margin-bottom:14px;">
+          <p style="font-weight:600;margin-bottom:6px;">${qi+1}. ${esc(q.question)} ${isCorrect?'<span style="color:var(--success);">&#10003;</span>':'<span style="color:var(--danger);">&#10007;</span>'}</p>
+          ${q.options.map((opt,oi)=>`<div style="padding:4px 8px;${opt.correct?'color:var(--success);font-weight:600;':(selected.includes(oi)?'color:var(--danger);':'color:var(--ink-soft);')}">${selected.includes(oi)?'&#9745;':'&#9744;'} ${esc(opt.text)}</div>`).join('')}
+          ${q.explanation?`<div class="save-note" style="margin-top:4px;"><em>${esc(q.explanation)}</em></div>`:''}
+        </div>`;
+      }).join('')}
+    </div>`;
+  }
+
+  return `<div class="card" id="oq-block-${idx}">
+    <h3 style="margin-top:0;">${esc(item.title||(isMcq?'MCQ Question':'Checkbox Question'))}</h3>
+    ${item.mandatory!==false ? `<p style="font-size:12.5px;color:var(--ink-soft);margin-bottom:10px;">Required to continue</p>` : ''}
+    ${questions.map((q,qi)=>`
+      <div style="margin-bottom:16px;">
+        <p style="font-weight:600;margin-bottom:8px;">${qi+1}. ${esc(q.question)}${isMcq && !q.multiSelect?'':' <span style="font-weight:400;color:var(--ink-soft);font-size:12px;">(select all that apply)</span>'}</p>
+        ${q.options.map((opt,oi)=>`
+          <label style="display:flex;gap:8px;align-items:center;padding:6px 8px;border-radius:8px;cursor:pointer;">
+            <input type="${isMcq && !q.multiSelect ? 'radio' : 'checkbox'}" name="oq-answer-${idx}-${qi}${isMcq && !q.multiSelect ? '' : '-'+oi}" value="${oi}">
+            ${esc(opt.text)}
+          </label>
+        `).join('')}
+      </div>
+    `).join('')}
+    <button class="btn amber" onclick="submitOptionQuestionBlock(${dayId},${idx})">Submit</button>
+  </div>`;
+}
+async function submitOptionQuestionBlock(dayId, idx){
+  const item = contentOverrides[dayId].content[idx];
+  const isMcq = item.type==='mcqQuestion';
+  const stateKey = isMcq ? 'mcqQuestions' : 'checkboxQuestions';
+  const dp = currentUserProgress[dayId];
+  if(!dp[stateKey]) dp[stateKey] = {};
+  const questions = item.questions||[];
+  const answers = {};
+  let score = 0, totalMarks = 0;
+  questions.forEach((q,qi)=>{
+    let selected;
+    if(isMcq && !q.multiSelect){
+      const checked = document.querySelector(`input[name="oq-answer-${idx}-${qi}"]:checked`);
+      selected = checked ? [parseInt(checked.value)] : [];
+    } else {
+      selected = q.options.map((o,oi)=>oi).filter(oi=>{
+        const el = document.querySelector(`input[name="oq-answer-${idx}-${qi}-${oi}"]`);
+        return el && el.checked;
+      });
+    }
+    answers[qi] = selected;
+    const marks = isMcq ? (q.marks??1) : 1;
+    totalMarks += marks;
+    const correctIdx = q.options.map((o,oi)=>o.correct?oi:null).filter(x=>x!==null);
+    const isCorrect = selected.length===correctIdx.length && selected.every(s=>correctIdx.includes(s));
+    if(isCorrect) score += marks;
+  });
+  dp[stateKey][idx] = { answers, submitted:true, score, totalMarks };
   await setProgress(currentUser.id, currentUserProgress);
   updateTheoryCompleteButtonState(dayId);
   renderApp();
@@ -8000,6 +8080,25 @@ function syncModuleDraftFromDOM(){
           if(g(`qa-klp-${i}-${qi}`)) q.keyLearningPoint = g(`qa-klp-${i}-${qi}`).value;
         });
       }
+    } else if(item.type==='checkboxQuestion' || item.type==='mcqQuestion'){
+      const isMcq = item.type==='mcqQuestion';
+      const prefix = isMcq ? 'mcq' : 'cbq';
+      if(g(`c-${prefix}-title-${i}`)) item.title = g(`c-${prefix}-title-${i}`).value;
+      if(g(`c-${prefix}-enabled-${i}`)) item.enabled = g(`c-${prefix}-enabled-${i}`).checked;
+      if(g(`c-${prefix}-mandatory-${i}`)) item.mandatory = g(`c-${prefix}-mandatory-${i}`).checked;
+      if(item.questions){
+        item.questions.forEach((q,qi)=>{
+          if(g(`${prefix}-q-${i}-${qi}`)) q.question = g(`${prefix}-q-${i}-${qi}`).value;
+          if(isMcq && g(`${prefix}-multi-${i}-${qi}`)) q.multiSelect = g(`${prefix}-multi-${i}-${qi}`).checked;
+          if(!q.options) q.options = [];
+          q.options.forEach((opt,oi)=>{
+            if(g(`${prefix}-opt-${i}-${qi}-${oi}`)) opt.text = g(`${prefix}-opt-${i}-${qi}-${oi}`).value;
+            if(g(`${prefix}-correct-${i}-${qi}-${oi}`)) opt.correct = g(`${prefix}-correct-${i}-${qi}-${oi}`).checked;
+          });
+          if(isMcq && g(`${prefix}-marks-${i}-${qi}`)) q.marks = Math.max(0, parseInt(g(`${prefix}-marks-${i}-${qi}`).value)||0);
+          if(g(`${prefix}-explain-${i}-${qi}`)) q.explanation = g(`${prefix}-explain-${i}-${qi}`).value;
+        });
+      }
     }
   });
   moduleDraft.tasks.forEach((t,i)=>{
@@ -8022,6 +8121,8 @@ const BLANK_CONTENT_ITEM = {
   button: ()=>({type:'button', label:'Button', action:''}),
   uploadActivity: ()=>({type:'uploadActivity', activityLabel:'New upload activity', mediaType:'photo', instructions:'Upload a photo or video of your practical work for your trainer to review.', aiCriteria:''}),
   quickAssessment: ()=>({type:'quickAssessment', title:'Quick Assessment', questions:[], passingPercent:70, mandatory:true, timerMinutes:10, customTimerMinutes:null, allowReattempt:true, maxAttempts:3, enabled:true}),
+  checkboxQuestion: ()=>({type:'checkboxQuestion', title:'Checkbox Question', questions:[], mandatory:true, enabled:true}),
+  mcqQuestion: ()=>({type:'mcqQuestion', title:'MCQ Question', questions:[], mandatory:true, enabled:true}),
 };
 function insertContentItem(afterIndex, type){
   syncModuleDraftFromDOM();
@@ -8042,6 +8143,24 @@ function removeQuickAssessmentQuestion(i, qi){
   moduleDraft.content[i].questions.splice(qi,1);
   refreshModuleEditor();
 }
+function _addOptionQuestion(i){ syncModuleDraftFromDOM(); const item = moduleDraft.content[i]; if(!item.questions) item.questions = []; item.questions.push({ question:'New question', options:[{text:'',correct:false},{text:'',correct:false},{text:'',correct:false},{text:'',correct:false}], multiSelect:false, marks:1, explanation:'' }); refreshModuleEditor(); }
+function _removeOptionQuestion(i, qi){ syncModuleDraftFromDOM(); moduleDraft.content[i].questions.splice(qi,1); refreshModuleEditor(); }
+function _duplicateOptionQuestion(i, qi){ syncModuleDraftFromDOM(); const copy = JSON.parse(JSON.stringify(moduleDraft.content[i].questions[qi])); moduleDraft.content[i].questions.splice(qi+1,0,copy); refreshModuleEditor(); }
+function _moveOptionQuestion(i, qi, dir){ syncModuleDraftFromDOM(); const qs = moduleDraft.content[i].questions; const j=qi+dir; if(j<0||j>=qs.length) return; [qs[qi],qs[j]]=[qs[j],qs[qi]]; refreshModuleEditor(); }
+function _addOption(i, qi){ syncModuleDraftFromDOM(); moduleDraft.content[i].questions[qi].options.push({text:'',correct:false}); refreshModuleEditor(); }
+function _removeOption(i, qi, oi){ syncModuleDraftFromDOM(); moduleDraft.content[i].questions[qi].options.splice(oi,1); refreshModuleEditor(); }
+function addCheckboxQuestion(i){ _addOptionQuestion(i); }
+function removeCheckboxQuestion(i, qi){ _removeOptionQuestion(i, qi); }
+function duplicateCheckboxQuestion(i, qi){ _duplicateOptionQuestion(i, qi); }
+function moveCheckboxQuestion(i, qi, dir){ _moveOptionQuestion(i, qi, dir); }
+function addOptionToCheckboxQuestion(i, qi){ _addOption(i, qi); }
+function removeOptionFromCheckboxQuestion(i, qi, oi){ _removeOption(i, qi, oi); }
+function addMcqQuestion(i){ _addOptionQuestion(i); }
+function removeMcqQuestion(i, qi){ _removeOptionQuestion(i, qi); }
+function duplicateMcqQuestion(i, qi){ _duplicateOptionQuestion(i, qi); }
+function moveMcqQuestion(i, qi, dir){ _moveOptionQuestion(i, qi, dir); }
+function addOptionToMcqQuestion(i, qi){ _addOption(i, qi); }
+function removeOptionFromMcqQuestion(i, qi, oi){ _removeOption(i, qi, oi); }
 function moveContentItem(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.content.length) return; [moduleDraft.content[i],moduleDraft.content[j]]=[moduleDraft.content[j],moduleDraft.content[i]]; refreshModuleEditor(); }
 let dragFromIndex = null;
 function onContentDragStart(i){ dragFromIndex = i; }
@@ -8202,7 +8321,7 @@ async function resetModuleToDefault(){
     closeModuleEditor();
   });
 }
-function contentTypeLabel(type){ return {theory:'Theory', video:'Video', audio:'Audio', photo:'Photo', banner:'Banner', text:'Text', button:'Button', uploadActivity:'Upload Activity', quickAssessment:'Quick Assessment'}[type] || type; }
+function contentTypeLabel(type){ return {theory:'Theory', video:'Video', audio:'Audio', photo:'Photo', banner:'Banner', text:'Text', button:'Button', uploadActivity:'Upload Activity', quickAssessment:'Quick Assessment', checkboxQuestion:'Checkbox Question', mcqQuestion:'MCQ Question'}[type] || type; }
 function ccContentTypePermKey(item){
   if(item.type==='theory') return 'editTheory';
   if(item.type==='video') return 'editVideo';
@@ -8224,6 +8343,8 @@ function renderAddRow(afterIndex){
       ${btn('button',null,'Button')}
       <button class="btn small secondary" onclick="insertContentItem(${afterIndex},'uploadActivity')" ${(canCreate && (ccCan('editPhotoUpload')||ccCan('editVideoUpload')))?'':'disabled'}>+ Upload Activity</button>
       ${btn('quickAssessment',null,'Quick Assessment')}
+      ${btn('checkboxQuestion',null,'Checkbox Questions')}
+      ${btn('mcqQuestion',null,'MCQ Questions')}
     </div>
   `;
 }
@@ -8369,6 +8490,46 @@ function renderContentItemCard(item, i, total){
         </div>
       `).join('')}
       <button class="btn secondary small" onclick="addQuickAssessmentQuestion(${i})">+ Add question</button>
+    `;
+  } else if(item.type==='checkboxQuestion' || item.type==='mcqQuestion'){
+    const isMcq = item.type==='mcqQuestion';
+    const prefix = isMcq ? 'mcq' : 'cbq';
+    fields = `
+      <input class="field-input" id="c-${prefix}-title-${i}" value="${esc(item.title||'')}" placeholder="Block title">
+      <div class="filter-row" style="margin-bottom:10px;">
+        <label style="display:flex;gap:6px;align-items:center;"><input type="checkbox" id="c-${prefix}-enabled-${i}" ${item.enabled!==false?'checked':''}>Enabled</label>
+        <label style="display:flex;gap:6px;align-items:center;"><input type="checkbox" id="c-${prefix}-mandatory-${i}" ${item.mandatory!==false?'checked':''}>Mandatory to proceed</label>
+      </div>
+      <span class="field-label" style="margin-top:6px;">Questions</span>
+      ${(item.questions||[]).length===0?`<div class="empty-state" style="padding:10px;">No questions yet — click "+ Add question" below.</div>`:''}
+      ${(item.questions||[]).map((q,qi)=>`
+        <div class="card" style="background:var(--porcelain);margin-bottom:8px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:6px;">
+            <span class="field-label" style="margin:0;">Question ${qi+1}</span>
+            <div style="display:flex;gap:6px;">
+              <button class="btn small secondary" onclick="duplicate${isMcq?'Mcq':'Checkbox'}Question(${i},${qi})">Duplicate</button>
+              <button class="btn small secondary" onclick="move${isMcq?'Mcq':'Checkbox'}Question(${i},${qi},-1)" ${qi===0?'disabled':''}>&uarr;</button>
+              <button class="btn small secondary" onclick="move${isMcq?'Mcq':'Checkbox'}Question(${i},${qi},1)" ${qi===(item.questions.length-1)?'disabled':''}>&darr;</button>
+              <button class="btn small danger" onclick="remove${isMcq?'Mcq':'Checkbox'}Question(${i},${qi})">Remove</button>
+            </div>
+          </div>
+          <input class="field-input" id="${prefix}-q-${i}-${qi}" value="${esc(q.question||'')}" placeholder="Question text">
+          ${isMcq ? `<label style="display:flex;gap:6px;align-items:center;margin-bottom:8px;"><input type="checkbox" id="${prefix}-multi-${i}-${qi}" ${q.multiSelect?'checked':''}>Allow multiple correct answers (multi-select)</label>` : ''}
+          <p style="font-size:11.5px;color:var(--ink-soft);margin:2px 0 6px;">Check the box next to every correct option.</p>
+          ${(q.options||[{text:'',correct:false},{text:'',correct:false},{text:'',correct:false},{text:'',correct:false}]).map((opt,oi)=>`
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
+              <input type="checkbox" id="${prefix}-correct-${i}-${qi}-${oi}" ${opt.correct?'checked':''}>
+              <input class="field-input" style="margin-bottom:0;" id="${prefix}-opt-${i}-${qi}-${oi}" value="${esc(opt.text||'')}" placeholder="Option ${oi+1}">
+              <button class="btn small danger" onclick="removeOptionFrom${isMcq?'Mcq':'Checkbox'}Question(${i},${qi},${oi})" title="Remove option">&times;</button>
+            </div>
+          `).join('')}
+          <button class="btn secondary small" onclick="addOptionTo${isMcq?'Mcq':'Checkbox'}Question(${i},${qi})" style="margin-bottom:8px;">+ Add option</button>
+          ${isMcq ? `<span class="field-label">Marks</span><input class="field-input" id="${prefix}-marks-${i}-${qi}" type="number" min="0" value="${q.marks??1}">` : ''}
+          <span class="field-label">Explanation / feedback</span>
+          <textarea class="field-input reflect" id="${prefix}-explain-${i}-${qi}" style="min-height:50px;">${esc(q.explanation||'')}</textarea>
+        </div>
+      `).join('')}
+      <button class="btn secondary small" onclick="add${isMcq?'Mcq':'Checkbox'}Question(${i})">+ Add question</button>
     `;
   }
   return `
