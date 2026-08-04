@@ -1725,8 +1725,7 @@ function sosRelevanceScore(problem, q){
   if(overlap>0) score = Math.max(score, 30+overlap*10);
   return score;
 }
-function renderSosProblemsScreen(){
-  const catName = sosCategories[sosSelectedCategory] ? sosCategories[sosSelectedCategory].name : '';
+function sosFilteredAndSortedList(){
   let list = Object.entries(sosProblems).filter(([,p])=>sosProblemCategoryIds(p).includes(sosSelectedCategory) && (p.status==='Published' || sosPreviewMode) && p.enabled!==false);
   if(sosSearchQuery){
     list = list
@@ -1737,14 +1736,28 @@ function renderSosProblemsScreen(){
   } else {
     list.sort((a,b)=>(a[1].order||0)-(b[1].order||0));
   }
+  return list;
+}
+function renderSosProblemsListHtml(){
+  const list = sosFilteredAndSortedList();
+  return list.length===0
+    ? `<div class="empty-state">${sosSearchQuery?'No matching topics — try different keywords, or ':'No published topics for this category yet — '}<span style="cursor:pointer;text-decoration:underline;" onclick="sosScreen='escalate'; renderSosScreen();">ask your Trainer directly</span>.</div>`
+    : `<div style="display:flex;flex-direction:column;gap:8px;margin-top:10px;">
+      ${list.map(([id,p])=>{ const tr = sosProblemTranslated(p, sosSelectedLanguage); return `<button class="btn secondary" style="text-align:left;justify-content:flex-start;" onclick="openSosProblem('${id}')">${esc(tr.title)}${sosPreviewMode && p.status==='Draft'?' <span style="color:var(--amber);font-size:11px;">(Draft)</span>':''}</button>`; }).join('')}
+    </div>`;
+}
+function updateSosSearchResults(inputEl){
+  sosSearchQuery = inputEl.value;
+  const resultsEl = document.getElementById('sos-problems-results');
+  if(resultsEl) resultsEl.innerHTML = renderSosProblemsListHtml();
+}
+function renderSosProblemsScreen(){
+  const catName = sosCategories[sosSelectedCategory] ? sosCategories[sosSelectedCategory].name : '';
   return `
     <p style="font-size:13px;color:var(--ink-soft);margin-bottom:4px;">${esc(catName)} &middot; ${esc(sosSelectedLanguage)}</p>
     <span class="field-label">Search your issue</span>
-    <input class="field-input" id="sos-search-input" value="${esc(sosSearchQuery)}" placeholder="e.g. no cooling, water leaking..." oninput="sosSearchQuery=this.value; renderSosScreen();">
-    ${list.length===0?`<div class="empty-state">${sosSearchQuery?'No matching topics — try different keywords, or ':'No published topics for this category yet — '}<span style="cursor:pointer;text-decoration:underline;" onclick="sosScreen='escalate'; renderSosScreen();">ask your Trainer directly</span>.</div>`:`
-    <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px;">
-      ${list.map(([id,p])=>{ const tr = sosProblemTranslated(p, sosSelectedLanguage); return `<button class="btn secondary" style="text-align:left;justify-content:flex-start;" onclick="openSosProblem('${id}')">${esc(tr.title)}${sosPreviewMode && p.status==='Draft'?' <span style="color:var(--amber);font-size:11px;">(Draft)</span>':''}</button>`; }).join('')}
-    </div>`}
+    <input class="field-input" id="sos-search-input" value="${esc(sosSearchQuery)}" placeholder="e.g. no cooling, water leaking..." oninput="updateSosSearchResults(this)">
+    <div id="sos-problems-results">${renderSosProblemsListHtml()}</div>
     <div class="sos-help-link" onclick="sosScreen='step1'; renderSosScreen();" style="text-align:center;margin-top:16px;cursor:pointer;font-size:13px;color:var(--ink-soft);">← Back</div>
   `;
 }
