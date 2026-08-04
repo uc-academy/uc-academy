@@ -331,6 +331,16 @@
   .rte-content ul, .rte-content ol{ margin:0 0 10px; padding-left:22px; }
   .rte-content a{ color:var(--brand); }
   .rte-content hr{ border:none; border-top:1px solid var(--line); margin:14px 0; }
+  .rte-content img, .rte-mount img{ max-width:100%; height:auto; border-radius:8px; display:block; margin:10px 0; image-rendering:auto; }
+  .rte-mount.ql-editor.rte-dragover, .rte-wrap .ql-editor.rte-dragover{ outline:2px dashed var(--brand); outline-offset:-4px; background:var(--brand-light); }
+  img.rte-img-align-left{ margin-left:0; margin-right:auto; }
+  img.rte-img-align-center{ margin-left:auto; margin-right:auto; }
+  img.rte-img-align-right{ margin-left:auto; margin-right:0; }
+  .rte-image-toolbar{ position:absolute; z-index:2000; background:var(--steel); border-radius:8px; padding:4px; display:flex; gap:2px; box-shadow:0 6px 20px rgba(0,0,0,0.3); }
+  .rte-image-toolbar button{ background:none; border:none; color:#fff; font-size:12px; padding:6px 8px; border-radius:5px; cursor:pointer; font-family:var(--font-heading); white-space:nowrap; }
+  .rte-image-toolbar button:hover{ background:rgba(255,255,255,0.15); }
+  .rte-image-toolbar button.rte-img-danger{ color:#FF9A9A; }
+  .rte-img-sep{ width:1px; background:rgba(255,255,255,0.2); margin:2px 2px; }
 </style>
 <style>
 /*!
@@ -7905,31 +7915,178 @@ const RTE_TOOLBAR = [
   [{ 'align': [] }],
   [{ 'list': 'ordered' }, { 'list': 'bullet' }, { 'list': 'check' }],
   [{ 'indent': '-1' }, { 'indent': '+1' }],
-  ['blockquote', 'link'],
+  ['blockquote', 'link', 'image'],
   ['rte-hr', 'clean'],
 ];
 function rteEncode(html){ return btoa(unescape(encodeURIComponent(html||''))); }
 function rteDecode(b64){ try{ return decodeURIComponent(escape(atob(b64||''))); } catch(e){ return ''; } }
-function rteMount(fieldId, initialHtml, placeholder){
-  return `<div class="rte-wrap" id="${fieldId}-wrap" data-field="${fieldId}" data-initial="${rteEncode(initialHtml)}" data-placeholder="${esc(placeholder||'')}"><div class="rte-mount" id="${fieldId}"></div></div>`;
+const RTE_IMAGE_MAX_MB = 8;
+const RTE_IMAGE_ALLOWED_TYPES = ['image/jpeg','image/jpg','image/png','image/webp','image/gif'];
+function rteValidateImageFile(file){
+  if(!RTE_IMAGE_ALLOWED_TYPES.includes(file.type)){
+    return { ok:false, reason:`"${file.name}" isn't a supported image type. Use JPG, PNG, WebP, or GIF.` };
+  }
+  if(file.size > RTE_IMAGE_MAX_MB*1024*1024){
+    return { ok:false, reason:`"${file.name}" is too large (max ${RTE_IMAGE_MAX_MB}MB). Try a smaller image.` };
+  }
+  return { ok:true };
+}
+function rteCompressImage(file, maxDimension){
+  return new Promise((resolve,reject)=>{
+    if(file.type==='image/gif'){ resolve(file); return; } // GIFs would lose animation if redrawn to canvas
+    const img = new Image();
+    const objUrl = URL.createObjectURL(file);
+    img.onload = ()=>{
+      URL.revokeObjectURL(objUrl);
+      let { width, height } = img;
+      if(width<=maxDimension && height<=maxDimension && file.size < 1.5*1024*1024){ resolve(file); return; }
+      const scale = Math.min(1, maxDimension/Math.max(width,height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(width*scale);
+      canvas.height = Math.round(height*scale);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const mime = file.type==='image/png' ? 'image/png' : 'image/jpeg';
+      canvas.toBlob(blob=>{
+        if(!blob){ resolve(file); return; }
+        resolve(new File([blob], file.name, { type: mime }));
+      }, mime, 0.82);
+    };
+    img.onerror = ()=>reject(new Error('damaged'));
+    img.src = objUrl;
+  });
+}
+async function rteUploadImage(file, contextPath){
+  const validation = rteValidateImageFile(file);
+  if(!validation.ok) return { ok:false, reason:validation.reason };
+  let processed;
+  try{ processed = await rteCompressImage(file, 1600); }
+  catch(e){ return { ok:false, reason:`"${file.name}" appears to be damaged or unreadable.` }; }
+  const path = `theory-images/${contextPath}/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g,'_')}`;
+  const url = await uploadFile(path, processed);
+  if(!url) return { ok:false, reason:'Upload failed — check your connection and try again.' };
+  return { ok:true, url, path };
+}
+function rteMount(fieldId, initialHtml, placeholder, contextPath){
+  return `<div class="rte-wrap" id="${fieldId}-wrap" data-field="${fieldId}" data-initial="${rteEncode(initialHtml)}" data-placeholder="${esc(placeholder||'')}" data-context="${esc(contextPath||'general')}"><div class="rte-mount" id="${fieldId}"></div></div>`;
+}
+function rteCurrentContext(){
+  return [editingCourseId||'legacy', editingDayId||'x', editingLanguage||'default'].join('/');
+}
+async function rteInsertImageFile(quill, file, contextPath){
+  const range = quill.getSelection(true) || { index: quill.getLength() };
+  showToast('Uploading image...', 'info');
+  const result = await rteUploadImage(file, contextPath);
+  if(!result.ok){ showToast(result.reason, 'error'); return; }
+  quill.insertEmbed(range.index, 'image', result.url, 'user');
+  quill.setSelection(range.index+1, 0, 'user');
+  showToast('Image added.', 'success');
 }
 function initRichTextEditors(){
   quillInstances = {};
   document.querySelectorAll('.rte-wrap').forEach(wrap=>{
     const fieldId = wrap.dataset.field;
     const initialHtml = rteDecode(wrap.dataset.initial);
+    const contextPath = wrap.dataset.context || 'general';
     const mountEl = document.getElementById(fieldId);
     if(!mountEl) return;
     const quill = new Quill(mountEl, {
       theme: 'snow',
       placeholder: wrap.dataset.placeholder || '',
-      modules: { toolbar: { container: RTE_TOOLBAR, handlers: { 'rte-hr': function(){
-        const range = this.quill.getSelection(true);
-        this.quill.clipboard.dangerouslyPasteHTML(range.index, '<hr>', 'user');
-      } } } }
+      modules: { toolbar: { container: RTE_TOOLBAR, handlers: {
+        'rte-hr': function(){
+          const range = this.quill.getSelection(true);
+          this.quill.clipboard.dangerouslyPasteHTML(range.index, '<hr>', 'user');
+        },
+        'image': function(){
+          const input = document.createElement('input');
+          input.type = 'file'; input.accept = RTE_IMAGE_ALLOWED_TYPES.join(',');
+          input.onchange = async ()=>{ if(input.files[0]) await rteInsertImageFile(this.quill, input.files[0], contextPath); };
+          input.click();
+        }
+      } } }
     });
     if(initialHtml) quill.clipboard.dangerouslyPasteHTML(initialHtml);
     quillInstances[fieldId] = quill;
+
+    // Drag-and-drop image support
+    const editorRoot = quill.root;
+    editorRoot.addEventListener('dragover', e=>{ e.preventDefault(); editorRoot.classList.add('rte-dragover'); });
+    editorRoot.addEventListener('dragleave', ()=>{ editorRoot.classList.remove('rte-dragover'); });
+    editorRoot.addEventListener('drop', async e=>{
+      e.preventDefault(); editorRoot.classList.remove('rte-dragover');
+      const files = Array.from(e.dataTransfer.files||[]).filter(f=>f.type.startsWith('image/'));
+      for(const file of files){ await rteInsertImageFile(quill, file, contextPath); }
+    });
+
+    // Floating per-image toolbar: click an image to show align/size/replace/alt/delete controls
+    editorRoot.addEventListener('click', e=>{
+      if(e.target.tagName==='IMG') rteShowImageToolbar(quill, e.target, contextPath);
+      else rteHideImageToolbar();
+    });
+  });
+}
+let rteActiveImageToolbar = null;
+function rteHideImageToolbar(){
+  if(rteActiveImageToolbar){ rteActiveImageToolbar.remove(); rteActiveImageToolbar = null; }
+}
+function rteShowImageToolbar(quill, imgEl, contextPath){
+  rteHideImageToolbar();
+  const bar = document.createElement('div');
+  bar.className = 'rte-image-toolbar';
+  bar.innerHTML = `
+    <button type="button" data-act="left" title="Align left">&#8676;</button>
+    <button type="button" data-act="center" title="Align center">&#8596;</button>
+    <button type="button" data-act="right" title="Align right">&#8677;</button>
+    <span class="rte-img-sep"></span>
+    <button type="button" data-act="small" title="Small">S</button>
+    <button type="button" data-act="medium" title="Medium">M</button>
+    <button type="button" data-act="large" title="Large">L</button>
+    <span class="rte-img-sep"></span>
+    <button type="button" data-act="alt" title="Alt text">Alt</button>
+    <button type="button" data-act="replace" title="Replace image">Replace</button>
+    <button type="button" data-act="preview" title="Preview">View</button>
+    <button type="button" data-act="delete" title="Delete image" class="rte-img-danger">Delete</button>
+  `;
+  document.body.appendChild(bar);
+  const rect = imgEl.getBoundingClientRect();
+  bar.style.top = (window.scrollY + rect.top - bar.offsetHeight - 8) + 'px';
+  bar.style.left = (window.scrollX + rect.left) + 'px';
+  rteActiveImageToolbar = bar;
+  bar.querySelectorAll('button').forEach(btn=>{
+    btn.addEventListener('click', async (ev)=>{
+      ev.stopPropagation();
+      const act = btn.dataset.act;
+      if(act==='left'){ imgEl.className = 'rte-img-align-left'; }
+      else if(act==='center'){ imgEl.className = 'rte-img-align-center'; }
+      else if(act==='right'){ imgEl.className = 'rte-img-align-right'; }
+      else if(act==='small'){ imgEl.style.width = '220px'; }
+      else if(act==='medium'){ imgEl.style.width = '420px'; }
+      else if(act==='large'){ imgEl.style.width = '100%'; }
+      else if(act==='alt'){
+        const current = imgEl.getAttribute('alt') || '';
+        const next = prompt('Alt text (describes the image for accessibility):', current);
+        if(next!==null) imgEl.setAttribute('alt', next);
+      } else if(act==='replace'){
+        const input = document.createElement('input');
+        input.type = 'file'; input.accept = RTE_IMAGE_ALLOWED_TYPES.join(',');
+        input.onchange = async ()=>{
+          if(!input.files[0]) return;
+          const result = await rteUploadImage(input.files[0], contextPath);
+          if(!result.ok){ showToast(result.reason, 'error'); return; }
+          imgEl.setAttribute('src', result.url);
+          showToast('Image replaced.', 'success');
+        };
+        input.click();
+      } else if(act==='preview'){
+        window.open(imgEl.src, '_blank');
+      } else if(act==='delete'){
+        imgEl.remove();
+        rteHideImageToolbar();
+        return;
+      }
+      quill.update('user');
+    });
   });
 }
 function rteGetValue(fieldId){
@@ -8667,7 +8824,7 @@ function renderContentItemCard(item, i, total){
   if(item.type==='theory'){
     fields = `
       <input class="field-input" id="c-heading-${i}" value="${esc(item.heading)}" placeholder="Heading">
-      ${rteMount('c-body-'+i, item.body, 'Edit every single word here')}
+      ${rteMount('c-body-'+i, item.body, 'Edit every single word here', rteCurrentContext())}
     `;
   } else if(item.type==='video'){
     const ws = item.watchSettings || {};
@@ -8741,7 +8898,7 @@ function renderContentItemCard(item, i, total){
       <input class="field-input" id="c-imageurl-${i}" value="${esc(item.imageUrl||'')}" placeholder="Background image URL (optional)">
     `;
   } else if(item.type==='text'){
-    fields = rteMount('c-body-'+i, item.body, 'Write your content here');
+    fields = rteMount('c-body-'+i, item.body, 'Write your content here', rteCurrentContext());
   } else if(item.type==='button'){
     fields = `
       <input class="field-input" id="c-label-${i}" value="${esc(item.label)}" placeholder="Button text">
