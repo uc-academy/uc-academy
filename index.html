@@ -91,7 +91,7 @@
     --teal:#2B6777; --teal-light:#DCEBEF;
     --ink:#241E33; --ink-soft:#6B647E; --line:#E7E2F1;
     --success:#3F8756; --success-bg:#E6F1E9; --danger:#B4472F; --danger-bg:#FBEAE5;
-    --lock:#9A93AC; --radius:12px;
+    --lock:#9A93AC; --radius:12px; --btn-radius:9px; --secondary:#2E9E4F;
     --font-heading:'Poppins', sans-serif; --font-body:'Inter', sans-serif;
   }
   *{box-sizing:border-box;}
@@ -218,7 +218,7 @@
   .video-progress-fill{ height:100%; background:var(--brand); transition:width .3s ease; }
   .video-progress-label{ font-size:11.5px; color:var(--ink-soft); margin-top:5px; }
 
-  .btn{ font-family:var(--font-heading); font-weight:600; letter-spacing:0.02em; font-size:11.5px; padding:10px 16px; border-radius:9px; border:1px solid var(--steel); background:var(--steel); color:#fff; cursor:pointer; }
+  .btn{ font-family:var(--font-heading); font-weight:600; letter-spacing:0.02em; font-size:11.5px; padding:10px 16px; border-radius:var(--btn-radius); border:1px solid var(--steel); background:var(--steel); color:#fff; cursor:pointer; }
   .btn:hover{ opacity:0.88; }
   .btn.secondary{ background:none; color:var(--steel); border-color:var(--line); }
   .btn.amber{ background:var(--brand); border-color:var(--brand-dark); color:#fff; box-shadow:0 6px 16px rgba(91,63,163,0.28); }
@@ -1211,13 +1211,18 @@ const NAV_LABEL_KEYS = [
   ['report','Report an Issue'], ['theme','Theme & Branding']
 ];
 const DEFAULT_THEME = {
-  brandColor: '#5B3FA3', logoText: 'UC', logoImageUrl: '',
+  brandColor: '#5B3FA3', secondaryColor: '#2E9E4F', backgroundColor: '#F7F6FB', textColor: '#1A1A2E',
+  borderRadius: 'medium', buttonStyle: 'rounded',
+  logoText: 'UC', logoImageUrl: '', faviconUrl: '',
   headingFont: 'Poppins', bodyFont: 'Inter',
   courseName: 'Urban Company Academy Expert Courses', courseSub: 'Professional Expert Courses',
   navLabels: {}
 };
 let currentTheme = { ...DEFAULT_THEME };
 async function getTheme(){ const v = await kvGet('theme:settings'); return v ? { ...DEFAULT_THEME, ...v, navLabels: {...(v.navLabels||{})} } : { ...DEFAULT_THEME }; }
+async function getThemeDraft(){ const v = await kvGet('theme:draft'); return v ? { ...DEFAULT_THEME, ...v, navLabels: {...(v.navLabels||{})} } : null; }
+async function setThemeDraft(t){ return await kvSet('theme:draft', t); }
+async function clearThemeDraft(){ return await kvDelete('theme:draft'); }
 async function setTheme(theme){ return await kvSet('theme:settings', theme); }
 
 /* ---- DASHBOARD LAYOUT (nav order, stat cards, tracking columns) ---- */
@@ -1454,11 +1459,24 @@ async function applyTheme(){
   root.setProperty('--brand-dark', shades.brandDark);
   root.setProperty('--brand-mid', shades.brandMid);
   root.setProperty('--brand-light', shades.brandLight);
+  root.setProperty('--secondary', currentTheme.secondaryColor || DEFAULT_THEME.secondaryColor);
+  root.setProperty('--porcelain', currentTheme.backgroundColor || DEFAULT_THEME.backgroundColor);
+  root.setProperty('--ink', currentTheme.textColor || DEFAULT_THEME.textColor);
+  const radiusMap = { none:'0px', small:'6px', medium:'12px', large:'20px' };
+  root.setProperty('--radius', radiusMap[currentTheme.borderRadius] || radiusMap.medium);
+  const btnRadiusMap = { square:'4px', rounded:'9px', pill:'999px' };
+  root.setProperty('--btn-radius', btnRadiusMap[currentTheme.buttonStyle] || btnRadiusMap.rounded);
   const hFont = currentTheme.headingFont || 'Poppins';
   const bFont = currentTheme.bodyFont || 'Inter';
   loadGoogleFont(hFont); loadGoogleFont(bFont);
   root.setProperty('--font-heading', `'${hFont}', sans-serif`);
   root.setProperty('--font-body', `'${bFont}', sans-serif`);
+  applyFavicon(currentTheme.faviconUrl);
+}
+function applyFavicon(url){
+  let link = document.querySelector("link[rel~='icon']");
+  if(!link){ link = document.createElement('link'); link.rel = 'icon'; document.head.appendChild(link); }
+  link.href = url || 'data:,'; // 'data:,' clears back to browser default when no favicon is set
 }
 function renderLogoMark(sizeClass){
   if(currentTheme.logoImageUrl){
@@ -4228,6 +4246,7 @@ let securityFilterStatus = '';
 let doubtsFilterStatus = '';
 let adminBatchesCache = [];
 let themeDraft = null;
+let themeHasPendingDraft = false;
 let layoutDraft = null;
 let aiDraft = null;
 let navDragFromKey = null;
@@ -4606,7 +4625,7 @@ async function renderAdminMain(){
       el.innerHTML = renderBatchesListTab();
     }
   }
-  else if(adminTab==='theme'){ themeDraft = JSON.parse(JSON.stringify(currentTheme)); layoutDraft = JSON.parse(JSON.stringify(currentLayout)); aiDraft = JSON.parse(JSON.stringify(currentAiSettings)); el.innerHTML = renderThemeTab(); }
+  else if(adminTab==='theme'){ const pendingDraft = await getThemeDraft(); themeHasPendingDraft = !!pendingDraft; themeDraft = pendingDraft ? pendingDraft : JSON.parse(JSON.stringify(currentTheme)); layoutDraft = JSON.parse(JSON.stringify(currentLayout)); aiDraft = JSON.parse(JSON.stringify(currentAiSettings)); el.innerHTML = renderThemeTab(); }
 }
 
 /* ---- OVERVIEW (admin only) ---- */
@@ -6737,12 +6756,16 @@ async function submitMediaReview(mediaId, newStatus){
 
 /* ---- BATCHES ---- */
 /* ---- THEME & BRANDING (admin only) ---- */
+function renderThemeTabOnly(){
+  document.getElementById('main').innerHTML = renderThemeTab();
+}
 function renderThemeTab(){
   const d = themeDraft;
   return `
-    <div class="crumb">Admin dashboard</div>
+    <div class="crumb">Admin dashboard → Settings</div>
     <h1 class="page-title">Theme &amp; Branding</h1>
-    <p class="page-sub">Colors, logo, fonts, course name, and sidebar labels — applies everywhere, for everyone, the moment you publish.</p>
+    <p class="page-sub">Colors, logo, fonts, course name, and sidebar labels. Nothing here affects users until you click Save & Publish.</p>
+    ${themeHasPendingDraft ? `<div class="gate-msg" style="margin-bottom:14px;background:#FFF6E5;border-color:var(--amber, #C9860A);"><b>You have an unpublished draft loaded.</b><p style="margin-top:4px;">These changes are not live yet — the site still shows the last published version. Continue editing, or click Save & Publish to make them live.</p></div>` : ''}
 
     <div class="card">
       <h3>Course name</h3>
@@ -6753,24 +6776,73 @@ function renderThemeTab(){
     </div>
 
     <div class="card">
-      <h3>Brand color</h3>
-      <p style="margin-bottom:10px;">Pick one color — lighter and darker shades used throughout the app are generated from it automatically.</p>
-      <div style="display:flex;gap:10px;align-items:center;">
-        <input type="color" id="theme-brand-color" value="${esc(d.brandColor)}" style="width:56px;height:44px;border:1px solid var(--line);border-radius:8px;cursor:pointer;padding:2px;">
-        <input class="field-input" id="theme-brand-color-hex" value="${esc(d.brandColor)}" style="margin-bottom:0;width:140px;" oninput="syncBrandColorHex()">
+      <h3>Colors</h3>
+      <p style="margin-bottom:10px;">Primary is used for buttons, links, and highlights — lighter/darker shades are generated from it automatically. The others are used more sparingly.</p>
+      <div class="form-grid">
+        <div>
+          <span class="field-label">Primary color</span>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input type="color" id="theme-brand-color" value="${esc(d.brandColor)}" style="width:44px;height:40px;border:1px solid var(--line);border-radius:8px;cursor:pointer;padding:2px;">
+            <input class="field-input" id="theme-brand-color-hex" value="${esc(d.brandColor)}" style="margin-bottom:0;" oninput="syncBrandColorHex()">
+          </div>
+        </div>
+        <div>
+          <span class="field-label">Secondary color</span>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input type="color" id="theme-secondary-color" value="${esc(d.secondaryColor)}" style="width:44px;height:40px;border:1px solid var(--line);border-radius:8px;cursor:pointer;padding:2px;">
+            <input class="field-input" id="theme-secondary-color-hex" value="${esc(d.secondaryColor)}" style="margin-bottom:0;" oninput="syncSecondaryColorHex()">
+          </div>
+        </div>
+        <div>
+          <span class="field-label">Background color</span>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input type="color" id="theme-bg-color" value="${esc(d.backgroundColor)}" style="width:44px;height:40px;border:1px solid var(--line);border-radius:8px;cursor:pointer;padding:2px;">
+            <input class="field-input" id="theme-bg-color-hex" value="${esc(d.backgroundColor)}" style="margin-bottom:0;" oninput="syncBgColorHex()">
+          </div>
+        </div>
+        <div>
+          <span class="field-label">Default text color</span>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input type="color" id="theme-text-color" value="${esc(d.textColor)}" style="width:44px;height:40px;border:1px solid var(--line);border-radius:8px;cursor:pointer;padding:2px;">
+            <input class="field-input" id="theme-text-color-hex" value="${esc(d.textColor)}" style="margin-bottom:0;" oninput="syncTextColorHex()">
+          </div>
+        </div>
       </div>
     </div>
 
     <div class="card">
-      <h3>Logo</h3>
-      <p style="margin-bottom:10px;">Upload an image to replace the default mark, or just set custom initials (used if no image is uploaded).</p>
+      <h3>Appearance</h3>
+      <div class="form-grid">
+        <div><span class="field-label">Border radius</span><select class="field-input" id="theme-border-radius">
+          <option value="none" ${d.borderRadius==='none'?'selected':''}>None (sharp corners)</option>
+          <option value="small" ${d.borderRadius==='small'?'selected':''}>Small</option>
+          <option value="medium" ${d.borderRadius==='medium'?'selected':''}>Medium (default)</option>
+          <option value="large" ${d.borderRadius==='large'?'selected':''}>Large (rounded)</option>
+        </select></div>
+        <div><span class="field-label">Button style</span><select class="field-input" id="theme-button-style">
+          <option value="square" ${d.buttonStyle==='square'?'selected':''}>Square</option>
+          <option value="rounded" ${d.buttonStyle==='rounded'?'selected':''}>Rounded (default)</option>
+          <option value="pill" ${d.buttonStyle==='pill'?'selected':''}>Pill</option>
+        </select></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Logo &amp; favicon</h3>
+      <p style="margin-bottom:10px;">Upload images to replace the default mark, or just set custom initials (used if no logo image is uploaded).</p>
       <span class="field-label">Initials (used if no logo image)</span>
       <input class="field-input" id="theme-logo-text" value="${esc(d.logoText)}" maxlength="3" style="width:100px;">
       <span class="field-label">Logo image</span>
-      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;">
         ${d.logoImageUrl ? `<img src="${esc(d.logoImageUrl)}" style="width:44px;height:44px;border-radius:50%;object-fit:cover;border:1px solid var(--line);">` : ''}
         <label class="btn secondary small" style="cursor:pointer;">Upload logo<input type="file" accept="image/*" style="display:none;" onchange="handleLogoUpload(event)"></label>
         ${d.logoImageUrl ? `<button class="btn danger small" onclick="removeLogoImage()">Remove image</button>` : ''}
+      </div>
+      <span class="field-label">Favicon (browser tab icon)</span>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+        ${d.faviconUrl ? `<img src="${esc(d.faviconUrl)}" style="width:24px;height:24px;border-radius:4px;object-fit:cover;border:1px solid var(--line);">` : ''}
+        <label class="btn secondary small" style="cursor:pointer;">Upload favicon<input type="file" accept="image/*" style="display:none;" onchange="handleFaviconUpload(event)"></label>
+        ${d.faviconUrl ? `<button class="btn danger small" onclick="removeFavicon()">Remove</button>` : ''}
       </div>
     </div>
 
@@ -6851,6 +6923,7 @@ function renderThemeTab(){
     </div>
 
     <div class="card" style="display:flex;gap:10px;flex-wrap:wrap;">
+      <button class="btn secondary" onclick="saveThemeAsDraft()">Save as Draft</button>
       <button class="btn amber" onclick="saveThemeDraft()">Save &amp; Publish</button>
       <button class="btn danger" onclick="resetThemeToDefault()">Reset to default</button>
     </div>
@@ -6888,6 +6961,18 @@ function syncBrandColorHex(){
   const hex = document.getElementById('theme-brand-color-hex').value.trim();
   if(/^#[0-9a-fA-F]{6}$/.test(hex)) document.getElementById('theme-brand-color').value = hex;
 }
+function syncSecondaryColorHex(){
+  const hex = document.getElementById('theme-secondary-color-hex').value.trim();
+  if(/^#[0-9a-fA-F]{6}$/.test(hex)) document.getElementById('theme-secondary-color').value = hex;
+}
+function syncBgColorHex(){
+  const hex = document.getElementById('theme-bg-color-hex').value.trim();
+  if(/^#[0-9a-fA-F]{6}$/.test(hex)) document.getElementById('theme-bg-color').value = hex;
+}
+function syncTextColorHex(){
+  const hex = document.getElementById('theme-text-color-hex').value.trim();
+  if(/^#[0-9a-fA-F]{6}$/.test(hex)) document.getElementById('theme-text-color').value = hex;
+}
 async function handleLogoUpload(event){
   const file = event.target.files[0];
   if(!file) return;
@@ -6897,14 +6982,34 @@ async function handleLogoUpload(event){
   if(!url){ showToast("Upload failed — check your connection.", 'error'); return; }
   themeDraft.logoImageUrl = url;
   showToast('Logo uploaded. Click Save & Publish to apply it.', 'success');
-  renderAdminMain();
+  renderThemeTabOnly();
 }
-function removeLogoImage(){ themeDraft.logoImageUrl = ''; renderAdminMain(); }
+function removeLogoImage(){ themeDraft.logoImageUrl = ''; renderThemeTabOnly(); }
+async function handleFaviconUpload(event){
+  const file = event.target.files[0];
+  if(!file) return;
+  showToast('Uploading favicon...', 'info');
+  const path = `branding/favicon_${Date.now()}_${file.name}`;
+  const url = await uploadFile(path, file);
+  if(!url){ showToast("Upload failed — check your connection.", 'error'); return; }
+  themeDraft.faviconUrl = url;
+  showToast('Favicon uploaded. Click Save & Publish to apply it.', 'success');
+  renderThemeTabOnly();
+}
+function removeFavicon(){ themeDraft.faviconUrl = ''; renderThemeTabOnly(); }
 function syncThemeDraftFromDOM(){
   themeDraft.courseName = document.getElementById('theme-course-name').value.trim() || DEFAULT_THEME.courseName;
   themeDraft.courseSub = document.getElementById('theme-course-sub').value.trim() || DEFAULT_THEME.courseSub;
   const hex = document.getElementById('theme-brand-color-hex').value.trim();
   themeDraft.brandColor = /^#[0-9a-fA-F]{6}$/.test(hex) ? hex : document.getElementById('theme-brand-color').value;
+  const secHex = document.getElementById('theme-secondary-color-hex').value.trim();
+  themeDraft.secondaryColor = /^#[0-9a-fA-F]{6}$/.test(secHex) ? secHex : document.getElementById('theme-secondary-color').value;
+  const bgHex = document.getElementById('theme-bg-color-hex').value.trim();
+  themeDraft.backgroundColor = /^#[0-9a-fA-F]{6}$/.test(bgHex) ? bgHex : document.getElementById('theme-bg-color').value;
+  const textHex = document.getElementById('theme-text-color-hex').value.trim();
+  themeDraft.textColor = /^#[0-9a-fA-F]{6}$/.test(textHex) ? textHex : document.getElementById('theme-text-color').value;
+  themeDraft.borderRadius = document.getElementById('theme-border-radius').value;
+  themeDraft.buttonStyle = document.getElementById('theme-button-style').value;
   themeDraft.logoText = document.getElementById('theme-logo-text').value.trim().toUpperCase().slice(0,3) || 'UC';
   themeDraft.headingFont = document.getElementById('theme-heading-font').value;
   themeDraft.bodyFont = document.getElementById('theme-body-font').value;
@@ -6914,6 +7019,27 @@ function syncThemeDraftFromDOM(){
     if(val) labels[key] = val;
   });
   themeDraft.navLabels = labels;
+}
+function diffThemeFields(before, after){
+  const labels = {
+    courseName:'Course name', courseSub:'Subtitle', brandColor:'Primary color', secondaryColor:'Secondary color',
+    backgroundColor:'Background color', textColor:'Text color', borderRadius:'Border radius', buttonStyle:'Button style',
+    logoText:'Logo initials', logoImageUrl:'Logo image', faviconUrl:'Favicon', headingFont:'Heading font', bodyFont:'Body font'
+  };
+  const changes = [];
+  Object.entries(labels).forEach(([key,label])=>{
+    const b = before ? (before[key]||'') : '';
+    const a = after[key]||'';
+    if(String(b)!==String(a)) changes.push({ field:label, previous:b||'(empty)', updated:a||'(empty)' });
+  });
+  return changes;
+}
+async function saveThemeAsDraft(){
+  syncThemeDraftFromDOM();
+  const ok = await setThemeDraft(themeDraft);
+  if(!ok){ showToast("Couldn't save the draft — check your connection.", 'error'); return; }
+  await logHistory('theme_draft_saved', `Theme & branding draft saved by ${trainerIdentity.name} (not yet published — live site unchanged)`, {});
+  showToast('Draft saved. Nothing has changed for users yet — click Save & Publish when ready.', 'success');
 }
 async function saveThemeDraft(){
   syncThemeDraftFromDOM();
@@ -6927,11 +7053,18 @@ async function saveThemeDraft(){
   if(proxyUrlEl) aiDraft.proxyUrl = proxyUrlEl.value.trim();
   if(appSecretEl) aiDraft.appSecret = appSecretEl.value.trim();
   if(dailyLimitEl) aiDraft.dailyLimit = Math.max(0, parseInt(dailyLimitEl.value)||0);
+  const themeChanges = diffThemeFields(currentTheme, themeDraft);
   const ok = await setTheme(themeDraft);
   const layoutOk = await setLayout(layoutDraft);
   const aiOk = await setAiSettings(aiDraft);
   if(!ok || !layoutOk || !aiOk){ showToast("Couldn't save — check your connection.", 'error'); return; }
-  await logHistory('theme_updated', `Theme, branding, layout, and AI review settings updated by ${trainerIdentity.name}`, {});
+  await clearThemeDraft();
+  themeHasPendingDraft = false;
+  if(themeChanges.length){
+    await logHistory('theme_updated', `Theme & branding published by ${trainerIdentity.name} — ${themeChanges.length} field${themeChanges.length===1?'':'s'} changed`, { changedBy: trainerIdentity.name, changes: themeChanges });
+  } else {
+    await logHistory('theme_updated', `Theme, branding, layout, and AI review settings updated by ${trainerIdentity.name}`, {});
+  }
   await applyTheme();
   currentLayout = layoutDraft;
   currentAiSettings = aiDraft;
@@ -6939,10 +7072,12 @@ async function saveThemeDraft(){
   renderAdmin();
 }
 async function resetThemeToDefault(){
-  showConfirmModal('Reset all branding, dashboard layout, and AI review settings to default? Your customizations will be removed for everyone.', async ()=>{
+  showConfirmModal('Reset all branding, dashboard layout, and AI review settings to default? Your customizations will be removed for everyone, including any unpublished draft.', async ()=>{
     await setTheme({ ...DEFAULT_THEME });
     await setLayout({ ...DEFAULT_LAYOUT });
     await setAiSettings({ ...DEFAULT_AI_SETTINGS });
+    await clearThemeDraft();
+    themeHasPendingDraft = false;
     currentLayout = { ...DEFAULT_LAYOUT };
     currentAiSettings = { ...DEFAULT_AI_SETTINGS };
     await logHistory('theme_reset', `Theme & branding reset to default by ${trainerIdentity.name}`, {});
