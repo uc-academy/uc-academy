@@ -9053,6 +9053,65 @@ function deleteModulePage(pageIdx){
     refreshModuleEditor();
   });
 }
+function deletePageBreak(pageBreakPosition){
+  // Removes the boundary AFTER page `pageBreakPosition`, merging its content into the next page.
+  // Unlike Delete Page, no content blocks are lost - they just become part of one combined page.
+  const groups = getModulePageGroups();
+  if(pageBreakPosition<0 || pageBreakPosition>=groups.length-1) return;
+  showConfirmModal(`Merge "${getModulePageName(pageBreakPosition)}" and "${getModulePageName(pageBreakPosition+1)}" into one page? All content blocks are kept — only the page break itself is removed.`, ()=>{
+    syncModuleDraftFromDOM();
+    const g = getModulePageGroups();
+    const merged = [...g[pageBreakPosition], ...g[pageBreakPosition+1]];
+    g.splice(pageBreakPosition, 2, merged);
+    // Shift page names down to match the new, shorter page list
+    if(moduleDraft.pageNames){
+      const oldNames = moduleDraft.pageNames;
+      const newNames = {};
+      let newIdx = 0;
+      for(let i=0;i<groups.length;i++){
+        if(i===pageBreakPosition+1) continue; // this page merged into the previous one, its own name is dropped
+        if(oldNames[i]) newNames[newIdx] = oldNames[i];
+        newIdx++;
+      }
+      moduleDraft.pageNames = newNames;
+    }
+    moduleDraft.content = flattenModulePageGroups(g);
+    refreshModuleEditor();
+  });
+}
+function movePageBreak(pageBreakPosition, dir){
+  // Shifts the boundary itself by one content block, resizing the two adjacent pages,
+  // rather than swapping or reordering whole pages.
+  syncModuleDraftFromDOM();
+  const groups = getModulePageGroups();
+  const before = groups[pageBreakPosition];
+  const after = groups[pageBreakPosition+1];
+  if(dir<0){ // move break up: last block of "before" moves into the start of "after"
+    if(before.length<=1){ showToast('This page needs at least one content block.', 'error'); return; }
+    after.unshift(before.pop());
+  } else { // move break down: first block of "after" moves into the end of "before"
+    if(after.length<=1){ showToast('This page needs at least one content block.', 'error'); return; }
+    before.push(after.shift());
+  }
+  moduleDraft.content = flattenModulePageGroups(groups);
+  refreshModuleEditor();
+}
+function previewNextPage(pageBreakPosition){
+  syncModuleDraftFromDOM();
+  const groups = getModulePageGroups();
+  const nextPage = groups[pageBreakPosition+1];
+  if(!nextPage) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `
+    <div class="confirm-box" style="max-width:600px;width:92%;text-align:left;max-height:80vh;overflow-y:auto;">
+      <h3 style="margin-top:0;">Preview: ${esc(getModulePageName(pageBreakPosition+1))}</h3>
+      <p style="font-size:12px;color:var(--ink-soft);margin-top:-6px;">Read-only preview of this page's content, exactly as a partner would see it.</p>
+      ${nextPage.length===0 ? '<p style="color:var(--ink-soft);">This page has no content blocks yet.</p>' : nextPage.map((item,i)=>renderHomeContentItem(item, i, {videoItemProgress:{},quickAssessments:{},checkboxQuestions:{},mcqQuestions:{}}, nextPage)).join('')}
+      <div class="confirm-actions"><button class="btn secondary" onclick="this.closest('.confirm-overlay').remove()">Close</button></div>
+    </div>`;
+  document.body.appendChild(overlay);
+}
 function toggleCollapseModulePage(pageIdx){
   moduleEditorCollapsedPages[pageIdx] = !moduleEditorCollapsedPages[pageIdx];
   refreshModuleEditor();
@@ -10492,9 +10551,20 @@ function renderModulePagesSection(d){
       </div>
       ${collapsed ? `<p style="padding:0 16px 12px;font-size:12px;color:var(--ink-soft);">Page collapsed — click Expand to edit its content.</p>` : ''}
     </div>
-    <div style="text-align:center; margin:-8px 0 18px; position:relative;">
+    <div style="text-align:center; margin:22px 0 26px; position:relative;">
       <div style="border-top:2px dashed var(--amber); position:absolute; top:50%; left:0; right:0; z-index:0;"></div>
-      <span style="background:var(--amber); color:#fff; font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; padding:4px 14px; border-radius:20px; position:relative; z-index:1;">${pi<totalPages-1?'Page Ends Here — '+esc(getModulePageName(pi+1))+' starts next':'End of content'}</span>
+      ${pi<totalPages-1 ? `
+        <div style="position:relative; z-index:1; display:inline-flex; flex-direction:column; align-items:center; gap:6px; background:#fff; padding:0 16px;">
+          <span style="background:var(--amber); color:#fff; font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; padding:4px 14px; border-radius:20px;">Page Ends Here</span>
+          <span style="background:var(--brand); color:#fff; font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; padding:4px 14px; border-radius:20px;">New Page Starts Here — ${esc(getModulePageName(pi+1))}</span>
+          <div style="display:flex; gap:6px; flex-wrap:wrap; justify-content:center; margin-top:4px;">
+            <button class="btn small secondary" onclick="movePageBreak(${pi},-1)" title="Move this page break up (shrink this page by one block)">&uarr; Break</button>
+            <button class="btn small secondary" onclick="movePageBreak(${pi},1)" title="Move this page break down (grow this page by one block)">&darr; Break</button>
+            <button class="btn small secondary" onclick="previewNextPage(${pi})">Preview Next Page</button>
+            <button class="btn small danger" onclick="deletePageBreak(${pi})" title="Merge these two pages into one, keeping all content">Delete Page Break</button>
+          </div>
+        </div>
+      ` : `<span style="background:#888; color:#fff; font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; padding:4px 14px; border-radius:20px; position:relative; z-index:1;">End of content</span>`}
     </div>`;
   }).join('');
 
