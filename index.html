@@ -8990,6 +8990,64 @@ async function duplicateCourseDayRow(dayId){
 let editingDayId = null;
 let editingCourseId = null;
 let editingLanguage = DEFAULT_LANGUAGE;
+let moduleEditorCollapsedPages = {};
+function getModulePageGroups(){
+  const groups = [[]];
+  (moduleDraft.content||[]).forEach(item=>{
+    if(item.type==='pageBreak'){ groups.push([]); return; }
+    groups[groups.length-1].push(item);
+  });
+  return groups;
+}
+function flattenModulePageGroups(groups){
+  const content = [];
+  groups.forEach((g,i)=>{
+    if(i>0) content.push({ type:'pageBreak', label: moduleDraft.pageNames && moduleDraft.pageNames[i] ? moduleDraft.pageNames[i] : '' });
+    content.push(...g);
+  });
+  return content;
+}
+function getModulePageName(pageIdx){
+  if(moduleDraft.pageNames && moduleDraft.pageNames[pageIdx]) return moduleDraft.pageNames[pageIdx];
+  return 'Page '+(pageIdx+1);
+}
+function setModulePageName(pageIdx, name){
+  syncModuleDraftFromDOM();
+  if(!moduleDraft.pageNames) moduleDraft.pageNames = {};
+  moduleDraft.pageNames[pageIdx] = name;
+}
+function moveModulePage(pageIdx, dir){
+  syncModuleDraftFromDOM();
+  const groups = getModulePageGroups();
+  const j = pageIdx+dir;
+  if(j<0 || j>=groups.length) return;
+  [groups[pageIdx], groups[j]] = [groups[j], groups[pageIdx]];
+  moduleDraft.content = flattenModulePageGroups(groups);
+  refreshModuleEditor();
+}
+function duplicateModulePage(pageIdx){
+  syncModuleDraftFromDOM();
+  const groups = getModulePageGroups();
+  const copy = JSON.parse(JSON.stringify(groups[pageIdx]));
+  groups.splice(pageIdx+1, 0, copy);
+  moduleDraft.content = flattenModulePageGroups(groups);
+  refreshModuleEditor();
+}
+function deleteModulePage(pageIdx){
+  const groups = getModulePageGroups();
+  if(groups.length<=1){ showToast('This is the only page — delete individual blocks instead, or add another page first.', 'error'); return; }
+  showConfirmModal(`Delete "${getModulePageName(pageIdx)}" and all ${groups[pageIdx].length} content block(s) on it? This can't be undone until you save.`, ()=>{
+    syncModuleDraftFromDOM();
+    const g = getModulePageGroups();
+    g.splice(pageIdx,1);
+    moduleDraft.content = flattenModulePageGroups(g);
+    refreshModuleEditor();
+  });
+}
+function toggleCollapseModulePage(pageIdx){
+  moduleEditorCollapsedPages[pageIdx] = !moduleEditorCollapsedPages[pageIdx];
+  refreshModuleEditor();
+}
 let moduleHasUnpublishedDraft = false;
 function blankCourseModuleDraft(){
   return { title:'New day', sub:'', content:[], assignmentIntro:'', tasks:[], mediaUploadEnabled:true, quiz:[] };
@@ -10305,14 +10363,7 @@ function renderModuleEditorTab(){
 
     <h2 class="page-title" style="font-size:18px;margin-top:20px;">Content</h2>
     <p style="font-size:12.5px;color:var(--ink-soft);margin:-8px 0 12px;">Mix theory, video, audio, and photos in any order. Drag a card by its header to reorder, or use the arrows. Use "+" under any card to insert something right after it.</p>
-    ${d.content.length===0 ? `<div class="card"><div class="empty-state">Nothing here yet — add your first item below.</div></div>` : ''}
-    ${renderAddRow(-1)}
-    ${d.content.map((item,i)=>{
-      const permKey = ccContentTypePermKey(item);
-      const allowed = ccCan('canEdit') && (!permKey || ccCan(permKey));
-      const card = renderContentItemCard(item,i,d.content.length);
-      return (allowed ? card : `<fieldset disabled style="border:none;padding:0;margin:0;opacity:0.6;">${card}</fieldset>`) + renderAddRow(i);
-    }).join('')}
+    ${d.content.length===0 ? `<div class="card"><div class="empty-state">Nothing here yet — add your first item below.</div></div>${renderAddRow(-1)}` : renderModulePagesSection(d)}
 
     ${isHome ? '' : `
     <h2 class="page-title" style="font-size:18px;margin-top:20px;">Assignment</h2>
@@ -10379,6 +10430,76 @@ function renderModuleEditorTab(){
   `;
 }
 
+
+function renderModulePagesSection(d){
+  const pageRanges = splitContentIntoPageRanges(d.content);
+  const totalPages = pageRanges.length;
+
+  const summaryLines = pageRanges.map((indices,pi)=>{
+    const blockCount = indices.length;
+    const hasQA = indices.some(idx=>d.content[idx].type==='quickAssessment');
+    const isLast = pi===totalPages-1;
+    const qaNote = hasQA ? ' + Quick Assessment' : '';
+    return `<li>${esc(getModulePageName(pi))} — ${blockCount} content block${blockCount===1?'':'s'}${qaNote}${isLast&&hasQA?' (Final Assessment)':''}</li>`;
+  }).join('');
+
+  const navLinks = pageRanges.map((_,pi)=>`<a href="#module-page-${pi}" class="btn small secondary" style="text-decoration:none;">${esc(getModulePageName(pi))}</a>`).join('');
+
+  const pagesHtml = pageRanges.map((indices,pi)=>{
+    const collapsed = !!moduleEditorCollapsedPages[pi];
+    const blockCount = indices.length;
+    const hasQA = indices.some(idx=>d.content[idx].type==='quickAssessment');
+    const blocksHtml = indices.map(i=>{
+      const item = d.content[i];
+      const permKey = ccContentTypePermKey(item);
+      const allowed = ccCan('canEdit') && (!permKey || ccCan(permKey));
+      const card = renderContentItemCard(item,i,d.content.length);
+      return (allowed ? card : `<fieldset disabled style="border:none;padding:0;margin:0;opacity:0.6;">${card}</fieldset>`) + renderAddRow(i);
+    }).join('');
+    const pageBreakIdx = pi>0 ? (function(){ let count=-1; for(let k=0;k<d.content.length;k++){ if(d.content[k].type==='pageBreak'){ count++; if(count===pi-1) return k; } } return null; })() : null;
+
+    return `
+    <div id="module-page-${pi}" style="border:2px solid var(--brand); border-radius:14px; margin-bottom:18px; box-shadow:0 2px 10px rgba(91,63,163,0.08); overflow:hidden;">
+      <div style="background:var(--brand-light); padding:12px 16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+          <span style="font-weight:700; font-size:14px; color:var(--brand-dark);">${esc(getModulePageName(pi))}</span>
+          <input class="field-input" style="margin-bottom:0; width:180px; display:inline-block;" placeholder="Rename this page" value="${esc((moduleDraft.pageNames&&moduleDraft.pageNames[pi])||'')}" onchange="setModulePageName(${pi}, this.value)">
+          <span style="font-size:11.5px; color:var(--ink-soft);">${blockCount} block${blockCount===1?'':'s'}${hasQA?' &middot; includes Quick Assessment':''}</span>
+        </div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap;">
+          <button class="btn small secondary" onclick="toggleCollapseModulePage(${pi})">${collapsed?'Expand':'Collapse'}</button>
+          <button class="btn small secondary" onclick="moveModulePage(${pi},-1)" ${pi===0?'disabled':''} title="Move page up">&uarr; Page</button>
+          <button class="btn small secondary" onclick="moveModulePage(${pi},1)" ${pi===totalPages-1?'disabled':''} title="Move page down">&darr; Page</button>
+          <button class="btn small secondary" onclick="duplicateModulePage(${pi})">Duplicate Page</button>
+          <button class="btn small danger" onclick="deleteModulePage(${pi})" ${totalPages<=1?'disabled':''}>Delete Page</button>
+        </div>
+      </div>
+      <div style="padding:14px 16px;${collapsed?'display:none;':''}">
+        ${pi===0 ? renderAddRow(-1) : ''}
+        ${blocksHtml}
+      </div>
+      ${collapsed ? `<p style="padding:0 16px 12px;font-size:12px;color:var(--ink-soft);">Page collapsed — click Expand to edit its content.</p>` : ''}
+    </div>
+    <div style="text-align:center; margin:-8px 0 18px; position:relative;">
+      <div style="border-top:2px dashed var(--amber); position:absolute; top:50%; left:0; right:0; z-index:0;"></div>
+      <span style="background:var(--amber); color:#fff; font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; padding:4px 14px; border-radius:20px; position:relative; z-index:1;">${pi<totalPages-1?'Page Ends Here — '+esc(getModulePageName(pi+1))+' starts next':'End of content'}</span>
+    </div>`;
+  }).join('');
+
+  return `
+    <div class="card" style="background:var(--porcelain);">
+      <h3 style="margin-top:0;">Page Summary</h3>
+      <p style="font-size:13px;margin-bottom:8px;"><b>Total Pages:</b> ${totalPages}</p>
+      <ul style="font-size:13px;margin:0 0 10px;padding-left:20px;">${summaryLines}</ul>
+      <p style="font-size:11.5px;color:var(--ink-soft);margin:0;">Page completion rule: a partner must finish every mandatory item on a page (videos watched, mandatory assessments passed) before "Next Page" unlocks.</p>
+    </div>
+    <div class="card" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <span style="font-size:12.5px;color:var(--ink-soft);margin-right:4px;">Jump to:</span>
+      ${navLinks}
+    </div>
+    ${pagesHtml}
+  `;
+}
 function renderVideosTab(){
   return `
     <div class="crumb">Admin dashboard</div>
