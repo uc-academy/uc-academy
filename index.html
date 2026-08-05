@@ -225,6 +225,7 @@
 
   audio{ width:100%; margin:10px 0; }
   .video-frame{ background:var(--steel); border-radius:var(--radius); overflow:hidden; margin-bottom:12px; aspect-ratio:16/9; display:flex; align-items:center; justify-content:center; position:relative; }
+  @keyframes ucaSpin{ to{ transform:rotate(360deg); } }
   .video-frame iframe{ width:100%; height:100%; border:0; }
   .video-placeholder{ color:#B7AED0; text-align:center; padding:20px; font-size:12.5px;}
   .video-progress-wrap{ margin-bottom:14px; }
@@ -3827,7 +3828,12 @@ function renderOverrideVideoItem(dayId, item, idx, dp){
   if(itemProgress.done && n.embedUrl){
     inner = `<iframe src="${esc(n.embedUrl)}" allowfullscreen></iframe>`;
   } else if(n.kind==='youtube'){
-    inner = `<div id="yt-player-${dayId}-${idx}" style="width:100%;height:100%;"></div>`;
+    inner = `<div id="yt-player-${dayId}-${idx}" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#fff;">
+      <div style="text-align:center;">
+        <div style="width:32px;height:32px;border:3px solid rgba(255,255,255,0.3);border-top-color:#fff;border-radius:50%;animation:ucaSpin 0.8s linear infinite;margin:0 auto 8px;"></div>
+        <span style="font-size:12px;">Loading video&hellip;</span>
+      </div>
+    </div>`;
   } else if(n.embedUrl){
     inner = `<iframe src="${esc(n.embedUrl)}" allowfullscreen></iframe>`;
   } else if(item.url){
@@ -3882,12 +3888,20 @@ function initOverrideVideoPlayers(day){
       const c = document.getElementById(elId);
       if(c) c.innerHTML = `<div class="video-placeholder">${reason}<br><span style="font-size:11.5px;">This can't be skipped — if the video won't load, ask your trainer to unlock it for you.</span></div>`;
     };
+    const ytErrorMessage = (code)=>{
+      if(code===2) return 'This video link looks invalid.';
+      if(code===5) return 'This video cannot be played in this browser.';
+      if(code===100) return 'This video was not found — it may have been removed or set to Private.';
+      if(code===101 || code===150) return 'The video owner has disabled playback on other websites for this video.';
+      return 'This video link could not be played.';
+    };
     let attempts = 0;
     const tryInit = ()=>{
       attempts++;
       if(!document.getElementById(elId)) return;
       if((ytApiReady || (window.YT && window.YT.Player))){
         ytPlayers[key] = new YT.Player(elId, {
+          width:'100%', height:'100%',
           videoId,
           events:{
             onReady:(e)=>{
@@ -3900,7 +3914,7 @@ function initOverrideVideoPlayers(day){
                 }
               }
             },
-            onError:()=>{ fail('This video link could not be played.'); },
+            onError:(e)=>{ fail(ytErrorMessage(e && e.data)); },
             onStateChange:(e)=>{
               if(alreadyDone) return;
               if(e.data===YT.PlayerState.PLAYING){
@@ -3912,10 +3926,10 @@ function initOverrideVideoPlayers(day){
             }
           }
         });
-      } else if(attempts<10){
-        setTimeout(tryInit, 300);
+      } else if(attempts<25){
+        setTimeout(tryInit, 400);
       } else {
-        fail('Video player unavailable.');
+        fail('Video player unavailable — check your internet connection and try refreshing.');
       }
     };
     tryInit();
@@ -4023,7 +4037,12 @@ function renderVideo(day){
   if(!url){
     body = `<div class="video-frame"><div class="video-placeholder">${esc(day.video.title)}<br><span style="font-size:11.5px;">No video linked yet — ask your trainer.</span></div></div>`;
   } else if(yt){
-    body = `<div class="video-frame"><div id="yt-player-${day.id}" style="width:100%;height:100%;"></div></div>`;
+    body = `<div class="video-frame"><div id="yt-player-${day.id}" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#fff;">
+      <div style="text-align:center;">
+        <div style="width:32px;height:32px;border:3px solid rgba(255,255,255,0.3);border-top-color:#fff;border-radius:50%;animation:ucaSpin 0.8s linear infinite;margin:0 auto 8px;"></div>
+        <span style="font-size:12px;">Loading video&hellip;</span>
+      </div>
+    </div></div>`;
   } else {
     const vm = url.match(/vimeo\.com\/(\d+)/);
     const embed = vm ? `https://player.vimeo.com/video/${vm[1]}` : '';
@@ -4078,12 +4097,20 @@ function initVideoTab(day){
     const c = document.getElementById(elId);
     if(c) c.innerHTML = `<div class="video-placeholder">${reason}<br><span style="font-size:11.5px;">This can't be skipped — if the video won't load, ask your trainer to unlock it for you.</span></div>`;
   };
+  const ytErrorMessage = (code)=>{
+    if(code===2) return 'This video link looks invalid.';
+    if(code===5) return 'This video cannot be played in this browser.';
+    if(code===100) return 'This video was not found — it may have been removed or set to Private.';
+    if(code===101 || code===150) return 'The video owner has disabled playback on other websites for this video.';
+    return 'This video link could not be played.';
+  };
   let attempts=0;
   const tryInit = ()=>{
     attempts++;
     if(!document.getElementById(elId)) return;
     if((ytApiReady || (window.YT && window.YT.Player))){
       ytPlayer = new YT.Player(elId, {
+        width:'100%', height:'100%',
         videoId,
         events:{
           onReady:(e)=>{
@@ -4097,7 +4124,7 @@ function initVideoTab(day){
               }
             }
           },
-          onError:()=>{ fail('This video link could not be played.'); },
+          onError:(e)=>{ fail(ytErrorMessage(e && e.data)); },
           onStateChange:(e)=>{
             if(e.data===YT.PlayerState.PLAYING){
               if(ytPollTimer) clearInterval(ytPollTimer);
@@ -4108,10 +4135,10 @@ function initVideoTab(day){
           }
         }
       });
-    } else if(attempts<10){
-      setTimeout(tryInit, 300);
+    } else if(attempts<25){
+      setTimeout(tryInit, 400);
     } else {
-      fail('Video player unavailable.');
+      fail('Video player unavailable — check your internet connection and try refreshing.');
     }
   };
   tryInit();
