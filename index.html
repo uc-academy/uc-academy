@@ -7716,10 +7716,23 @@ function renderMediaReviewCard(m){
         <button class="btn amber small" onclick="submitMediaReview('${m.id}','Pass')">Mark Pass</button>
         <button class="btn danger small" onclick="submitMediaReview('${m.id}','Fail')">Mark Fail</button>
         <button class="btn secondary small" onclick="submitMediaReview('${m.id}','ResubmissionRequired')">Request Resubmission</button>
+        <button class="btn danger small" onclick="promptDeleteMediaRecord('${m.id}')">Delete</button>
       </div>
       ${m.reviewedBy?`<div class="save-note">Last reviewed by ${esc(m.reviewedBy)} &middot; ${fmtDateTime(m.reviewedAt)}${m.overrideReason?` &middot; Overrode AI: "${esc(m.overrideReason)}"`:''}</div>`:''}
     </div>
   `;
+}
+function promptDeleteMediaRecord(mediaId){
+  if(!ccCan('canDelete')){ showToast("You don't have permission to delete uploads.", 'error'); return; }
+  showConfirmModal('Delete this upload permanently? The photo/video and its review history will be removed. This cannot be undone.', async ()=>{
+    const record = await getMediaRecord(mediaId);
+    if(!record){ showToast('Could not find that upload.', 'error'); return; }
+    if(record.storagePath) await deleteUploadedFile(record.storagePath);
+    await kvDelete('media:'+mediaId);
+    await logHistory('media_deleted', `Upload deleted for ${record.partnerName||record.partnerId} (${record.activityLabel||'media'}) by ${trainerIdentity.name}`, {mediaId, partnerId:record.partnerId});
+    showToast('Upload deleted.', 'success');
+    renderAdminMain();
+  });
 }
 async function submitMediaReview(mediaId, newStatus){
   const scoreEl = document.getElementById('media-score-'+mediaId);
