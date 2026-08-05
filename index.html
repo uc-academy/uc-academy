@@ -1321,10 +1321,11 @@ async function callAiProxy({ model, max_tokens, messages, system }){
   return await resp.json();
 }
 async function runAIPhotoReview(base64, mimeType, activityLabel, criteria){
+  let rawText = null;
   try{
     const data = await callAiProxy({
       model:'claude-sonnet-4-6',
-      max_tokens:800,
+      max_tokens:1200,
       messages:[{
         role:'user',
         content:[
@@ -1341,18 +1342,21 @@ Field requirements:
 - "result": exactly one of "Pass", "Fail", "Manual Review".
 - "score": out of 5, reflecting how fully the criteria were met.
 - "confidence": exactly one of "high", "medium", "low" — how certain you are about this specific result, given what's actually visible in the photo. Use "low" whenever the photo is blurry, poorly lit, taken from a bad angle, doesn't clearly show the relevant detail, or you are genuinely uncertain either way.
-- "mistakes": a list of the SPECIFIC criteria points that were not met or are unclear, each in plain, concrete language a partner can act on (e.g. "UC logo is not visible in the photo" rather than "uniform incorrect"). Empty list only if every criterion is clearly met.
-- "feedback": 1-3 sentences explaining the reasoning behind the result, in a supportive tone, referencing what was and wasn't visible.
+- "mistakes": a list of the SPECIFIC criteria points that were not met or are unclear, each in plain, concrete language a partner can act on (e.g. "UC logo is not visible in the photo" rather than "uniform incorrect"). Empty list only if every criterion is clearly met. Keep each entry short — under 12 words.
+- "feedback": 1-2 short sentences explaining the reasoning behind the result. Keep this concise.
 
+Keep your entire response brief — this must fit well within a short JSON object. Do not add any text before or after the JSON.
 Set "result" to "Manual Review" (not a forced Pass or Fail) whenever the photo doesn't clearly show what's needed to judge it fairly.` }
         ]
       }]
     });
     const textBlock = (data.content||[]).find(c=>c.type==='text');
-    if(!textBlock) throw new Error('No text content in AI response');
-    const clean = textBlock.text.replace(/```json|```/g,'').trim();
+    if(!textBlock) throw new Error('No text content in AI response. Full response: '+JSON.stringify(data).slice(0,500));
+    rawText = textBlock.text;
+    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+    const clean = (jsonMatch ? jsonMatch[0] : rawText.replace(/```json|```/g,'')).trim();
     const parsed = JSON.parse(clean);
-    if(!['Pass','Fail','Manual Review'].includes(parsed.result)) throw new Error('Unexpected result value from AI');
+    if(!['Pass','Fail','Manual Review'].includes(parsed.result)) throw new Error('Unexpected result value from AI: '+JSON.stringify(parsed.result));
     const confidence = ['high','medium','low'].includes(parsed.confidence) ? parsed.confidence : 'medium';
     // Deterministic safety net: never let a low-confidence Pass/Fail reach a partner as a final-looking
     // result, even if the model didn't itself choose "Manual Review" - this doesn't rely on the model
@@ -1363,8 +1367,8 @@ Set "result" to "Manual Review" (not a forced Pass or Fail) whenever the photo d
       : (parsed.feedback||'');
     return { result:finalResult, score: typeof parsed.score==='number'?parsed.score:null, confidence, mistakes: Array.isArray(parsed.mistakes)?parsed.mistakes:[], feedback };
   }catch(e){
-    console.error('AI photo review failed:', e);
-    return { result:'Manual Review', score:null, confidence:'low', mistakes:[], feedback:'AI review could not be completed automatically — please review this manually.', aiError:true };
+    console.error('AI photo review failed:', e, rawText ? ('\n--- Raw AI response text ---\n'+rawText) : '(no response text received - the request itself likely failed before reaching the model)');
+    return { result:'Manual Review', score:null, confidence:'low', mistakes:[], feedback:'AI review could not be completed automatically — please review this manually.', aiError:true, aiErrorDetail: String(e && e.message || e) };
   }
 }
 function extractVideoFrames(file, frameCount){
@@ -1408,6 +1412,7 @@ function extractVideoFrames(file, frameCount){
   });
 }
 async function runAIVideoReview(frames, activityLabel, criteria){
+  let rawText = null;
   try{
     if(!frames || !frames.length) throw new Error('No frames to review');
     const content = frames.map(f=>({type:'image', source:{type:'base64', media_type:'image/jpeg', data:f}}));
@@ -1418,22 +1423,25 @@ Grading criteria (evaluate against EACH point below individually before deciding
 ${criteria || 'General correctness and safety of the work shown.'}
 
 Respond with ONLY raw JSON, no markdown formatting, no other text, in exactly this shape:
-{"result":"Pass","score":4,"confidence":"medium","mistakes":["specific criterion not met, in plain language"],"feedback":"clear explanation of why this passed or failed, referencing the specific criteria and what the frames could/couldn't show"}
+{"result":"Pass","score":4,"confidence":"medium","mistakes":["specific criterion not met, in plain language"],"feedback":"clear explanation of why this passed or failed"}
 
 Field requirements:
 - "result": exactly one of "Pass", "Fail", "Manual Review".
 - "score": out of 5.
 - "confidence": exactly one of "high", "medium", "low" — given still frames can't show motion or technique, "high" should be rare; use "low" whenever frames are unclear, poorly lit, badly framed, or don't clearly show the relevant detail.
-- "mistakes": specific criteria points not met or unclear, in plain, concrete language a partner can act on. Empty list only if every visible criterion is clearly met.
-- "feedback": 1-3 sentences explaining the reasoning, in a supportive tone, noting if something couldn't be judged from stills alone.
+- "mistakes": specific criteria points not met or unclear, in plain, concrete language. Keep each entry short — under 12 words. Empty list only if every visible criterion is clearly met.
+- "feedback": 1-2 short sentences explaining the reasoning, noting if something couldn't be judged from stills alone. Keep this concise.
 
+Keep your entire response brief — this must fit well within a short JSON object. Do not add any text before or after the JSON.
 Set "result" to "Manual Review" (not a forced Pass or Fail) whenever the frames don't clearly show what's needed to judge fairly.` });
-    const data = await callAiProxy({ model:'claude-sonnet-4-6', max_tokens:800, messages:[{ role:'user', content }] });
+    const data = await callAiProxy({ model:'claude-sonnet-4-6', max_tokens:1200, messages:[{ role:'user', content }] });
     const textBlock = (data.content||[]).find(c=>c.type==='text');
-    if(!textBlock) throw new Error('No text content in AI response');
-    const clean = textBlock.text.replace(/```json|```/g,'').trim();
+    if(!textBlock) throw new Error('No text content in AI response. Full response: '+JSON.stringify(data).slice(0,500));
+    rawText = textBlock.text;
+    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+    const clean = (jsonMatch ? jsonMatch[0] : rawText.replace(/```json|```/g,'')).trim();
     const parsed = JSON.parse(clean);
-    if(!['Pass','Fail','Manual Review'].includes(parsed.result)) throw new Error('Unexpected result value from AI');
+    if(!['Pass','Fail','Manual Review'].includes(parsed.result)) throw new Error('Unexpected result value from AI: '+JSON.stringify(parsed.result));
     const confidence = ['high','medium','low'].includes(parsed.confidence) ? parsed.confidence : 'medium';
     const finalResult = (confidence==='low' && parsed.result!=='Manual Review') ? 'Manual Review' : parsed.result;
     const feedback = finalResult==='Manual Review' && confidence==='low' && parsed.result!=='Manual Review'
@@ -1441,8 +1449,8 @@ Set "result" to "Manual Review" (not a forced Pass or Fail) whenever the frames 
       : (parsed.feedback||'');
     return { result:finalResult, score: typeof parsed.score==='number'?parsed.score:null, confidence, mistakes: Array.isArray(parsed.mistakes)?parsed.mistakes:[], feedback, sampledFrames: frames.length };
   }catch(e){
-    console.error('AI video review failed:', e);
-    return { result:'Manual Review', score:null, confidence:'low', mistakes:[], feedback:'AI review could not be completed automatically — please review this manually.', aiError:true };
+    console.error('AI video review failed:', e, rawText ? ('\n--- Raw AI response text ---\n'+rawText) : '(no response text received - the request itself likely failed before reaching the model)');
+    return { result:'Manual Review', score:null, confidence:'low', mistakes:[], feedback:'AI review could not be completed automatically — please review this manually.', aiError:true, aiErrorDetail: String(e && e.message || e) };
   }
 }
 /* ---- AI TRAINER ASSISTANT ---- */
