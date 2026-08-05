@@ -10546,7 +10546,7 @@ function renderModulePagesSection(d){
         </div>
       </div>
       <div style="padding:14px 16px;${collapsed?'display:none;':''}">
-        ${pi===0 ? renderAddRow(-1) : ''}
+        ${renderAddRow(pageBreakIdx===null ? -1 : pageBreakIdx)}
         ${blocksHtml}
       </div>
       ${collapsed ? `<p style="padding:0 16px 12px;font-size:12px;color:var(--ink-soft);">Page collapsed — click Expand to edit its content.</p>` : ''}
