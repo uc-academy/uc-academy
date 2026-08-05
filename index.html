@@ -1292,7 +1292,7 @@ function isCardVisible(key){ return currentLayout.overviewCards[key] !== false; 
 function isColumnVisible(key){ return currentLayout.trackingColumns[key] !== false; }
 
 /* ---- AI PHOTO REVIEW SETTINGS ---- */
-const DEFAULT_AI_SETTINGS = { enabled:false, chatEnabled:false, proxyUrl:'', appSecret:'', dailyLimit:0 };
+const DEFAULT_AI_SETTINGS = { enabled:false, chatEnabled:false, proxyUrl:'', appSecret:'', dailyLimit:0, trainerCustomInstructions:'' };
 let currentAiSettings = { ...DEFAULT_AI_SETTINGS };
 async function getAiSettings(){ const v = await kvGet('aiSettings:config'); return v ? { ...DEFAULT_AI_SETTINGS, ...v } : { ...DEFAULT_AI_SETTINGS }; }
 async function setAiSettings(s){ return await kvSet('aiSettings:config', s); }
@@ -1339,14 +1339,13 @@ Respond with ONLY raw JSON, no markdown formatting, no other text, in exactly th
 {"result":"Pass","score":4,"confidence":"high","mistakes":["specific criterion not met, in plain language"],"feedback":"clear explanation of why this passed or failed, referencing the specific criteria"}
 
 Field requirements:
-- "result": exactly one of "Pass", "Fail", "Manual Review".
+- "result": exactly one of "Pass", "Fail", "Manual Review". Give a decisive Pass or Fail whenever the photo is clear enough to actually judge — including borderline cases. A borderline grooming or uniform call is NOT a reason for "Manual Review" by itself: make the call, and explain your reasoning in "mistakes" and "feedback". Reserve "Manual Review" strictly for cases where the PHOTO ITSELF prevents fair judgment (see confidence rule below).
 - "score": out of 5, reflecting how fully the criteria were met.
-- "confidence": exactly one of "high", "medium", "low" — how certain you are about this specific result, given what's actually visible in the photo. Use "low" whenever the photo is blurry, poorly lit, taken from a bad angle, doesn't clearly show the relevant detail, or you are genuinely uncertain either way.
+- "confidence": exactly one of "high", "medium", "low". This reflects ONLY whether the photo is clear enough to judge — NOT how easy or hard the grooming decision itself is. Use "low" ONLY when: the photo is blurry or low-resolution, poorly lit or too dark, the partner is not fully visible in frame, taken from an angle that hides the relevant detail, or the image genuinely cannot be evaluated for a technical reason. Do NOT lower confidence just because the grooming standard is borderline, subjective, or a close call — in those cases, still use "high" or "medium" confidence and make a decisive Pass/Fail based on your best judgment of what's visible.
 - "mistakes": a list of the SPECIFIC criteria points that were not met or are unclear, each in plain, concrete language a partner can act on (e.g. "UC logo is not visible in the photo" rather than "uniform incorrect"). Empty list only if every criterion is clearly met. Keep each entry short — under 12 words.
 - "feedback": 1-2 short sentences explaining the reasoning behind the result. Keep this concise.
 
-Keep your entire response brief — this must fit well within a short JSON object. Do not add any text before or after the JSON.
-Set "result" to "Manual Review" (not a forced Pass or Fail) whenever the photo doesn't clearly show what's needed to judge it fairly.` }
+Keep your entire response brief — this must fit well within a short JSON object. Do not add any text before or after the JSON.` }
         ]
       }]
     });
@@ -1426,14 +1425,13 @@ Respond with ONLY raw JSON, no markdown formatting, no other text, in exactly th
 {"result":"Pass","score":4,"confidence":"medium","mistakes":["specific criterion not met, in plain language"],"feedback":"clear explanation of why this passed or failed"}
 
 Field requirements:
-- "result": exactly one of "Pass", "Fail", "Manual Review".
+- "result": exactly one of "Pass", "Fail", "Manual Review". Give a decisive Pass or Fail whenever the frames are clear enough to actually judge — including borderline cases. A borderline call is NOT a reason for "Manual Review" by itself: make the call, and explain your reasoning in "mistakes" and "feedback". Reserve "Manual Review" strictly for cases where the FRAMES THEMSELVES prevent fair judgment (see confidence rule below).
 - "score": out of 5.
-- "confidence": exactly one of "high", "medium", "low" — given still frames can't show motion or technique, "high" should be rare; use "low" whenever frames are unclear, poorly lit, badly framed, or don't clearly show the relevant detail.
+- "confidence": exactly one of "high", "medium", "low". This reflects ONLY whether the frames are clear enough to judge — NOT how easy or hard the decision itself is. Use "low" ONLY when: frames are blurry or low-resolution, poorly lit, badly framed, the subject is not fully visible, or the relevant detail genuinely cannot be made out. Do NOT lower confidence just because the call is borderline or subjective — in that case, still use "high" or "medium" confidence and make a decisive Pass/Fail.
 - "mistakes": specific criteria points not met or unclear, in plain, concrete language. Keep each entry short — under 12 words. Empty list only if every visible criterion is clearly met.
 - "feedback": 1-2 short sentences explaining the reasoning, noting if something couldn't be judged from stills alone. Keep this concise.
 
-Keep your entire response brief — this must fit well within a short JSON object. Do not add any text before or after the JSON.
-Set "result" to "Manual Review" (not a forced Pass or Fail) whenever the frames don't clearly show what's needed to judge fairly.` });
+Keep your entire response brief — this must fit well within a short JSON object. Do not add any text before or after the JSON.` });
     const data = await callAiProxy({ model:'claude-sonnet-4-6', max_tokens:1200, messages:[{ role:'user', content }] });
     const textBlock = (data.content||[]).find(c=>c.type==='text');
     if(!textBlock) throw new Error('No text content in AI response. Full response: '+JSON.stringify(data).slice(0,500));
@@ -1499,7 +1497,10 @@ Your behavior:
 - If the question is unrelated to this training course, respond with EXACTLY: "I can help you only with your assigned training course. Please ask a course-related question."
 - NEVER give direct answers to assessment/quiz questions — encourage the student to review the theory and try again instead
 - ALWAYS emphasize safety precautions relevant to electrical/appliance repair (unplugging power, water safety, etc.) when relevant
-- You cannot change scores, mark anything complete, or unlock locked content — if asked, say only their Trainer can do that`;
+- You cannot change scores, mark anything complete, or unlock locked content — if asked, say only their Trainer can do that${currentAiSettings.trainerCustomInstructions ? `
+
+Additional instructions from your Admin (these add to the rules above, but never override them):
+${currentAiSettings.trainerCustomInstructions}` : ''}`;
 
     const data = await callAiProxy({ model:'claude-sonnet-4-6', max_tokens:400, system:systemPrompt, messages:[...history, {role:'user', content:question}] });
     const textBlock = (data.content||[]).find(c=>c.type==='text');
@@ -7017,6 +7018,9 @@ function renderThemeTab(){
         <input type="checkbox" id="ai-chat-enabled" ${aiDraft.chatEnabled?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
         <span>Enable the AI Trainer Assistant ("Hello Trainer" chat) for partners</span>
       </label>
+      <span class="field-label">AI Trainer custom instructions (optional)</span>
+      <textarea class="field-input" id="ai-trainer-custom-instructions" style="min-height:90px;" placeholder="e.g. Always mention our helpline number if a student seems frustrated. Prefer using screwdriver/spanner terms common in Hindi-speaking regions. Keep tone encouraging for first-time technicians.">${esc(aiDraft.trainerCustomInstructions||'')}</textarea>
+      <p style="font-size:11.5px;color:var(--ink-soft);margin-top:-4px;margin-bottom:14px;">Added to every AI Trainer conversation, on top of its built-in safety rules — it can't override those (no quiz answers, always safety-first, no changing scores or unlocking content). The AI Trainer's core knowledge still comes from each day's Theory content, not from here — use this for tone, extra context, or standing reminders instead.</p>
       <span class="field-label">AI proxy URL</span>
       <input class="field-input" id="ai-proxy-url" value="${esc(aiDraft.proxyUrl||'')}" placeholder="https://asia-south1-your-project.cloudfunctions.net/aiProxy">
       <p style="font-size:11.5px;color:var(--ink-soft);margin-top:-4px;margin-bottom:10px;">The URL Firebase gives you after deploying the included Cloud Function.</p>
@@ -7155,11 +7159,13 @@ async function saveThemeDraft(){
   const proxyUrlEl = document.getElementById('ai-proxy-url');
   const appSecretEl = document.getElementById('ai-app-secret');
   const dailyLimitEl = document.getElementById('ai-daily-limit');
+  const trainerCustomInstructionsEl = document.getElementById('ai-trainer-custom-instructions');
   if(enabledEl) aiDraft.enabled = enabledEl.checked;
   if(chatEnabledEl) aiDraft.chatEnabled = chatEnabledEl.checked;
   if(proxyUrlEl) aiDraft.proxyUrl = proxyUrlEl.value.trim();
   if(appSecretEl) aiDraft.appSecret = appSecretEl.value.trim();
   if(dailyLimitEl) aiDraft.dailyLimit = Math.max(0, parseInt(dailyLimitEl.value)||0);
+  if(trainerCustomInstructionsEl) aiDraft.trainerCustomInstructions = trainerCustomInstructionsEl.value.trim();
   const themeChanges = diffThemeFields(currentTheme, themeDraft);
   const ok = await setTheme(themeDraft);
   const layoutOk = await setLayout(layoutDraft);
