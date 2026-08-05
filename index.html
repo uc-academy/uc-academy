@@ -2719,9 +2719,55 @@ async function submitAdminLogin(){
 function getSavedAdminName(){
   try{ return localStorage.getItem('uca_admin_name') || 'Admin'; }catch(e){ return 'Admin'; }
 }
+async function renderMyProfilePage(){
+  await seedDefaultCategoriesIfEmpty();
+  adminCategories = await listCategories();
+  adminCourses = await listCourses();
+  const t = trainerIdentity;
+  const roleLabel = isAdminRole()?'Admin':isCCRole()?'Content Creator':isZTRole()?'Zonal Trainer':'Trainer';
+  const employeeId = t.trainerId||t.ccId||t.ztId||'—';
+  const categoryNames = isAdminRole() ? '—'
+    : isCCRole() ? (t.assignedCategories||[]).map(id=>adminCategories[id]?.name).filter(Boolean).join(', ') || '— none —'
+    : isZTRole() ? (t.assignedCategories||[]).map(id=>adminCategories[id]?.name).filter(Boolean).join(', ') || '— none —'
+    : (t.category || '—');
+  const courseNames = isAdminRole() ? '—'
+    : (t.assignedCourses||[]).map(id=>adminCourses[id]?.name).filter(Boolean).join(', ') || '— none —';
+  const cityText = isAdminRole() ? '—' : isZTRole() ? ((t.assignedCities||[]).join(', ')||'— none —') : (t.city||'—');
+  const photoHtml = t.profilePhotoUrl
+    ? `<img src="${esc(t.profilePhotoUrl)}" style="width:84px;height:84px;border-radius:50%;object-fit:cover;border:2px solid var(--line);">`
+    : `<div style="width:84px;height:84px;border-radius:50%;background:var(--brand-light);display:flex;align-items:center;justify-content:center;font-size:28px;color:var(--brand);font-weight:700;">${esc((t.name||'?')[0].toUpperCase())}</div>`;
+  return `
+    <div class="crumb">Admin dashboard</div>
+    <h1 class="page-title">My Profile</h1>
+    <div class="card">
+      <div style="display:flex;gap:16px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">
+        ${photoHtml}
+        <div style="flex:1;min-width:180px;">
+          <p style="font-weight:700;font-size:18px;margin:0 0 2px;">${esc(t.name)}</p>
+          <p style="font-size:12.5px;color:var(--ink-soft);margin:0;">${esc(roleLabel)}</p>
+          ${t.profilePhotoUrl
+            ? `<p style="font-size:11.5px;color:var(--ink-soft);margin-top:8px;">Photo locked — ask Admin to reset it.</p>`
+            : `<label class="btn secondary small" style="cursor:pointer;margin-top:8px;display:inline-block;">Add photo<input type="file" accept="image/*" style="display:none;" onchange="handleStaffPhotoUpload(event)"></label>`}
+        </div>
+      </div>
+      <div class="form-grid" style="font-size:13px;">
+        <div><b>Employee ID</b><br>${esc(employeeId)}</div>
+        <div><b>Role</b><br>${esc(roleLabel)}</div>
+        <div><b>City</b><br>${esc(cityText)}</div>
+        <div><b>Category</b><br>${esc(categoryNames)}</div>
+        <div class="full"><b>Assigned Course(s)</b><br>${esc(courseNames)}</div>
+      </div>
+    </div>
+    <button class="btn secondary" onclick="closeMyProfile()">&larr; Back</button>
+  `;
+}
 async function handleStaffPhotoUpload(event){
   const file = event.target.files[0];
   if(!file) return;
+  if(trainerIdentity.profilePhotoUrl){
+    showToast('Your profile photo is locked. Ask an Admin to reset it first.', 'error');
+    event.target.value=''; return;
+  }
   const check = rteValidateImageFile(file);
   if(!check.ok){ showToast(check.reason, 'error'); event.target.value=''; return; }
   showToast('Uploading photo...', 'info');
@@ -2747,6 +2793,7 @@ async function handleStaffPhotoUpload(event){
   trainerIdentity.profilePhotoUrl = uploadResult.url;
   showToast('Profile photo updated.', 'success');
   renderAdminSidebar();
+  if(viewingMyProfile) renderAdminMain();
 }
 function startEditAdminName(){ editingAdminName=true; renderAdminSidebar(); const el=document.getElementById('admin-name-input'); if(el) el.focus(); }
 function saveAdminName(){
@@ -5239,6 +5286,9 @@ async function renderAdmin(){
   renderAdminMain();
 }
 let editingAdminName = false;
+let viewingMyProfile = false;
+function openMyProfile(){ viewingMyProfile = true; renderAdminMain(); }
+function closeMyProfile(){ viewingMyProfile = false; renderAdminMain(); }
 function renderAdminSidebar(){
   const tabs = adminTabDefs();
   const roleLabel = isAdminRole() ? 'Platform Administrator' : `${esc(trainerIdentity.category)} &middot; ${esc(trainerIdentity.city)}`;
@@ -5253,14 +5303,16 @@ function renderAdminSidebar(){
         ${trainerIdentity.profilePhotoUrl
           ? `<img src="${esc(trainerIdentity.profilePhotoUrl)}" style="width:38px;height:38px;border-radius:50%;object-fit:cover;flex-shrink:0;">`
           : `<span style="width:38px;height:38px;border-radius:50%;background:rgba(255,255,255,0.15);color:#fff;font-size:14px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;">${esc((trainerIdentity.name||'?')[0].toUpperCase())}</span>`}
-        <label style="cursor:pointer;font-size:11px;color:rgba(255,255,255,0.7);text-decoration:underline;">
-          ${trainerIdentity.profilePhotoUrl?'Change photo':'Add photo'}
-          <input type="file" accept="image/*" style="display:none;" onchange="handleStaffPhotoUpload(event)">
-        </label>
+        ${trainerIdentity.profilePhotoUrl
+          ? `<span style="font-size:10.5px;color:rgba(255,255,255,0.55);">Photo locked — ask Admin to reset it.</span>`
+          : `<label style="cursor:pointer;font-size:11px;color:rgba(255,255,255,0.7);text-decoration:underline;">
+              Add photo
+              <input type="file" accept="image/*" style="display:none;" onchange="handleStaffPhotoUpload(event)">
+            </label>`}
       </div>
       ${nameBlock}
       <div class="who-meta">${roleLabel}</div>
-      <div class="who-actions"><span onclick="switchId()">Exit &rarr;</span><span onclick="refreshAdminData()">Refresh</span>${isZTRole()?'<span onclick="changeZTScope()">Change Category/City</span>':''}</div>
+      <div class="who-actions"><span onclick="openMyProfile()">My Profile</span><span onclick="switchId()">Exit &rarr;</span><span onclick="refreshAdminData()">Refresh</span>${isZTRole()?'<span onclick="changeZTScope()">Change Category/City</span>':''}</div>
       ${isZTRole() && (ztSessionCategory || ztSessionCity) ? `<div style="padding:0 16px 10px;font-size:11px;color:rgba(255,255,255,0.55);">${ztSessionCategory && adminCategories[ztSessionCategory] ? esc(adminCategories[ztSessionCategory].name) : 'All categories'} &middot; ${ztSessionCity ? esc(ztSessionCity) : 'All cities'}</div>` : ''}
     </div>
     ${storageAvailable===false ? `<div class="gate-msg error" style="margin-bottom:10px;font-size:11px;"><b>Can't reach the database.</b> Check your connection and reload.</div>` : ''}
@@ -5306,6 +5358,7 @@ function setAdminTab(t){
 
 async function renderAdminMain(){
   const el = document.getElementById('main');
+  if(viewingMyProfile){ el.innerHTML = await renderMyProfilePage(); return; }
   el.innerHTML = `<div class="spinner-note">Loading...</div>`;
   if(isTrainerRole() && !trainerHasAnyAssignment()){
     el.innerHTML = `<div class="card" style="text-align:center;padding:40px 24px;">
@@ -5572,8 +5625,8 @@ function renderTrainersTab(){
       <h3>All trainers &middot; ${entries.length}</h3>
       ${entries.length===0?`<div class="empty-state">No trainers created yet. Add your first trainer above.</div>`:`
       <table class="data-table">
-        <tr><th>Name</th><th>Phone</th><th>Category</th><th>City</th><th>Assigned courses</th><th>Password</th><th>Created</th><th></th></tr>
-        ${entries.map(([id,t])=>`<tr><td>${esc(t.name)}</td><td>${esc(t.phone)}</td><td>${esc(t.category)}</td><td>${esc(t.city)}</td><td style="max-width:200px;white-space:normal;">${(t.assignedCourses||[]).map(cid=>esc(adminCourses[cid]?.name||'')).filter(Boolean).join(', ') || '<span style="color:var(--ink-soft);">— none —</span>'}</td><td class="mono">${esc(t.password)}</td><td>${fmtDateTime(t.createdAt)}</td><td><button class="btn small danger" onclick="removeTrainer('${id}')">Remove</button></td></tr>`).join('')}
+        <tr><th>Photo</th><th>Name</th><th>Phone</th><th>Category</th><th>City</th><th>Assigned courses</th><th>Password</th><th>Created</th><th></th></tr>
+        ${entries.map(([id,t])=>`<tr><td>${t.profilePhotoUrl?`<img src="${esc(t.profilePhotoUrl)}" style="width:30px;height:30px;border-radius:50%;object-fit:cover;">`:`<span style="width:30px;height:30px;border-radius:50%;background:var(--brand-light);color:var(--brand);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;">${esc((t.name||'?')[0].toUpperCase())}</span>`}</td><td>${esc(t.name)}</td><td>${esc(t.phone)}</td><td>${esc(t.category)}</td><td>${esc(t.city)}</td><td style="max-width:200px;white-space:normal;">${(t.assignedCourses||[]).map(cid=>esc(adminCourses[cid]?.name||'')).filter(Boolean).join(', ') || '<span style="color:var(--ink-soft);">— none —</span>'}</td><td class="mono">${esc(t.password)}</td><td>${fmtDateTime(t.createdAt)}</td><td style="display:flex;gap:6px;flex-wrap:wrap;">${t.profilePhotoUrl?`<button class="btn small secondary" onclick="resetStaffPhoto('trainer','${id}','${esc(t.name)}')">Reset Photo</button>`:''}<button class="btn small danger" onclick="removeTrainer('${id}')">Remove</button></td></tr>`).join('')}
       </table>`}
     </div>
   `;
@@ -5652,8 +5705,9 @@ function renderCCManageTab(){
       <h3>All Content Creators &middot; ${entries.length}</h3>
       ${entries.length===0?`<div class="empty-state">No Content Creator accounts yet.</div>`:`
       <table class="data-table">
-        <tr><th>Name</th><th>Phone</th><th>Password</th><th>Categories</th><th>Status</th><th>Created</th><th></th></tr>
+        <tr><th>Photo</th><th>Name</th><th>Phone</th><th>Password</th><th>Categories</th><th>Status</th><th>Created</th><th></th></tr>
         ${entries.map(([id,c])=>`<tr>
+          <td>${c.profilePhotoUrl?`<img src="${esc(c.profilePhotoUrl)}" style="width:30px;height:30px;border-radius:50%;object-fit:cover;">`:`<span style="width:30px;height:30px;border-radius:50%;background:var(--brand-light);color:var(--brand);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;">${esc((c.name||'?')[0].toUpperCase())}</span>`}</td>
           <td>${esc(c.name)}</td><td>${esc(c.phone)}</td><td class="mono">${esc(c.password)}</td>
           <td style="max-width:180px;white-space:normal;">${(c.assignedCategories||[]).map(cid=>esc(adminCategories[cid]?.name||'')).filter(Boolean).join(', ') || '<span style="color:var(--ink-soft);">— none —</span>'}</td>
           <td><span class="pill ${c.active!==false?'open':'closed'}">${c.active!==false?'Active':'Deactivated'}</span></td>
@@ -5663,6 +5717,7 @@ function renderCCManageTab(){
             <button class="btn small secondary" onclick="openSosCCPermissionsPanel('${id}')">SOS Permissions</button>
             <button class="btn small secondary" onclick="toggleCCActive('${id}')">${c.active!==false?'Deactivate':'Reactivate'}</button>
             <button class="btn small secondary" onclick="resetCCPassword('${id}')">Reset password</button>
+            ${c.profilePhotoUrl?`<button class="btn small secondary" onclick="resetStaffPhoto('cc','${id}','${esc(c.name)}')">Reset Photo</button>`:''}
             <button class="btn small danger" onclick="removeCC('${id}')">Remove</button>
           </td>
         </tr>`).join('')}
@@ -5883,13 +5938,14 @@ function renderZTManageTab(){
       <h3>All Zonal Training Managers &middot; ${entries.length}</h3>
       ${entries.length===0?`<div class="empty-state">No Zonal Training Manager accounts yet.</div>`:`
       <table class="data-table">
-        <tr><th>Name</th><th>Phone</th><th>Password</th><th>Assigned</th><th>Categories</th><th>Status</th><th></th></tr>
+        <tr><th>Photo</th><th>Name</th><th>Phone</th><th>Password</th><th>Assigned</th><th>Categories</th><th>Status</th><th></th></tr>
         ${entries.map(([id,z])=>{
           const zones = z.assignedZones||[]; const cities = z.assignedCities||[];
           const extraCities = cities.filter(c=>!zones.includes(CITY_ZONE[c]));
           const assignedText = [...zones, ...extraCities].join(', ') || '— none yet —';
           const catText = (z.assignedCategories||[]).map(cid=>adminCategories[cid]?.name).filter(Boolean).join(', ') || '— none —';
           return `<tr>
+          <td>${z.profilePhotoUrl?`<img src="${esc(z.profilePhotoUrl)}" style="width:30px;height:30px;border-radius:50%;object-fit:cover;">`:`<span style="width:30px;height:30px;border-radius:50%;background:var(--brand-light);color:var(--brand);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;">${esc((z.name||'?')[0].toUpperCase())}</span>`}</td>
           <td>${esc(z.name)}</td><td>${esc(z.phone)}</td><td class="mono">${esc(z.password)}</td>
           <td style="max-width:220px;white-space:normal;">${esc(assignedText)}</td>
           <td style="max-width:180px;white-space:normal;">${esc(catText)}</td>
@@ -5898,6 +5954,7 @@ function renderZTManageTab(){
             <button class="btn small secondary" onclick="editZTAssignment('${id}')">Edit zones/cities</button>
             <button class="btn small secondary" onclick="toggleZTActive('${id}')">${z.active!==false?'Deactivate':'Reactivate'}</button>
             <button class="btn small secondary" onclick="resetZTPassword('${id}')">Reset password</button>
+            ${z.profilePhotoUrl?`<button class="btn small secondary" onclick="resetStaffPhoto('zt','${id}','${esc(z.name)}')">Reset Photo</button>`:''}
             <button class="btn small danger" onclick="removeZT('${id}')">Remove</button>
           </td>
         </tr>`;}).join('')}
@@ -8660,6 +8717,22 @@ async function resetPartnerProgress(id){
     await setProgress(id, {});
     await logHistory('partner_progress_reset', `Course progress reset for ${name} by ${trainerIdentity.name}`, {partnerId:id});
     showToast(`${name}'s progress has been reset.`, 'success');
+    renderAdminMain();
+  });
+}
+async function resetStaffPhoto(role, id, name){
+  if(!isAdminRole()){ showToast('Only Admin can reset a staff profile photo.', 'error'); return; }
+  showConfirmModal(`Reset ${name}'s profile photo? This removes their current photo and lets them upload a new one.`, async ()=>{
+    if(role==='admin'){
+      await setAdminProfile({ ...(await getAdminProfile()), profilePhotoUrl:'' });
+    } else {
+      const key = role+':'+id;
+      const existing = await kvGet(key);
+      if(!existing){ showToast("Couldn't find that record.", 'error'); return; }
+      await kvSet(key, { ...existing, profilePhotoUrl:'' });
+    }
+    await logHistory('staff_photo_reset', `Profile photo reset for ${name} (${role}) by ${trainerIdentity.name}`, {role, id});
+    showToast(`${name}'s profile photo has been reset.`, 'success');
     renderAdminMain();
   });
 }
