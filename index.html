@@ -1587,6 +1587,21 @@ async function loadAndApplyDayRegistry(courseId){
 
 let currentUser = null;
 let currentUserProgress = {};
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState==='hidden' && currentUser && currentUser.id && Object.keys(currentUserProgress).length){
+    // The tab may be suspended by the OS almost immediately after this (screen lock, app switch,
+    // backgrounding) - mobile browsers can interrupt in-flight saves. Fire a save right now, as early
+    // as possible, to maximize the chance it completes before that happens. This duplicates whatever
+    // save already happened after the last action - that's intentional, it's a safety net, not the
+    // primary save path.
+    try{ setProgress(currentUser.id, currentUserProgress); }catch(e){}
+  }
+});
+window.addEventListener('pagehide', ()=>{
+  if(currentUser && currentUser.id && Object.keys(currentUserProgress).length){
+    try{ setProgress(currentUser.id, currentUserProgress); }catch(e){}
+  }
+});
 let currentUserUnlockedDays = [];
 let currentUserHomeEnabled = true;
 let currentUserDisabledDayIds = [];
