@@ -1330,11 +1330,21 @@ async function runAIPhotoReview(base64, mimeType, activityLabel, criteria){
         content:[
           {type:'image', source:{type:'base64', media_type: mimeType||'image/jpeg', data: base64}},
           {type:'text', text: `You are reviewing a washing machine repair training photo for this activity: "${activityLabel||'practical activity'}".
-Grading criteria: ${criteria || 'General correctness and safety of the work shown.'}
+
+Grading criteria (evaluate the photo against EACH point below individually before deciding overall):
+${criteria || 'General correctness and safety of the work shown.'}
+
 Respond with ONLY raw JSON, no markdown formatting, no other text, in exactly this shape:
-{"result":"Pass","score":4,"mistakes":[],"feedback":"short improvement note"}
-"result" must be exactly one of: "Pass", "Fail", "Manual Review". Score is out of 5.
-Use "Manual Review" whenever the photo is unclear, doesn't clearly show the activity, or you are not confident enough to give a Pass/Fail.` }
+{"result":"Pass","score":4,"confidence":"high","mistakes":["specific criterion not met, in plain language"],"feedback":"clear explanation of why this passed or failed, referencing the specific criteria"}
+
+Field requirements:
+- "result": exactly one of "Pass", "Fail", "Manual Review".
+- "score": out of 5, reflecting how fully the criteria were met.
+- "confidence": exactly one of "high", "medium", "low" — how certain you are about this specific result, given what's actually visible in the photo. Use "low" whenever the photo is blurry, poorly lit, taken from a bad angle, doesn't clearly show the relevant detail, or you are genuinely uncertain either way.
+- "mistakes": a list of the SPECIFIC criteria points that were not met or are unclear, each in plain, concrete language a partner can act on (e.g. "UC logo is not visible in the photo" rather than "uniform incorrect"). Empty list only if every criterion is clearly met.
+- "feedback": 1-3 sentences explaining the reasoning behind the result, in a supportive tone, referencing what was and wasn't visible.
+
+Set "result" to "Manual Review" (not a forced Pass or Fail) whenever the photo doesn't clearly show what's needed to judge it fairly.` }
         ]
       }]
     });
@@ -1343,10 +1353,18 @@ Use "Manual Review" whenever the photo is unclear, doesn't clearly show the acti
     const clean = textBlock.text.replace(/```json|```/g,'').trim();
     const parsed = JSON.parse(clean);
     if(!['Pass','Fail','Manual Review'].includes(parsed.result)) throw new Error('Unexpected result value from AI');
-    return { result:parsed.result, score: typeof parsed.score==='number'?parsed.score:null, mistakes: Array.isArray(parsed.mistakes)?parsed.mistakes:[], feedback: parsed.feedback||'' };
+    const confidence = ['high','medium','low'].includes(parsed.confidence) ? parsed.confidence : 'medium';
+    // Deterministic safety net: never let a low-confidence Pass/Fail reach a partner as a final-looking
+    // result, even if the model didn't itself choose "Manual Review" - this doesn't rely on the model
+    // remembering the instruction every time.
+    const finalResult = (confidence==='low' && parsed.result!=='Manual Review') ? 'Manual Review' : parsed.result;
+    const feedback = finalResult==='Manual Review' && confidence==='low' && parsed.result!=='Manual Review'
+      ? `${parsed.feedback||''} (Flagged for manual review — the AI's confidence in this result was low.)`.trim()
+      : (parsed.feedback||'');
+    return { result:finalResult, score: typeof parsed.score==='number'?parsed.score:null, confidence, mistakes: Array.isArray(parsed.mistakes)?parsed.mistakes:[], feedback };
   }catch(e){
     console.error('AI photo review failed:', e);
-    return { result:'Manual Review', score:null, mistakes:[], feedback:'AI review could not be completed automatically — please review this manually.', aiError:true };
+    return { result:'Manual Review', score:null, confidence:'low', mistakes:[], feedback:'AI review could not be completed automatically — please review this manually.', aiError:true };
   }
 }
 function extractVideoFrames(file, frameCount){
@@ -1394,22 +1412,37 @@ async function runAIVideoReview(frames, activityLabel, criteria){
     if(!frames || !frames.length) throw new Error('No frames to review');
     const content = frames.map(f=>({type:'image', source:{type:'base64', media_type:'image/jpeg', data:f}}));
     content.push({type:'text', text: `You are reviewing ${frames.length} still frames sampled at even intervals from a washing machine repair training video, for this activity: "${activityLabel||'practical activity'}".
-IMPORTANT: these are sampled still frames only — you cannot see motion, technique, sequence, or anything that happened between frames. Grade conservatively.
-Grading criteria: ${criteria || 'General correctness and safety of the work shown.'}
+IMPORTANT: these are sampled still frames only — you cannot see motion, technique, sequence, or anything that happened between frames. Grade conservatively, and treat this as inherently lower-confidence than a direct photo.
+
+Grading criteria (evaluate against EACH point below individually before deciding overall):
+${criteria || 'General correctness and safety of the work shown.'}
+
 Respond with ONLY raw JSON, no markdown formatting, no other text, in exactly this shape:
-{"result":"Pass","score":4,"mistakes":[],"feedback":"short improvement note"}
-"result" must be exactly one of: "Pass", "Fail", "Manual Review". Score is out of 5.
-Use "Manual Review" whenever the frames are unclear, don't clearly show the activity, or you are not confident enough to give a Pass/Fail from still frames alone.` });
+{"result":"Pass","score":4,"confidence":"medium","mistakes":["specific criterion not met, in plain language"],"feedback":"clear explanation of why this passed or failed, referencing the specific criteria and what the frames could/couldn't show"}
+
+Field requirements:
+- "result": exactly one of "Pass", "Fail", "Manual Review".
+- "score": out of 5.
+- "confidence": exactly one of "high", "medium", "low" — given still frames can't show motion or technique, "high" should be rare; use "low" whenever frames are unclear, poorly lit, badly framed, or don't clearly show the relevant detail.
+- "mistakes": specific criteria points not met or unclear, in plain, concrete language a partner can act on. Empty list only if every visible criterion is clearly met.
+- "feedback": 1-3 sentences explaining the reasoning, in a supportive tone, noting if something couldn't be judged from stills alone.
+
+Set "result" to "Manual Review" (not a forced Pass or Fail) whenever the frames don't clearly show what's needed to judge fairly.` });
     const data = await callAiProxy({ model:'claude-sonnet-4-6', max_tokens:800, messages:[{ role:'user', content }] });
     const textBlock = (data.content||[]).find(c=>c.type==='text');
     if(!textBlock) throw new Error('No text content in AI response');
     const clean = textBlock.text.replace(/```json|```/g,'').trim();
     const parsed = JSON.parse(clean);
     if(!['Pass','Fail','Manual Review'].includes(parsed.result)) throw new Error('Unexpected result value from AI');
-    return { result:parsed.result, score: typeof parsed.score==='number'?parsed.score:null, mistakes: Array.isArray(parsed.mistakes)?parsed.mistakes:[], feedback: parsed.feedback||'', sampledFrames: frames.length };
+    const confidence = ['high','medium','low'].includes(parsed.confidence) ? parsed.confidence : 'medium';
+    const finalResult = (confidence==='low' && parsed.result!=='Manual Review') ? 'Manual Review' : parsed.result;
+    const feedback = finalResult==='Manual Review' && confidence==='low' && parsed.result!=='Manual Review'
+      ? `${parsed.feedback||''} (Flagged for manual review — the AI's confidence in this result was low.)`.trim()
+      : (parsed.feedback||'');
+    return { result:finalResult, score: typeof parsed.score==='number'?parsed.score:null, confidence, mistakes: Array.isArray(parsed.mistakes)?parsed.mistakes:[], feedback, sampledFrames: frames.length };
   }catch(e){
     console.error('AI video review failed:', e);
-    return { result:'Manual Review', score:null, mistakes:[], feedback:'AI review could not be completed automatically — please review this manually.', aiError:true };
+    return { result:'Manual Review', score:null, confidence:'low', mistakes:[], feedback:'AI review could not be completed automatically — please review this manually.', aiError:true };
   }
 }
 /* ---- AI TRAINER ASSISTANT ---- */
@@ -2232,6 +2265,7 @@ async function submitPartnerId(){
   if(!result.ok){ gateError = result.reason; renderGate(); return; }
   currentDay = currentUserUnlockedDays.length ? Math.max(...currentUserUnlockedDays) : 0;
   currentTab='theory';
+  loadMyMedia(currentDay===0 ? 'home' : currentDay);
   renderApp();
 }
 async function logCheckin(session){
@@ -2639,6 +2673,7 @@ async function tryRestoreSession(){
         currentDay = currentUserUnlockedDays.length ? Math.max(...currentUserUnlockedDays) : 0;
         currentTab='theory';
       }
+      loadMyMedia(currentDay===0 ? 'home' : currentDay);
       renderApp();
       startSessionWatch();
       return true;
@@ -2786,6 +2821,9 @@ function goTo(dayId, tab){
   renderApp(); window.scrollTo(0,0);
   if(dayId>0 && dayId<98){
     refreshDayContent(dayId).then(()=>{ if(currentDay===dayId){ cleanupPlayer(); renderMainOnly(); } });
+    loadMyMedia(dayId);
+  } else if(dayId===0){
+    loadMyMedia('home');
   }
 }
 async function changePartnerLanguage(lang){
@@ -2855,7 +2893,8 @@ function setTab(tab){
 async function loadMyMedia(dayId){
   const all = await listMediaForPartner(currentUser.id);
   myMediaCache[dayId] = all.filter(m=>m.dayId===dayId);
-  if(currentTab==='assignment' && currentDay===dayId) renderMainOnly();
+  const viewingSameLocation = (dayId==='home' && currentDay===0) || currentDay===dayId;
+  if((currentTab==='assignment' || currentTab==='theory') && viewingSameLocation) renderMainOnly();
 }
 function renderMainOnly(){
   document.getElementById('main').innerHTML = renderCurrentPage();
@@ -3330,7 +3369,10 @@ function renderActivityUploadItem(dayId, item, idx){
     ${latest ? `<div style="margin-bottom:10px;">
       ${latest.type==='photo' ? `<img src="${esc(latest.url)}" style="max-width:100%;max-height:240px;border-radius:8px;">` : `<video src="${esc(latest.url)}" controls style="max-width:100%;max-height:240px;border-radius:8px;"></video>`}
       <div class="save-note">Submitted ${fmtDateTime(latest.uploadedAt)}</div>
-      ${latest.aiResult ? `<div class="save-note">AI first look: <b>${esc(latest.aiResult)}</b>${latest.aiScore!==null&&latest.aiScore!==undefined?` &middot; ${latest.aiScore}/5`:''} — your Trainer will confirm the final result.</div>` : ''}
+      ${latest.aiResult ? `<div class="save-note">AI first look: <b>${esc(latest.aiResult)}</b>${latest.aiScore!==null&&latest.aiScore!==undefined?` &middot; ${latest.aiScore}/5`:''} — your Trainer will confirm the final result.
+        ${latest.aiFeedback?`<div style="margin-top:4px;">${esc(latest.aiFeedback)}</div>`:''}
+        ${latest.aiMistakes&&latest.aiMistakes.length?`<div style="margin-top:4px;"><b>Points to check:</b><ul style="margin:4px 0 0;padding-left:18px;">${latest.aiMistakes.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>`:''}
+      </div>` : ''}
       ${latest.status==='Pass' || latest.status==='Fail' ? `<div class="save-note">Reviewed by ${esc(latest.reviewedBy||'your trainer')}${latest.reviewedAt?' &middot; '+fmtDateTime(latest.reviewedAt):''}${latest.remarks?` &middot; "${esc(latest.remarks)}"`:''}</div>` : ''}
     </div>` : ''}
     ${past.length>0 ? `<details style="margin-bottom:10px;">
@@ -3341,12 +3383,15 @@ function renderActivityUploadItem(dayId, item, idx){
         ${m.reviewedBy?`<div style="color:var(--ink-soft);">Reviewed by ${esc(m.reviewedBy)}${m.remarks?': "'+esc(m.remarks)+'"':''}</div>`:''}
       </div>`).join('')}
     </details>` : ''}
+    ${(!latest || latest.status==='Pending' || latest.status==='ResubmissionRequired') ? `
     <label class="btn amber small" style="cursor:pointer;display:inline-block;">
-      ${latest ? 'Upload again' : (item.mediaType==='video' ? '+ Upload video' : '+ Upload photo')}
+      ${latest ? (latest.status==='ResubmissionRequired' ? 'Upload new photo' : 'Replace photo') : (item.mediaType==='video' ? '+ Upload video' : '+ Upload photo')}
       <input type="file" accept="${item.mediaType==='video'?'video/*':'image/*'}" style="display:none;"
         data-day="${dayId}" data-idx="${idx}" data-mediatype="${esc(item.mediaType)}" data-label="${esc(item.activityLabel||'')}" data-criteria="${esc(item.aiCriteria||'')}"
         onchange="handleActivityUpload(event)">
     </label>
+    ${latest && latest.status==='ResubmissionRequired' ? `<p style="font-size:12px;color:var(--ink-soft);margin-top:6px;">Your trainer asked for a new submission${latest.remarks?': "'+esc(latest.remarks)+'"':''}.</p>` : ''}
+    ` : `<p style="font-size:12.5px;color:var(--ink-soft);">This submission has been reviewed. Contact your Trainer if you need to resubmit.</p>`}
   </div>`;
 }
 let lastActivityUploadFingerprint = {};
@@ -3403,13 +3448,17 @@ async function handleActivityUpload(event){
       }
     }
   }
+  const priorForThisActivity = (myMediaCache[dayId]||[]).filter(m=>m.activityIndex===idx).sort((a,b)=>new Date(b.uploadedAt)-new Date(a.uploadedAt))[0];
   const record = await createMediaRecord({
     partnerId: currentUser.id, partnerName: currentUser.name, trainerName: currentUser.trainer, trainerId: currentUser.trainerId, city: currentUser.city,
     dayId, activityIndex: idx, activityLabel: activityLabel || `Day ${dayId} activity`, type: mediaType, storagePath: path, url,
     status: 'Pending',
+    resubmissionOf: priorForThisActivity ? priorForThisActivity.id : null,
+    attemptNumber: priorForThisActivity ? (priorForThisActivity.attemptNumber||1)+1 : 1,
     aiResult: aiResult ? aiResult.result : null,
     aiScore: aiResult ? aiResult.score : null,
     aiMistakes: aiResult ? aiResult.mistakes : null,
+    aiConfidence: aiResult ? aiResult.confidence : null,
     aiFeedback: aiResult ? aiResult.feedback : null,
     aiAnalyzedAt: aiResult ? new Date().toISOString() : null,
   });
@@ -5931,6 +5980,7 @@ async function openPartnerPreview(partnerId){
   currentDay = s.currentDay;
   currentTab = 'theory';
   previewPartnerId = partnerId;
+  loadMyMedia(currentDay===0 ? 'home' : currentDay);
   renderAdminMain();
 }
 function closePartnerPreview(){
