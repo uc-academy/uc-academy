@@ -2970,12 +2970,14 @@ function renderMainOnly(){
   if(currentDay>0 && currentDay<98 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay));
   if(currentDay>0 && currentDay<98 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
   if(currentDay===0 && contentOverrides['home']) initOverrideVideoPlayers({id:'home'});
+  ensureAnyInProgressQaTimerTicking();
 }
 function renderMain(){
   document.getElementById('main').innerHTML = renderCurrentPage();
   if(currentDay>0 && currentDay<98 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay));
   if(currentDay>0 && currentDay<98 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
   if(currentDay===0 && contentOverrides['home']) initOverrideVideoPlayers({id:'home'});
+  ensureAnyInProgressQaTimerTicking();
 }
 function renderCurrentPage(){
   if(currentDay===-1) return renderProgressCardPage();
@@ -3428,6 +3430,7 @@ async function markTheoryDone(dayId){
 }
 
 let qaTimerInterval = null;
+let qaTimerIntervalKey = null;
 function quickAssessmentDurationSeconds(item){
   const mins = item.timerMinutes==='custom' ? (item.customTimerMinutes||30) : (item.timerMinutes||10);
   return mins*60;
@@ -3518,13 +3521,20 @@ async function startQuickAssessment(dayId, idx){
   dp.quickAssessments[idx] = { ...(dp.quickAssessments[idx]||{attempts:[],passed:false}), startedAt:new Date().toISOString(), currentAnswers:[], justSubmittedAttempt:false };
   await setProgress(currentUser.id, currentUserProgress);
   renderApp();
+  ensureQaTimerTicking(dayId, idx);
+}
+function ensureQaTimerTicking(dayId, idx){
+  const el = document.getElementById('qa-timer-'+idx);
+  if(!el) return; // nothing in-progress currently rendered for this block
+  if(qaTimerInterval && qaTimerIntervalKey===`${dayId}-${idx}`) return; // already ticking for this exact block
   if(qaTimerInterval) clearInterval(qaTimerInterval);
+  qaTimerIntervalKey = `${dayId}-${idx}`;
   qaTimerInterval = setInterval(()=>{
     const el = document.getElementById('qa-timer-'+idx);
-    if(!el){ clearInterval(qaTimerInterval); return; }
+    if(!el){ clearInterval(qaTimerInterval); qaTimerInterval=null; qaTimerIntervalKey=null; return; }
     const item = contentOverrides[dayId].content[idx];
     const state = currentUserProgress[dayId].quickAssessments[idx];
-    if(!state || !state.startedAt){ clearInterval(qaTimerInterval); return; }
+    if(!state || !state.startedAt){ clearInterval(qaTimerInterval); qaTimerInterval=null; qaTimerIntervalKey=null; return; }
     const durationSec = quickAssessmentDurationSeconds(item);
     const elapsedSec = (Date.now() - new Date(state.startedAt).getTime())/1000;
     const remainingSec = Math.max(0, Math.round(durationSec - elapsedSec));
@@ -3532,8 +3542,20 @@ async function startQuickAssessment(dayId, idx){
     el.textContent = `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
     const submitBtn = document.getElementById('qa-submit-btn-'+idx);
     if(submitBtn && remainingSec<=0) submitBtn.disabled = false;
-    if(remainingSec<=0){ clearInterval(qaTimerInterval); submitQuickAssessment(dayId, idx, true); }
+    if(remainingSec<=0){ clearInterval(qaTimerInterval); qaTimerInterval=null; qaTimerIntervalKey=null; submitQuickAssessment(dayId, idx, true); }
   }, 1000);
+}
+function ensureAnyInProgressQaTimerTicking(){
+  const dayId = currentDay===0 ? 'home' : currentDay;
+  const ov = contentOverrides[dayId];
+  if(!ov || !ov.content) return;
+  const dp = currentUserProgress[dayId];
+  if(!dp || !dp.quickAssessments) return;
+  ov.content.forEach((item,idx)=>{
+    if(item.type!=='quickAssessment') return;
+    const state = dp.quickAssessments[idx];
+    if(state && state.startedAt && !state.justSubmittedAttempt) ensureQaTimerTicking(dayId, idx);
+  });
 }
 async function saveQuickAssessmentAnswer(dayId, idx, qi, oi){
   const dp = currentUserProgress[dayId];
