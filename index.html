@@ -7008,7 +7008,7 @@ function renderThemeTab(){
       <h3>AI Photo &amp; Video Review <span class="pill scheduled" style="font-size:10px;">Beta</span></h3>
       <div class="gate-msg" style="margin-bottom:12px;background:var(--success-light,#EAF7EE);border-color:var(--success,#2E9E4F);">
         <b>This now runs through a server-side proxy — no API key is stored here or sent to any browser.</b>
-        <p style="margin-top:6px;">The Anthropic key lives only in your Cloud Function's server-side secrets. This app only needs the proxy's URL below, which is safe to store — it can't be used to make AI calls on its own. See the deployment guide bundled with this app for one-time setup (deploying the Cloud Function, which requires Firebase's Blaze plan). Until a proxy URL is set below, AI features stay off.</p>
+        <p style="margin-top:6px;">The Anthropic key lives only in your proxy's server-side secrets — never in this database or in any browser. This app only needs the proxy's URL below, which is safe to store — it can't be used to make AI calls on its own. See the deployment guides bundled with this app for one-time setup (Firebase Cloud Functions or Cloudflare Workers — either works the same way from the app's side; Cloudflare's free tier needs no payment plan, Firebase's requires the Blaze plan). Until a proxy URL is set below, AI features stay off.</p>
       </div>
       <label style="display:flex;gap:10px;align-items:center;margin-bottom:12px;cursor:pointer;">
         <input type="checkbox" id="ai-enabled" ${aiDraft.enabled?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
@@ -7023,7 +7023,7 @@ function renderThemeTab(){
       <p style="font-size:11.5px;color:var(--ink-soft);margin-top:-4px;margin-bottom:14px;">Added to every AI Trainer conversation, on top of its built-in safety rules — it can't override those (no quiz answers, always safety-first, no changing scores or unlocking content). The AI Trainer's core knowledge still comes from each day's Theory content, not from here — use this for tone, extra context, or standing reminders instead.</p>
       <span class="field-label">AI proxy URL</span>
       <input class="field-input" id="ai-proxy-url" value="${esc(aiDraft.proxyUrl||'')}" placeholder="https://asia-south1-your-project.cloudfunctions.net/aiProxy">
-      <p style="font-size:11.5px;color:var(--ink-soft);margin-top:-4px;margin-bottom:10px;">The URL Firebase gives you after deploying the included Cloud Function.</p>
+      <p style="font-size:11.5px;color:var(--ink-soft);margin-top:-4px;margin-bottom:10px;">The URL your proxy gives you after deploying it (Firebase Cloud Function or Cloudflare Worker).</p>
       <span class="field-label">App secret</span>
       <input class="field-input" id="ai-app-secret" type="password" value="${esc(aiDraft.appSecret||'')}" placeholder="Must match APP_SHARED_SECRET set on the function">
       <p style="font-size:11.5px;color:var(--ink-soft);margin-top:-4px;margin-bottom:10px;">A basic deterrent against casual abuse of the proxy URL — not a substitute for a spending limit on the Anthropic key itself. See the deployment guide.</p>
