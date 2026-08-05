@@ -5108,6 +5108,7 @@ const ADMIN_TAB_KEYS_DEFAULT = [
   ['support','Support','Requests & issues'],
   ['history','History','Audit log'],
   ['media','Media Review','Photo & video review'],
+  ['phototracking','Photo Tracking','Uploaded photos by partner'],
   ['aidoubts','AI Doubts','Student questions & AI answers'],
   ['batches','Batches','Track by batch'],
   ['theme','Theme & Branding','Colors, logo, fonts'],
@@ -5122,6 +5123,7 @@ const TRAINER_TAB_KEYS_DEFAULT = [
   ['partners','Partners','Your partners'],
   ['tracking','Tracking','Your partners\' scores'],
   ['media','Media Review','Photo & video review'],
+  ['phototracking','Photo Tracking','Uploaded photos by partner'],
   ['aidoubts','AI Doubts','Student questions & AI answers'],
   ['batches','Batches','Your batch history'],
   ['sosanalytics','SOS Help Analytics','Search, video & escalation insights'],
@@ -5399,6 +5401,14 @@ async function renderAdminMain(){
     const all = await listAllMedia();
     adminMediaCache = isAdminRole() ? all : all.filter(m=>m.trainerId ? m.trainerId===trainerIdentity.trainerId : m.trainerName===trainerIdentity.name);
     el.innerHTML = renderMediaReviewTab();
+  }
+  else if(adminTab==='phototracking'){
+    const all = await listAllMedia();
+    adminMediaCache = isAdminRole() ? all : all.filter(m=>m.trainerId ? m.trainerId===trainerIdentity.trainerId : m.trainerName===trainerIdentity.name);
+    await seedDefaultCategoriesIfEmpty(); adminCategories = await listCategories(); adminCourses = await listCourses();
+    adminRoster = await listRoster();
+    trackingBatchesCache = await listAllBatches();
+    el.innerHTML = renderPhotoTrackingTab();
   }
   else if(adminTab==='aidoubts'){
     const all = await listDoubts();
@@ -6734,9 +6744,16 @@ function openOverridePanel(partnerId){
   const s = computePartnerStatus(partnerId, r);
   const overlay = document.createElement('div');
   overlay.className = 'confirm-overlay';
-  overlay.innerHTML = `<div class="confirm-box" style="text-align:left;max-width:480px;">
-    <p><strong>Manual Override — ${esc(r.name)}</strong><br><span style="font-size:12.5px;color:var(--ink-soft);">Currently on Day ${s.currentDay}. These actions only unblock progress forward — they never delete or reset existing scores, attendance, or feedback.</span></p>
-    <div style="display:flex;flex-direction:column;gap:8px;margin:14px 0;">
+  overlay.innerHTML = `<div class="confirm-box" style="text-align:left;max-width:520px;max-height:85vh;overflow-y:auto;">
+    <p><strong>Manual Override — ${esc(r.name)}</strong><br><span style="font-size:12.5px;color:var(--ink-soft);">Currently on Day ${s.currentDay}.</span></p>
+
+    <span class="field-label" style="margin-top:10px;">Direct access</span>
+    <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">
+      <button class="btn secondary" onclick="openPartnerPreview('${partnerId}')">Open partner's exact learning screen</button>
+    </div>
+
+    <span class="field-label">Unblock forward (never deletes existing scores or attendance)</span>
+    <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">
       <button class="btn secondary" ${s.theoryDone?'disabled':''} onclick="promptOverrideAction('${partnerId}',${s.currentDay},'Theory','${s.theoryDone}','Mark Theory as complete?')">Mark Theory complete ${s.theoryDone?'✓ already done':''}</button>
       <button class="btn secondary" ${s.videoDone?'disabled':''} onclick="promptOverrideAction('${partnerId}',${s.currentDay},'Video','${s.videoDone}','Mark the video as watched (100%) and unlock what comes next?')">Mark Video complete ${s.videoDone?'✓ already done':''}</button>
       ${s.hasAudio?`<button class="btn secondary" ${s.audioPlayed?'disabled':''} onclick="promptOverrideAction('${partnerId}',${s.currentDay},'Audio','${s.audioPlayed}','Mark the audio as played?')">Mark Audio complete ${s.audioPlayed?'✓ already done':''}</button>`:''}
@@ -6744,6 +6761,26 @@ function openOverridePanel(partnerId){
       <button class="btn secondary" ${s.assessUnlocked.includes(s.currentDay)?'disabled':''} onclick="promptOverrideAction('${partnerId}',${s.currentDay},'Assessment Unlock','locked','Unlock this day\\'s assessment for the partner?')">Unlock this day's Assessment ${s.assessUnlocked.includes(s.currentDay)?'✓ already unlocked':''}</button>
       <button class="btn amber" ${s.unlocked.includes(s.currentDay+1)?'disabled':''} onclick="promptOverrideAction('${partnerId}',${s.currentDay+1},'Day Unlock','locked','Unlock Day ${s.currentDay+1} for the partner?')">Unlock Day ${s.currentDay+1} ${s.unlocked.includes(s.currentDay+1)?'✓ already unlocked':''}</button>
     </div>
+
+    <span class="field-label">Lock (removes access already granted)</span>
+    <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">
+      <button class="btn danger" ${!s.unlocked.includes(s.currentDay)?'disabled':''} onclick="promptLockAction('${partnerId}',${s.currentDay},'day','Lock Day ${s.currentDay} for this partner? They will lose access until re-unlocked.')">Lock Day ${s.currentDay}</button>
+      <button class="btn danger" ${!s.assessUnlocked.includes(s.currentDay)?'disabled':''} onclick="promptLockAction('${partnerId}',${s.currentDay},'assessment','Lock this day\\'s Assessment for this partner?')">Lock this day's Assessment</button>
+    </div>
+
+    <span class="field-label">Reset (clears existing progress for Day ${s.currentDay} — cannot be undone)</span>
+    <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">
+      <button class="btn danger" onclick="promptResetComponent('${partnerId}',${s.currentDay},'video','Reset video progress for Day ${s.currentDay}? The partner will need to rewatch from 0%.')">Reset Video Progress</button>
+      <button class="btn danger" onclick="promptResetComponent('${partnerId}',${s.currentDay},'quickAssessment','Reset all Quick Assessment attempts for Day ${s.currentDay}? The partner will need to retake them.')">Reset Quick Assessment</button>
+      <button class="btn danger" onclick="promptResetComponent('${partnerId}',${s.currentDay},'assignment','Reset assignment progress for Day ${s.currentDay}? This clears task checkmarks, timers, uploaded task photos, and notes.')">Reset Assignment</button>
+    </div>
+
+    <span class="field-label">Move partner</span>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:14px;">
+      <input class="field-input" style="margin-bottom:0;width:80px;" id="override-move-to-day" type="number" min="1" placeholder="Day #">
+      <button class="btn secondary" onclick="promptMoveToDay('${partnerId}')">Unlock &amp; move to this day</button>
+    </div>
+
     <div class="confirm-actions"><button class="btn secondary" id="override-panel-close">Close</button></div>
   </div>`;
   document.body.appendChild(overlay);
@@ -6797,6 +6834,61 @@ function promptOverrideAction(partnerId, dayId, activity, previousStatus, confir
 }
 function ensureDayInProgObj(prog, dayId){
   if(!prog[dayId]) prog[dayId] = { theoryDone:false, videoDone:false, videoPct:0, audioPlayed:false, tasksChecked:[], quizSubmitted:false };
+}
+function promptLockAction(partnerId, dayId, kind, confirmMsg){
+  document.querySelectorAll('.confirm-overlay').forEach(o=>o.remove());
+  promptForResetReason(confirmMsg, async (reason)=>{
+    const r = adminRoster[partnerId];
+    const key = slug(r.city)+'__'+slug(r.trainer);
+    if(kind==='day'){
+      const days = new Set(adminUnlocks[key] || []);
+      days.delete(dayId);
+      await setUnlock(r.city, r.trainer, [...days]);
+    } else if(kind==='assessment'){
+      const days = new Set(adminAssessmentUnlocks[key] || []);
+      days.delete(dayId);
+      await setAssessmentUnlock(r.city, r.trainer, [...days]);
+    }
+    await logProgressOverride(partnerId, r?r.name:partnerId, dayId, kind==='day'?'Day Lock':'Assessment Lock', 'unlocked', 'locked', reason);
+    showToast(`${kind==='day'?'Day':'Assessment'} locked for ${r?r.name:partnerId}.`, 'success');
+    renderAdminMain();
+  });
+}
+function promptResetComponent(partnerId, dayId, component, confirmMsg){
+  document.querySelectorAll('.confirm-overlay').forEach(o=>o.remove());
+  promptForResetReason(confirmMsg, async (reason)=>{
+    const r = adminRoster[partnerId];
+    const prog = await getProgress(partnerId);
+    ensureDayInProgObj(prog, dayId);
+    const dp = prog[dayId];
+    if(component==='video'){
+      dp.videoDone = false; dp.videoPct = 0; dp.videoItemProgress = {}; dp.videoRanges = []; dp.videoLastTime = null;
+    } else if(component==='quickAssessment'){
+      dp.quickAssessments = {};
+    } else if(component==='assignment'){
+      dp.tasksChecked = []; dp.taskTimers = {}; dp.taskPhotos = {}; dp.taskNotes = {};
+    }
+    await setProgress(partnerId, prog);
+    await logProgressOverride(partnerId, r?r.name:partnerId, dayId, `Reset: ${component}`, 'had progress', 'reset', reason);
+    showToast(`${component==='quickAssessment'?'Quick Assessment':component.charAt(0).toUpperCase()+component.slice(1)} reset for ${r?r.name:partnerId} on Day ${dayId}.`, 'success');
+    renderAdminMain();
+  });
+}
+function promptMoveToDay(partnerId){
+  const input = document.getElementById('override-move-to-day');
+  const dayId = parseInt(input && input.value);
+  if(!dayId || dayId<1){ showToast('Enter a valid day number.', 'error'); return; }
+  document.querySelectorAll('.confirm-overlay').forEach(o=>o.remove());
+  promptForResetReason(`Unlock and move this partner to Day ${dayId}?`, async (reason)=>{
+    const r = adminRoster[partnerId];
+    const key = slug(r.city)+'__'+slug(r.trainer);
+    const days = new Set(adminUnlocks[key] || []);
+    days.add(dayId);
+    await setUnlock(r.city, r.trainer, [...days]);
+    await logProgressOverride(partnerId, r?r.name:partnerId, dayId, 'Move to Day', 'elsewhere', 'moved', reason);
+    showToast(`${r?r.name:partnerId} can now access Day ${dayId}.`, 'success');
+    renderAdminMain();
+  });
 }
 function openEscalationForm(partnerId){
   const r = adminRoster[partnerId];
@@ -7474,6 +7566,89 @@ async function exportSecurityLogsExcel(){
   XLSX.writeFile(wb, 'security-login-activity-'+todayStr()+'.xlsx');
 }
 
+let photoTrackingFilters = { city:'', categoryId:'', courseId:'', batchId:'', trainer:'', partnerId:'' };
+function setPhotoTrackingFilter(key, value){
+  photoTrackingFilters[key] = value;
+  renderAdminMain();
+}
+function renderPhotoTrackingTab(){
+  const photos = adminMediaCache.filter(m=>m.type==='photo');
+  const enriched = photos.map(m=>{
+    const roster = adminRoster[m.partnerId] || {};
+    const course = roster.courseId ? adminCourses[roster.courseId] : null;
+    const category = course ? adminCategories[course.categoryId] : null;
+    const batch = roster.batchId ? trackingBatchesCache.find(b=>b.id===roster.batchId) : null;
+    return { ...m, _city: roster.city||'', _categoryName: category?category.name:'', _courseName: course?course.name:'', _batchNumber: batch?batch.batchNumber:(roster.batchNumber||''), _profilePhotoUrl: roster.profilePhotoUrl||'' };
+  });
+  const cities = [...new Set(enriched.map(m=>m._city).filter(Boolean))].sort();
+  const trainers = [...new Set(enriched.map(m=>m.trainerName).filter(Boolean))].sort();
+  const partners = [...new Set(enriched.map(m=>m.partnerId).filter(Boolean))].map(pid=>({id:pid, name:(adminRoster[pid]||{}).name||pid}));
+  let filtered = enriched;
+  if(photoTrackingFilters.city) filtered = filtered.filter(m=>m._city===photoTrackingFilters.city);
+  if(photoTrackingFilters.categoryId) filtered = filtered.filter(m=>{ const r=adminRoster[m.partnerId]; const c=r&&r.courseId?adminCourses[r.courseId]:null; return c && c.categoryId===photoTrackingFilters.categoryId; });
+  if(photoTrackingFilters.courseId) filtered = filtered.filter(m=>(adminRoster[m.partnerId]||{}).courseId===photoTrackingFilters.courseId);
+  if(photoTrackingFilters.batchId) filtered = filtered.filter(m=>(adminRoster[m.partnerId]||{}).batchId===photoTrackingFilters.batchId);
+  if(photoTrackingFilters.trainer) filtered = filtered.filter(m=>m.trainerName===photoTrackingFilters.trainer);
+  if(photoTrackingFilters.partnerId) filtered = filtered.filter(m=>m.partnerId===photoTrackingFilters.partnerId);
+
+  const byPartner = {};
+  filtered.forEach(m=>{ if(!byPartner[m.partnerId]) byPartner[m.partnerId] = []; byPartner[m.partnerId].push(m); });
+
+  const photoCard = (m)=>`
+    <div style="border:1px solid var(--line);border-radius:10px;padding:10px;width:220px;">
+      <img src="${esc(m.url)}" style="width:100%;height:140px;object-fit:cover;border-radius:6px;cursor:zoom-in;margin-bottom:8px;" onclick="openPhotoZoom('${esc(m.url)}')">
+      <p style="font-size:12px;font-weight:600;margin:0 0 4px;">${esc(m.activityLabel||'Photo')}</p>
+      <p style="font-size:11px;color:var(--ink-soft);margin:0 0 4px;">Day ${m.dayId} &middot; ${fmtDateTime(m.uploadedAt)}</p>
+      <span class="pill ${mediaStatusPillClass(m.status)}" style="font-size:10px;">${MEDIA_STATUS_LABEL[m.status]||m.status}</span>
+      ${m.aiResult ? `<p style="font-size:10.5px;color:var(--ink-soft);margin:4px 0 0;">AI: ${esc(m.aiResult)}${m.aiScore!==null&&m.aiScore!==undefined?' · '+m.aiScore+'/5':''}</p>`:''}
+      ${m.remarks ? `<p style="font-size:10.5px;color:var(--ink-soft);margin:4px 0 0;">${esc(m.remarks)}</p>`:''}
+      <div style="display:flex;gap:6px;margin-top:8px;">
+        <a href="${esc(m.url)}" target="_blank" rel="noopener" class="btn small secondary" style="text-decoration:none;">Download</a>
+      </div>
+    </div>`;
+
+  return `
+    <div class="crumb">${isAdminRole()?'Admin dashboard':'Trainer dashboard'}</div>
+    <h1 class="page-title">Photo Tracking</h1>
+    <p class="page-sub">Every photo uploaded by a partner, in one place — organized by partner with full review context. ${filtered.length} photo${filtered.length===1?'':'s'} shown.</p>
+
+    <div class="card">
+      <div class="form-grid">
+        <div><span class="field-label">City</span><select class="field-input" onchange="setPhotoTrackingFilter('city', this.value)"><option value="">All cities</option>${cities.map(c=>`<option value="${esc(c)}" ${photoTrackingFilters.city===c?'selected':''}>${esc(c)}</option>`).join('')}</select></div>
+        <div><span class="field-label">Category</span><select class="field-input" onchange="setPhotoTrackingFilter('categoryId', this.value)"><option value="">All categories</option>${Object.entries(adminCategories).map(([id,c])=>`<option value="${id}" ${photoTrackingFilters.categoryId===id?'selected':''}>${esc(c.name)}</option>`).join('')}</select></div>
+        <div><span class="field-label">Course</span><select class="field-input" onchange="setPhotoTrackingFilter('courseId', this.value)"><option value="">All courses</option>${Object.entries(adminCourses).map(([id,c])=>`<option value="${id}" ${photoTrackingFilters.courseId===id?'selected':''}>${esc(c.name)}</option>`).join('')}</select></div>
+        <div><span class="field-label">Batch</span><select class="field-input" onchange="setPhotoTrackingFilter('batchId', this.value)"><option value="">All batches</option>${trackingBatchesCache.map(b=>`<option value="${b.id}" ${photoTrackingFilters.batchId===b.id?'selected':''}>Batch ${b.batchNumber} — ${esc(b.trainerName)}</option>`).join('')}</select></div>
+        <div><span class="field-label">Trainer</span><select class="field-input" onchange="setPhotoTrackingFilter('trainer', this.value)"><option value="">All trainers</option>${trainers.map(t=>`<option value="${esc(t)}" ${photoTrackingFilters.trainer===t?'selected':''}>${esc(t)}</option>`).join('')}</select></div>
+        <div><span class="field-label">Partner</span><select class="field-input" onchange="setPhotoTrackingFilter('partnerId', this.value)"><option value="">All partners</option>${partners.map(p=>`<option value="${esc(p.id)}" ${photoTrackingFilters.partnerId===p.id?'selected':''}>${esc(p.name)}</option>`).join('')}</select></div>
+      </div>
+      ${Object.values(photoTrackingFilters).some(Boolean) ? `<button class="btn small secondary" onclick="photoTrackingFilters={city:'',categoryId:'',courseId:'',batchId:'',trainer:'',partnerId:''};renderAdminMain();">Clear filters</button>` : ''}
+    </div>
+
+    ${Object.keys(byPartner).length===0 ? `<div class="card"><div class="empty-state">No photos match this filter yet.</div></div>` :
+      Object.entries(byPartner).map(([partnerId, records])=>{
+        const r = adminRoster[partnerId] || {};
+        const first = records[0];
+        return `<div class="card">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">
+            ${r.profilePhotoUrl?`<img src="${esc(r.profilePhotoUrl)}" style="width:40px;height:40px;border-radius:50%;object-fit:cover;">`:`<span style="width:40px;height:40px;border-radius:50%;background:var(--brand-light);color:var(--brand);font-weight:700;display:flex;align-items:center;justify-content:center;">${esc((r.name||'?')[0].toUpperCase())}</span>`}
+            <div>
+              <p style="font-weight:700;margin:0;">${esc(r.name||partnerId)} <span class="mono" style="font-weight:400;font-size:12px;color:var(--ink-soft);">(${esc(partnerId)})</span></p>
+              <p style="font-size:11.5px;color:var(--ink-soft);margin:0;">${esc(first._batchNumber?'Batch '+first._batchNumber+' · ':'')}${esc(first._categoryName)}${first._courseName?' — '+esc(first._courseName):''} &middot; ${esc(r.trainer||'')}</p>
+            </div>
+          </div>
+          <div style="display:flex;gap:12px;flex-wrap:wrap;">${records.map(photoCard).join('')}</div>
+        </div>`;
+      }).join('')}
+  `;
+}
+function openPhotoZoom(url){
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.style.cursor = 'zoom-out';
+  overlay.innerHTML = `<img src="${esc(url)}" style="max-width:92vw;max-height:92vh;border-radius:8px;">`;
+  overlay.addEventListener('click', ()=>overlay.remove());
+  document.body.appendChild(overlay);
+}
 function renderMediaReviewTab(){
   const filtered = mediaFilterStatus ? adminMediaCache.filter(m=>m.status===mediaFilterStatus) : adminMediaCache;
   const pending = filtered.filter(m=>m.status==='Pending');
