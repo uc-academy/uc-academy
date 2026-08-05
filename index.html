@@ -1687,6 +1687,61 @@ function isDayStarted(d){
   const dp = currentUserProgress[d];
   return dp.theoryDone || dp.videoPct>0 || dp.quizSubmitted || dp.tasksChecked.some(Boolean);
 }
+function computeDayResult(dayId, ov){
+  ensureDay(dayId);
+  const dp = currentUserProgress[dayId];
+  if(!ov){
+    // Legacy day with no course-scoped content override - fall back to the old quiz-based system
+    if(!isDayStarted(dayId)) return { status:'notStarted', label:'Not Started', percent:null };
+    if(!dp.quizSubmitted) return { status:'inProgress', label:'In Progress', percent:null };
+    const r = ratingFromPct(dp.quizPct);
+    return { status: r.pass?'pass':'fail', label: ratingLabel(r), percent: dp.quizPct };
+  }
+  const items = ov.content || [];
+  const videoIndices = items.map((it,i)=>(it.type==='video' && it.url && (it.watchSettings?.mandatory!==false))?i:null).filter(i=>i!==null);
+  const hasAudio = items.some(it=>it.type==='audio');
+  const qaIndices = items.map((it,i)=>(it.type==='quickAssessment' && it.enabled!==false && it.mandatory!==false)?i:null).filter(i=>i!==null);
+  const optionQIndices = items.map((it,i)=>((it.type==='checkboxQuestion'||it.type==='mcqQuestion') && it.enabled!==false && it.mandatory!==false)?i:null).filter(i=>i!==null);
+
+  const anyStarted = dp.theoryDone || dp.videoPct>0 || videoIndices.some(i=>dp.videoItemProgress[i]?.done) ||
+    qaIndices.some(i=>dp.quickAssessments && dp.quickAssessments[i] && dp.quickAssessments[i].attempts && dp.quickAssessments[i].attempts.length) ||
+    optionQIndices.some(i=>(dp.checkboxQuestions&&dp.checkboxQuestions[i]&&dp.checkboxQuestions[i].submitted) || (dp.mcqQuestions&&dp.mcqQuestions[i]&&dp.mcqQuestions[i].submitted));
+  if(!anyStarted) return { status:'notStarted', label:'Not Started', percent:null };
+
+  const allVideosDone = videoIndices.every(i => dp.videoItemProgress[i]?.done);
+  const allQAPassed = qaIndices.every(i => dp.quickAssessments && dp.quickAssessments[i] && dp.quickAssessments[i].passed);
+  const allOptionQSubmitted = optionQIndices.every(i => (dp.checkboxQuestions&&dp.checkboxQuestions[i]&&dp.checkboxQuestions[i].submitted) || (dp.mcqQuestions&&dp.mcqQuestions[i]&&dp.mcqQuestions[i].submitted));
+  const complete = allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed && allOptionQSubmitted;
+  if(!complete) return { status:'inProgress', label:'In Progress', percent:null };
+
+  // Compute an aggregate score from mandatory Quick Assessments (the only blocks with a real percent score)
+  const qaScores = qaIndices.map(i => dp.quickAssessments[i]).filter(s=>s && s.attempts && s.attempts.length)
+    .map(s => s.attempts[s.attempts.length-1].percent);
+  const percent = qaScores.length ? Math.round(qaScores.reduce((a,b)=>a+b,0)/qaScores.length) : 100;
+  const anyQAFailed = qaIndices.some(i => dp.quickAssessments[i] && !dp.quickAssessments[i].passed);
+  const r = ratingFromPct(percent);
+  return { status: (r.pass && !anyQAFailed) ? 'pass' : 'fail', label: ratingLabel(r), percent };
+}
+async function getCourseById(id){ return id ? await kvGet('course:'+id) : null; }
+async function getCategoryById(id){ return id ? await kvGet('category:'+id) : null; }
+async function handleProfilePhotoUpload(event){
+  const file = event.target.files[0];
+  if(!file) return;
+  const check = rteValidateImageFile(file);
+  if(!check.ok){ showToast(check.reason, 'error'); event.target.value=''; return; }
+  showToast('Uploading photo...', 'info');
+  const path = `profile-photos/${currentUser.id}/${Date.now()}_${file.name}`;
+  const uploadResult = await uploadFile(path, file);
+  event.target.value = '';
+  if(!uploadResult.ok){ showToast(`Upload failed — try again. (${uploadResult.error})`, 'error'); return; }
+  const existing = await getRosterEntry(currentUser.id);
+  if(!existing){ showToast("Couldn't find your partner record.", 'error'); return; }
+  const ok = await setRosterEntry(currentUser.id, { ...existing, profilePhotoUrl: uploadResult.url });
+  if(!ok){ showToast("Couldn't save your photo — check your connection.", 'error'); return; }
+  currentUser.profilePhotoUrl = uploadResult.url;
+  showToast('Profile photo updated.', 'success');
+  renderApp();
+}
 function isDayUnlocked(d){ return currentUserUnlockedDays.includes(d); }
 function isAssessmentUnlocked(d){ return currentUserAssessmentUnlockedDays.includes(d); }
 
@@ -2225,7 +2280,7 @@ async function loginAsPartner(id, opts){
     return { ok:false, reason:`No class has been scheduled yet for you. Please check with your trainer.` };
   }
   const s = result.session;
-  currentUser = { id, name:r.name, officeId:r.officeId||'', city:r.city, trainer:r.trainer, trainerId:r.trainerId||null, courseId:r.courseId||null, preferredLanguage:r.preferredLanguage||DEFAULT_LANGUAGE, day:s.day, open:s.open, close:s.close };
+  currentUser = { id, name:r.name, officeId:r.officeId||'', city:r.city, trainer:r.trainer, trainerId:r.trainerId||null, courseId:r.courseId||null, preferredLanguage:r.preferredLanguage||DEFAULT_LANGUAGE, day:s.day, open:s.open, close:s.close, profilePhotoUrl:r.profilePhotoUrl||'', batchNumber:r.batchNumber||null };
   await seedDefaultLanguageIfEmpty();
   const langs = await listLanguages();
   partnerAvailableLanguages = Object.values(langs).filter(l=>l.active!==false).map(l=>l.name);
@@ -2758,6 +2813,10 @@ function renderSidebar(){
       <div class="knob" style="border-color:var(--amber);"></div>
       <div class="nav-text"><div class="nav-title">Home</div><div class="nav-sub">Welcome & Safety</div></div>
     </div>` : ''}
+    <div class="knob-row ${currentDay===-1?'active':''}" onclick="goToProgressCard()">
+      <div class="knob" style="border-color:var(--brand);"></div>
+      <div class="nav-text"><div class="nav-title">My Progress</div><div class="nav-sub">Profile & results</div></div>
+    </div>
   `;
   html += `<div class="nav-section-label">Course Days</div>`;
   DAYS.filter(d=>!currentUserDisabledDayIds.includes(d.id)).forEach(d=>html+=knobRow(d));
@@ -2919,6 +2978,7 @@ function renderMain(){
   if(currentDay===0 && contentOverrides['home']) initOverrideVideoPlayers({id:'home'});
 }
 function renderCurrentPage(){
+  if(currentDay===-1) return renderProgressCardPage();
   if(currentDay===0) return renderHome();
   if(currentDay===98) return renderKeyLearningPoints();
   if(currentDay===99) return renderResult();
@@ -2949,6 +3009,210 @@ function renderHomeContentItem(item, idx, dp, items){
     return renderOptionQuestionBlock('home', item, idx, dp);
   }
   return '';
+}
+let progressCardData = null;
+async function loadProgressCardData(){
+  const course = await getCourseById(currentUser.courseId);
+  const category = course ? await getCategoryById(course.categoryId) : null;
+  const dayIds = currentUser.courseId ? await getDayRegistry(currentUser.courseId) : DAYS.map(d=>d.id);
+  const dayResults = [];
+  for(const dayId of dayIds){
+    let ov = contentOverrides[dayId];
+    if(!ov && currentUser.courseId){
+      const result = await getContentOverrideWithFallback(dayId, currentUser.courseId, currentUser.preferredLanguage);
+      ov = result.data ? migrateOldOverrideToUnified(result.data) : null;
+    }
+    const dayTitle = ov ? ov.title : (DAYS.find(d=>d.id===dayId)?.title || `Day ${dayId}`);
+    const unlocked = isDayUnlocked(dayId);
+    const result = unlocked ? computeDayResult(dayId, ov) : { status:'locked', label:'Locked', percent:null };
+    dayResults.push({ dayId, title: dayTitle, ...result });
+  }
+  const startedOrDone = dayResults.filter(d=>d.status!=='locked' && d.status!=='notStarted');
+  const completedDays = dayResults.filter(d=>d.status==='pass' || d.status==='fail');
+  const passedDays = dayResults.filter(d=>d.status==='pass');
+  const failedDays = dayResults.filter(d=>d.status==='fail');
+  const totalDays = dayResults.length;
+  const overallPercent = totalDays ? Math.round((completedDays.length/totalDays)*100) : 0;
+  const scoredDays = completedDays.filter(d=>d.percent!==null);
+  const avgScore = scoredDays.length ? Math.round(scoredDays.reduce((a,d)=>a+d.percent,0)/scoredDays.length) : null;
+  const overallGrade = avgScore!==null ? ratingLabel(ratingFromPct(avgScore)) : '—';
+  const overallStatus = completedDays.length===0 ? 'notStarted' : (completedDays.length<totalDays ? 'inProgress' : (failedDays.length===0 ? 'pass' : 'fail'));
+
+  progressCardData = {
+    courseName: course ? course.name : '—', categoryName: category ? category.name : '—',
+    dayResults, totalDays, completedCount: completedDays.length, passedCount: passedDays.length, failedCount: failedDays.length,
+    overallPercent, overallGrade, overallStatus, avgScore,
+  };
+}
+function goToProgressCard(){
+  loadProgressCardData().then(()=>{ if(currentDay===-1) renderMainOnly(); });
+  currentDay = -1; currentTab='theory';
+  closeSidebar();
+  persistPartnerPosition();
+  renderApp(); window.scrollTo(0,0);
+}
+const STATUS_DOT = { pass:'🟢', inProgress:'🟡', fail:'🔴', notStarted:'🔵', locked:'⚪' };
+function renderProgressCardPage(){
+  if(!progressCardData) return `<div class="spinner-note">Loading your progress...</div>`;
+  const d = progressCardData;
+  const photoHtml = currentUser.profilePhotoUrl
+    ? `<img src="${esc(currentUser.profilePhotoUrl)}" style="width:84px;height:84px;border-radius:50%;object-fit:cover;border:2px solid var(--line);">`
+    : `<div style="width:84px;height:84px;border-radius:50%;background:var(--brand-light);display:flex;align-items:center;justify-content:center;font-size:28px;color:var(--brand);font-weight:700;">${esc((currentUser.name||'?')[0].toUpperCase())}</div>`;
+  const progressBar = (pct, color) => `<div style="background:var(--line);border-radius:6px;height:10px;overflow:hidden;margin:4px 0 10px;"><div style="width:${Math.max(0,Math.min(100,pct||0))}%;height:100%;background:${color||'var(--brand)'};"></div></div>`;
+
+  return `
+    <div class="card">
+      <h3 style="margin-bottom:14px;">My Progress</h3>
+      <div style="display:flex;gap:16px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">
+        ${photoHtml}
+        <div style="flex:1;min-width:180px;">
+          <p style="font-weight:700;font-size:16px;margin:0 0 2px;">${esc(currentUser.name)}</p>
+          <p style="font-size:12.5px;color:var(--ink-soft);margin:0;">Partner ID: ${esc(currentUser.id)}</p>
+          <label class="btn secondary small" style="cursor:pointer;margin-top:8px;display:inline-block;">
+            ${currentUser.profilePhotoUrl?'Change photo':'Upload photo'}
+            <input type="file" accept="image/*" style="display:none;" onchange="handleProfilePhotoUpload(event)">
+          </label>
+        </div>
+      </div>
+      <div class="form-grid" style="font-size:13px;">
+        <div><b>Category</b><br>${esc(d.categoryName)}</div>
+        <div><b>Course</b><br>${esc(d.courseName)}</div>
+        <div><b>Batch</b><br>${currentUser.batchNumber?('Batch '+esc(String(currentUser.batchNumber))):'—'}</div>
+        <div><b>Trainer</b><br>${esc(currentUser.trainer||'—')}</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Learning Progress</h3>
+      <p style="font-size:13px;margin-bottom:2px;">Overall course completion — ${d.overallPercent}%</p>
+      ${progressBar(d.overallPercent)}
+      <div class="form-grid" style="font-size:13px;">
+        <div><b>Status</b><br>${STATUS_DOT[d.overallStatus]} ${d.overallStatus==='pass'?'Pass':d.overallStatus==='fail'?'Needs attention':d.overallStatus==='inProgress'?'In Progress':'Not Started'}</div>
+        <div><b>Current day</b><br>${currentUser.day>0?('Day '+currentUser.day):'—'}</div>
+        <div><b>Days completed</b><br>${d.completedCount} / ${d.totalDays}</div>
+        <div><b>Overall grade</b><br>${esc(d.overallGrade)}</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Day-Wise Results</h3>
+      ${d.dayResults.map(r=>`
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line);">
+          <span>${STATUS_DOT[r.status]} Day ${r.dayId} — ${esc(r.title)}</span>
+          <span style="font-size:12.5px;color:var(--ink-soft);">${r.status==='locked'?'Locked':r.status==='notStarted'?'Not Started':r.status==='inProgress'?'In Progress':`${r.label}${r.percent!==null?' · '+r.percent+'%':''}`}</span>
+        </div>
+      `).join('')}
+    </div>
+
+    <div class="card">
+      <h3>Performance Summary</h3>
+      <div class="form-grid" style="font-size:13px;">
+        <div><b>Final grade</b><br>${esc(d.overallGrade)}</div>
+        <div><b>Days passed</b><br>${d.passedCount}</div>
+        <div><b>Days needing attention</b><br>${d.failedCount}</div>
+        <div><b>Average assessment score</b><br>${d.avgScore!==null?d.avgScore+'%':'—'}</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Certificate &amp; Report</h3>
+      <p style="font-size:13px;color:var(--ink-soft);">Report Card: <b>${d.completedCount>0?'Available':'Not Available'}</b> &middot; Certificate: <b>${(d.overallStatus==='pass' && d.completedCount===d.totalDays && d.totalDays>0)?'Unlocked':'Locked'}</b></p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;">
+        <button class="btn secondary small" onclick="runReportCardExport()" ${d.completedCount===0?'disabled':''}>Download Report Card</button>
+        ${(d.overallStatus==='pass' && d.completedCount===d.totalDays && d.totalDays>0)
+          ? `<button class="btn amber small" onclick="runCertificateExport()">Download Certificate</button>`
+          : `<button class="btn secondary small" disabled title="Unlocks once all days are passed">Download Certificate (Locked)</button>`}
+      </div>
+      <p id="progress-export-note" style="font-size:12px;color:var(--ink-soft);margin-top:8px;"></p>
+    </div>
+  `;
+}
+async function runReportCardExport(){
+  const note = document.getElementById('progress-export-note');
+  const d = progressCardData;
+  if(!d){ if(note) note.textContent = 'Progress data is still loading — try again in a moment.'; return; }
+  const rows = d.dayResults.map(r=>`
+    <tr>
+      <td>Day ${r.dayId} — ${esc(r.title)}</td>
+      <td>${r.status==='locked'?'Locked':r.status==='notStarted'?'Not Started':r.status==='inProgress'?'In Progress':esc(r.label)}</td>
+      <td>${r.percent!==null?r.percent+'%':'—'}</td>
+    </tr>`).join('');
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Report Card — ${esc(currentUser.name)}</title>
+  <style>
+    @page { margin: 20mm 16mm; }
+    body { font-family: Arial, Helvetica, sans-serif; color:#1a1a2e; font-size:13px; line-height:1.5; }
+    h1 { font-size:22px; margin-bottom:2px; } h2 { font-size:15px; color:#555; font-weight:normal; margin-top:0; }
+    table { width:100%; border-collapse:collapse; margin-top:16px; }
+    th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #ddd; font-size:12.5px; }
+    th { background:#F5F3FB; }
+    .rc-header { display:flex; justify-content:space-between; align-items:flex-start; border-bottom:2px solid #5B3FA3; padding-bottom:14px; margin-bottom:16px; }
+    .rc-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px 24px; margin-bottom:16px; font-size:13px; }
+    .rc-photo { width:70px; height:70px; border-radius:50%; object-fit:cover; }
+  </style></head>
+  <body>
+    <div class="rc-header">
+      <div>
+        <h1>Report Card</h1>
+        <h2>${esc(COURSE_NAME)}</h2>
+      </div>
+      ${currentUser.profilePhotoUrl ? `<img src="${esc(currentUser.profilePhotoUrl)}" class="rc-photo">` : ''}
+    </div>
+    <div class="rc-grid">
+      <div><b>Name:</b> ${esc(currentUser.name)}</div>
+      <div><b>Partner ID:</b> ${esc(currentUser.id)}</div>
+      <div><b>Category:</b> ${esc(d.categoryName)}</div>
+      <div><b>Course:</b> ${esc(d.courseName)}</div>
+      <div><b>Batch:</b> ${currentUser.batchNumber?('Batch '+esc(String(currentUser.batchNumber))):'—'}</div>
+      <div><b>Trainer:</b> ${esc(currentUser.trainer||'—')}</div>
+      <div><b>Overall completion:</b> ${d.overallPercent}%</div>
+      <div><b>Overall grade:</b> ${esc(d.overallGrade)}</div>
+      <div><b>Days passed:</b> ${d.passedCount} / ${d.totalDays}</div>
+      <div><b>Report generated:</b> ${esc(new Date().toLocaleDateString())}</div>
+    </div>
+    <table>
+      <thead><tr><th>Day</th><th>Result</th><th>Score</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </body></html>`;
+  const win = window.open('', '_blank');
+  if(!win){ if(note) note.textContent = 'Your browser blocked the export window — please allow pop-ups and try again.'; return; }
+  win.document.open(); win.document.write(html); win.document.close();
+  if(note) note.textContent = 'Report ready — use your browser\'s print dialog to save as PDF.';
+  win.onload = () => { setTimeout(()=>{ try{ win.focus(); win.print(); }catch(e){} }, 600); };
+}
+async function runCertificateExport(){
+  const note = document.getElementById('progress-export-note');
+  const d = progressCardData;
+  if(!d || !(d.overallStatus==='pass' && d.completedCount===d.totalDays && d.totalDays>0)){
+    if(note) note.textContent = 'Certificate unlocks once every day in the course has been passed.';
+    return;
+  }
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Certificate — ${esc(currentUser.name)}</title>
+  <style>
+    @page { size: landscape; margin: 14mm; }
+    body { font-family: Georgia, 'Times New Roman', serif; color:#1a1a2e; text-align:center; }
+    .cert-border { border: 6px double #5B3FA3; padding: 50px 40px; height: calc(100vh - 130px); display:flex; flex-direction:column; justify-content:center; align-items:center; }
+    .cert-label { letter-spacing:0.2em; text-transform:uppercase; color:#8267C4; font-size:13px; margin-bottom:10px; }
+    .cert-title { font-size:34px; margin:0 0 24px; }
+    .cert-name { font-size:30px; font-weight:bold; margin:10px 0; border-bottom:1px solid #ccc; padding-bottom:10px; display:inline-block; min-width:400px; }
+    .cert-course { font-size:16px; margin:16px 0 30px; color:#333; }
+    .cert-meta { font-size:12px; color:#666; margin-top:20px; }
+  </style></head>
+  <body>
+    <div class="cert-border">
+      <div class="cert-label">${esc(COURSE_NAME)}</div>
+      <h1 class="cert-title">Certificate of Completion</h1>
+      <p style="font-size:14px;">This certifies that</p>
+      <div class="cert-name">${esc(currentUser.name)}</div>
+      <p class="cert-course">has successfully completed<br><b>${esc(d.courseName)}</b> (${esc(d.categoryName)})</p>
+      <p class="cert-meta">Partner ID: ${esc(currentUser.id)} &middot; Final Grade: ${esc(d.overallGrade)} &middot; Issued ${esc(new Date().toLocaleDateString())}</p>
+    </div>
+  </body></html>`;
+  const win = window.open('', '_blank');
+  if(!win){ if(note) note.textContent = 'Your browser blocked the export window — please allow pop-ups and try again.'; return; }
+  win.document.open(); win.document.write(html); win.document.close();
+  if(note) note.textContent = 'Certificate ready — use your browser\'s print dialog to save as PDF.';
+  win.onload = () => { setTimeout(()=>{ try{ win.focus(); win.print(); }catch(e){} }, 600); };
 }
 function renderHome(){
   const s = overallStats();
@@ -3194,17 +3458,21 @@ function renderQuickAssessmentBlock(dayId, item, idx, dp){
         <div id="qa-timer-${idx}" style="font-family:monospace;font-size:20px;font-weight:700;color:${remainingSec<60?'var(--danger)':'var(--brand)'};">${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}</div>
       </div>
       <p style="font-size:12px;color:var(--ink-soft);margin-top:-4px;margin-bottom:12px;">${timerDone ? 'Time is up — submit when ready.' : 'You can answer now, but Submit unlocks only once the timer reaches 00:00. This is a minimum duration, not a time limit.'}</p>
-      ${(item.questions||[]).map((q,qi)=>`
+      ${(item.questions||[]).map((q,qi)=>{
+        const mode = q.answerMode||'single';
+        const currentMulti = Array.isArray(state.currentAnswers[qi]) ? state.currentAnswers[qi] : [];
+        return `
         <div style="margin-bottom:16px;">
-          <p style="font-weight:600;margin-bottom:8px;">${qi+1}. ${esc(q.question)}</p>
+          <p style="font-weight:600;margin-bottom:8px;">${qi+1}. ${esc(q.question)}${mode==='multiple'?' <span style="font-weight:400;font-size:11.5px;color:var(--ink-soft);">(select all that apply)</span>':''}</p>
           ${(q.options||[]).map((opt,oi)=>`
             <label style="display:flex;gap:8px;align-items:center;padding:8px;border-radius:8px;cursor:pointer;" class="qa-option-label">
-              <input type="radio" name="qa-answer-${idx}-${qi}" value="${oi}" ${state.currentAnswers[qi]===oi?'checked':''} onchange="saveQuickAssessmentAnswer(${jsDayId(dayId)},${idx},${qi},${oi})">
+              ${mode==='multiple'
+                ? `<input type="checkbox" name="qa-answer-${idx}-${qi}" value="${oi}" ${currentMulti.includes(oi)?'checked':''} onchange="saveQuickAssessmentAnswerMulti(${jsDayId(dayId)},${idx},${qi},${oi},this.checked)">`
+                : `<input type="radio" name="qa-answer-${idx}-${qi}" value="${oi}" ${state.currentAnswers[qi]===oi?'checked':''} onchange="saveQuickAssessmentAnswer(${jsDayId(dayId)},${idx},${qi},${oi})">`}
               ${esc(opt)}
-            </label>
-          `).join('')}
+            </label>`).join('')}
         </div>
-      `).join('')}
+      `;}).join('')}
       <button class="btn amber" id="qa-submit-btn-${idx}" ${!timerDone?'disabled':''} onclick="submitQuickAssessment(${jsDayId(dayId)},${idx},false)">${timerDone?'Submit Now':'Submit (unlocks at 00:00)'}</button>
     </div>`;
   }
@@ -3217,7 +3485,20 @@ function renderQuickAssessmentBlock(dayId, item, idx, dp){
       <p style="font-size:22px;font-weight:700;color:${last.passed?'var(--success)':'var(--danger)'};margin:4px 0;">${last.score}/${last.total} (${last.percent}%) — ${last.passed?'Passed':'Failed'}</p>
       ${!last.passed ? `<div style="margin-top:10px;">
         <p style="font-weight:600;margin-bottom:6px;">Questions to review:</p>
-        ${(item.questions||[]).map((q,qi)=>last.answers[qi]!==q.correct?`<div class="save-note" style="margin-bottom:8px;"><strong>${esc(q.question)}</strong><br>Correct answer: ${esc(q.options[q.correct])}${q.keyLearningPoint?`<br><span class="rte-content ql-editor">${q.keyLearningPoint}</span>`:''}</div>`:'').join('')}
+        ${(item.questions||[]).map((q,qi)=>{
+          const mode = q.answerMode||'single';
+          let isWrong, correctText;
+          if(mode==='multiple'){
+            const correct = [...(q.correctIndices||[])].sort((a,b)=>a-b);
+            const given = Array.isArray(last.answers[qi]) ? [...last.answers[qi]].sort((a,b)=>a-b) : [];
+            isWrong = !(correct.length===given.length && correct.every((v,i)=>v===given[i]));
+            correctText = correct.map(i=>q.options[i]).join(', ');
+          } else {
+            isWrong = last.answers[qi]!==q.correct;
+            correctText = q.options[q.correct];
+          }
+          return isWrong ? `<div class="save-note" style="margin-bottom:8px;"><strong>${esc(q.question)}</strong><br>Correct answer: ${esc(correctText)}${q.keyLearningPoint?`<br><span class="rte-content ql-editor">${q.keyLearningPoint}</span>`:''}</div>` : '';
+        }).join('')}
       </div>` : ''}
       ${!last.passed && canAttempt ? `<p style="font-size:12.5px;color:var(--ink-soft);margin-top:8px;">Attempt ${attemptCount} of ${maxAttempts} used.</p><button class="btn amber" onclick="startQuickAssessment(${jsDayId(dayId)},${idx})">Retry Assessment</button>` : ''}
       ${!last.passed && !canAttempt ? `<p style="color:var(--danger);font-size:13px;margin-top:8px;">No attempts remaining. Contact your Trainer.</p>` : ''}
@@ -3261,6 +3542,14 @@ async function saveQuickAssessmentAnswer(dayId, idx, qi, oi){
   state.currentAnswers[qi] = oi;
   await setProgress(currentUser.id, currentUserProgress);
 }
+async function saveQuickAssessmentAnswerMulti(dayId, idx, qi, oi, checked){
+  const dp = currentUserProgress[dayId];
+  const state = dp.quickAssessments && dp.quickAssessments[idx];
+  if(!state || !state.startedAt) return;
+  const current = Array.isArray(state.currentAnswers[qi]) ? state.currentAnswers[qi] : [];
+  state.currentAnswers[qi] = checked ? [...current, oi].filter((v,i,a)=>a.indexOf(v)===i) : current.filter(x=>x!==oi);
+  await setProgress(currentUser.id, currentUserProgress);
+}
 async function submitQuickAssessment(dayId, idx, isAutoSubmit){
   if(qaTimerInterval){ clearInterval(qaTimerInterval); qaTimerInterval = null; }
   const item = contentOverrides[dayId].content[idx];
@@ -3268,11 +3557,26 @@ async function submitQuickAssessment(dayId, idx, isAutoSubmit){
   const state = dp.quickAssessments[idx];
   if(!state || state.justSubmittedAttempt) return; // prevent double-submit
   const answers = (item.questions||[]).map((q,qi)=>{
+    const mode = q.answerMode||'single';
+    if(mode==='multiple'){
+      const checkedEls = document.querySelectorAll(`input[name="qa-answer-${idx}-${qi}"]:checked`);
+      if(checkedEls.length) return Array.from(checkedEls).map(el=>parseInt(el.value)).sort((a,b)=>a-b);
+      return Array.isArray(state.currentAnswers[qi]) ? [...state.currentAnswers[qi]].sort((a,b)=>a-b) : [];
+    }
     const checked = document.querySelector(`input[name="qa-answer-${idx}-${qi}"]:checked`);
     return checked ? parseInt(checked.value) : (state.currentAnswers[qi] ?? -1);
   });
   const total = (item.questions||[]).length;
-  const score = (item.questions||[]).reduce((sum,q,qi)=>sum + (answers[qi]===q.correct?1:0), 0);
+  const score = (item.questions||[]).reduce((sum,q,qi)=>{
+    const mode = q.answerMode||'single';
+    if(mode==='multiple'){
+      const correct = [...(q.correctIndices||[])].sort((a,b)=>a-b);
+      const given = Array.isArray(answers[qi]) ? answers[qi] : [];
+      const isMatch = correct.length===given.length && correct.every((v,i)=>v===given[i]);
+      return sum + (isMatch?1:0);
+    }
+    return sum + (answers[qi]===q.correct?1:0);
+  }, 0);
   const percent = total>0 ? Math.round((score/total)*100) : 0;
   const passed = percent >= (item.passingPercent||70);
   const startedAt = state.startedAt;
@@ -5974,7 +6278,7 @@ async function openPartnerPreview(partnerId){
   const r = adminRoster[partnerId];
   if(!r){ showToast('Could not find that partner.', 'error'); return; }
   const s = computePartnerStatus(partnerId, r);
-  currentUser = { id: partnerId, name: r.name, officeId: r.officeId||'', city: r.city, trainer: r.trainer, trainerId: r.trainerId||null, courseId: r.courseId||null, preferredLanguage: r.preferredLanguage||DEFAULT_LANGUAGE, day: s.currentDay, open:'—', close:'—' };
+  currentUser = { id: partnerId, name: r.name, officeId: r.officeId||'', city: r.city, trainer: r.trainer, trainerId: r.trainerId||null, courseId: r.courseId||null, preferredLanguage: r.preferredLanguage||DEFAULT_LANGUAGE, day: s.currentDay, open:'—', close:'—', profilePhotoUrl:r.profilePhotoUrl||'', batchNumber:r.batchNumber||null };
   currentUserProgress = await getProgress(partnerId);
   for(const d of DAYS) ensureDay(d.id);
   currentUserUnlockedDays = s.unlocked;
@@ -6005,7 +6309,7 @@ function renderAdminPreviewMode(){
   const dayObj = DAYS.find(d=>d.id===currentDay) || DAYS[0];
   let bodyHtml;
   try{
-    bodyHtml = currentDay===0 ? renderHome() : currentDay===99 ? renderResult() : renderDayShell(dayObj);
+    bodyHtml = currentDay===-1 ? renderProgressCardPage() : currentDay===0 ? renderHome() : currentDay===99 ? renderResult() : renderDayShell(dayObj);
   }catch(e){
     bodyHtml = `<div class="empty-state">Could not render this partner's current screen (${esc(e.message)}).</div>`;
   }
@@ -9323,13 +9627,83 @@ function addQuickAssessmentQuestion(i){
   syncModuleDraftFromDOM();
   const item = moduleDraft.content[i];
   if(!item.questions) item.questions = [];
-  item.questions.push({ question:'New question', options:['','','',''], correct:0, keyLearningPoint:'' });
+  item.questions.push({ question:'New question', options:['','','',''], correct:0, correctIndices:[], answerMode:'single', keyLearningPoint:'' });
   refreshModuleEditor();
 }
 function removeQuickAssessmentQuestion(i, qi){
   syncModuleDraftFromDOM();
   moduleDraft.content[i].questions.splice(qi,1);
   refreshModuleEditor();
+}
+function addQaOption(i, qi){
+  syncModuleDraftFromDOM();
+  moduleDraft.content[i].questions[qi].options.push('');
+  refreshModuleEditor();
+}
+function removeQaOption(i, qi, oi){
+  syncModuleDraftFromDOM();
+  const q = moduleDraft.content[i].questions[qi];
+  if(q.options.length<=2){ showToast('Keep at least two options for this question.', 'error'); return; }
+  const isSingleCorrect = (q.answerMode||'single')==='single' && q.correct===oi;
+  const isMultiCorrect = (q.answerMode||'single')==='multiple' && (q.correctIndices||[]).includes(oi);
+  const doRemove = () => {
+    q.options.splice(oi,1);
+    if((q.answerMode||'single')==='single'){
+      if(q.correct===oi) q.correct = -1; // force re-selection before save
+      else if(q.correct>oi) q.correct -= 1;
+    } else {
+      q.correctIndices = (q.correctIndices||[]).filter(x=>x!==oi).map(x=>x>oi?x-1:x);
+    }
+    refreshModuleEditor();
+  };
+  if(isSingleCorrect || isMultiCorrect){
+    showConfirmModal('This option is marked as a correct answer. Delete it anyway? You\'ll need to pick a new correct answer before saving.', doRemove);
+  } else {
+    doRemove();
+  }
+}
+function duplicateQaOption(i, qi, oi){
+  syncModuleDraftFromDOM();
+  const q = moduleDraft.content[i].questions[qi];
+  q.options.splice(oi+1, 0, q.options[oi]);
+  if((q.answerMode||'single')==='single' && q.correct>oi) q.correct += 1;
+  else if((q.answerMode||'single')==='multiple') q.correctIndices = (q.correctIndices||[]).map(x=>x>oi?x+1:x);
+  refreshModuleEditor();
+}
+function moveQaOption(i, qi, oi, dir){
+  syncModuleDraftFromDOM();
+  const q = moduleDraft.content[i].questions[qi];
+  const j = oi+dir;
+  if(j<0 || j>=q.options.length) return;
+  [q.options[oi], q.options[j]] = [q.options[j], q.options[oi]];
+  const remap = (idx) => idx===oi ? j : idx===j ? oi : idx;
+  if((q.answerMode||'single')==='single'){ if(q.correct===oi||q.correct===j) q.correct = remap(q.correct); }
+  else { q.correctIndices = (q.correctIndices||[]).map(remap); }
+  refreshModuleEditor();
+}
+function setQaAnswerMode(i, qi, mode){
+  syncModuleDraftFromDOM();
+  const q = moduleDraft.content[i].questions[qi];
+  q.answerMode = mode;
+  if(mode==='single'){ q.correctIndices = []; }
+  else { q.correct = -1; if(!q.correctIndices) q.correctIndices = []; }
+  refreshModuleEditor();
+}
+function setQaTrueFalse(i, qi){
+  syncModuleDraftFromDOM();
+  const q = moduleDraft.content[i].questions[qi];
+  q.options = ['True','False'];
+  q.answerMode = 'single';
+  q.correct = 0;
+  q.correctIndices = [];
+  refreshModuleEditor();
+}
+function toggleQaCorrectOption(i, qi, oi, checked){
+  syncModuleDraftFromDOM();
+  const q = moduleDraft.content[i].questions[qi];
+  if(!q.correctIndices) q.correctIndices = [];
+  if(checked){ if(!q.correctIndices.includes(oi)) q.correctIndices.push(oi); }
+  else { q.correctIndices = q.correctIndices.filter(x=>x!==oi); }
 }
 function _addOptionQuestion(i){ syncModuleDraftFromDOM(); const item = moduleDraft.content[i]; if(!item.questions) item.questions = []; item.questions.push({ question:'New question', options:[{text:'',correct:false},{text:'',correct:false},{text:'',correct:false},{text:'',correct:false}], multiSelect:false, marks:1, explanation:'' }); refreshModuleEditor(); }
 function _removeOptionQuestion(i, qi){ syncModuleDraftFromDOM(); moduleDraft.content[i].questions.splice(qi,1); refreshModuleEditor(); }
@@ -9549,11 +9923,33 @@ async function saveModuleAsDraft(){
   showToast('Saved as draft — partners still see the previous published version.', 'success');
   renderAdminMain();
 }
+function findMissingCorrectAnswer(content){
+  for(const item of (content||[])){
+    if(item.type==='quickAssessment'){
+      for(const [qi,q] of (item.questions||[]).entries()){
+        const mode = q.answerMode||'single';
+        if(mode==='multiple'){
+          if(!q.correctIndices || q.correctIndices.length===0) return `"${item.title||'Quick Assessment'}" — Question ${qi+1} needs at least one correct answer selected before saving.`;
+        } else {
+          if(q.correct===undefined || q.correct===null || q.correct<0 || q.correct>=(q.options||[]).length) return `"${item.title||'Quick Assessment'}" — Question ${qi+1} needs a correct answer selected before saving.`;
+        }
+      }
+    } else if(item.type==='checkboxQuestion' || item.type==='mcqQuestion'){
+      for(const [qi,q] of (item.questions||[]).entries()){
+        const hasCorrect = (q.options||[]).some(o=>o.correct);
+        if(!hasCorrect) return `"${item.title||'Question block'}" — Question ${qi+1} needs at least one correct answer selected before saving.`;
+      }
+    }
+  }
+  return null;
+}
 async function saveModuleDraft(){
   if(!ccCan('canPublish')){ showToast("You don't have permission to publish.", 'error'); return; }
   syncModuleDraftFromDOM();
   if(!moduleDraft.title.trim()){ showToast('Give it a title.', 'error'); return; }
   if(!editingCourseId && editingDayId!=='home' && moduleDraft.quiz.length===0){ showToast('Add at least one assessment question.', 'error'); return; }
+  const missingAnswer = findMissingCorrectAnswer(moduleDraft.content);
+  if(missingAnswer){ showToast(missingAnswer, 'error'); return; }
   const ok = await setContentOverride(editingDayId, moduleDraft, editingCourseId, editingLanguage);
   if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
   await deleteDraftContentOverride(editingDayId, editingCourseId, editingLanguage);
@@ -9729,23 +10125,38 @@ function renderContentItemCard(item, i, total){
       </div>
       <span class="field-label" style="margin-top:10px;">Questions</span>
       ${(item.questions||[]).length===0?`<div class="empty-state" style="padding:10px;">No questions yet — click "+ Add question" below.</div>`:''}
-      ${(item.questions||[]).map((q,qi)=>`
+      ${(item.questions||[]).map((q,qi)=>{
+        const mode = q.answerMode||'single';
+        return `
         <div class="card" style="background:var(--porcelain);margin-bottom:8px;">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
             <span class="field-label" style="margin:0;">Question ${qi+1}</span>
             <button class="btn small danger" onclick="removeQuickAssessmentQuestion(${i},${qi})">Remove</button>
           </div>
           <input class="field-input" id="qa-q-${i}-${qi}" value="${esc(q.question||'')}" placeholder="Question text">
+          <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+            <span class="field-label" style="margin:0;">Answer type:</span>
+            <label style="display:flex;gap:4px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="radio" name="qa-mode-${i}-${qi}" ${mode==='single'?'checked':''} onchange="setQaAnswerMode(${i},${qi},'single')"> Single-choice</label>
+            <label style="display:flex;gap:4px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="radio" name="qa-mode-${i}-${qi}" ${mode==='multiple'?'checked':''} onchange="setQaAnswerMode(${i},${qi},'multiple')"> Multiple-choice</label>
+            <button class="btn small secondary" type="button" onclick="setQaTrueFalse(${i},${qi})">Set as True/False</button>
+          </div>
           ${(q.options||['','','','']).map((opt,oi)=>`
-            <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
-              <input type="radio" name="qa-correct-${i}-${qi}" value="${oi}" ${q.correct===oi?'checked':''}>
-              <input class="field-input" style="margin-bottom:0;" id="qa-opt-${i}-${qi}-${oi}" value="${esc(opt)}" placeholder="Option ${oi+1}">
+            <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
+              ${mode==='multiple'
+                ? `<input type="checkbox" onchange="toggleQaCorrectOption(${i},${qi},${oi},this.checked)" ${(q.correctIndices||[]).includes(oi)?'checked':''}>`
+                : `<input type="radio" name="qa-correct-${i}-${qi}" value="${oi}" ${q.correct===oi?'checked':''}>`}
+              <input class="field-input" style="margin-bottom:0;flex:1;" id="qa-opt-${i}-${qi}-${oi}" value="${esc(opt)}" placeholder="Option ${oi+1}">
+              <button class="btn small secondary" type="button" title="Move up" onclick="moveQaOption(${i},${qi},${oi},-1)" ${oi===0?'disabled':''}>&uarr;</button>
+              <button class="btn small secondary" type="button" title="Move down" onclick="moveQaOption(${i},${qi},${oi},1)" ${oi===(q.options.length-1)?'disabled':''}>&darr;</button>
+              <button class="btn small secondary" type="button" title="Duplicate" onclick="duplicateQaOption(${i},${qi},${oi})">Duplicate</button>
+              <button class="btn small danger" type="button" title="Delete" onclick="removeQaOption(${i},${qi},${oi})">&times;</button>
             </div>
           `).join('')}
+          <button class="btn small secondary" type="button" onclick="addQaOption(${i},${qi})">+ Add option</button>
           <span class="field-label">Key learning point (shown if this question is answered incorrectly)</span>
           ${rteMount(`qa-klp-${i}-${qi}`, q.keyLearningPoint||'', 'Shown when this question is answered incorrectly', rteCurrentContext())}
         </div>
-      `).join('')}
+      `;}).join('')}
       <button class="btn secondary small" onclick="addQuickAssessmentQuestion(${i})">+ Add question</button>
     `;
   } else if(item.type==='checkboxQuestion' || item.type==='mcqQuestion'){
