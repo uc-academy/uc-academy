@@ -4434,41 +4434,180 @@ async function saveComponentPhotoNote(dayId, key, note){
   dp.componentPhotos[key].note = note;
   await setProgress(currentUser.id, currentUserProgress);
 }
+function renderSimpleTaskRow(dayId, t, i, dp){
+  const timerSec = taskTimerDurationSeconds(t);
+  if(timerSec<=0){
+    return `<div class="task-row"><input type="checkbox" id="task-${i}" ${dp.tasksChecked[i]?'checked':''} onchange="toggleTask(${dayId},${i})"><label for="task-${i}">${esc(taskText(t))}</label></div>`;
+  }
+  const timerState = dp.taskTimers[i];
+  if(dp.tasksChecked[i]){
+    return `<div class="task-row"><input type="checkbox" id="task-${i}" checked onchange="toggleTask(${dayId},${i})"><label for="task-${i}">${esc(taskText(t))}</label></div>`;
+  }
+  if(!timerState || !timerState.startedAt){
+    return `<div class="task-row" style="align-items:center;">
+      <span style="flex:1;">${esc(taskText(t))} <span style="font-size:11px;color:var(--ink-soft);">(min. ${Math.round(timerSec/60)} min before this can be checked off)</span></span>
+      <button class="btn small amber" onclick="startTaskTimer(${dayId},${i})">Start Task</button>
+    </div>`;
+  }
+  const elapsedSec = (Date.now() - new Date(timerState.startedAt).getTime())/1000;
+  const remainingSec = Math.max(0, Math.round(timerSec - elapsedSec));
+  const timerDone = remainingSec<=0;
+  const mins = Math.floor(remainingSec/60), secs = remainingSec%60;
+  return `<div class="task-row" style="align-items:center;">
+    <span style="flex:1;">${esc(taskText(t))}</span>
+    ${timerDone
+      ? `<input type="checkbox" id="task-${i}" onchange="toggleTask(${dayId},${i})">`
+      : `<span id="task-timer-display-${i}" style="font-family:monospace;font-weight:700;color:var(--brand);">${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}</span>`}
+  </div>`;
+}
+function taskRequirementPhotos(dp, taskIdx, reqId){
+  return (dp.taskPhotos[taskIdx] && dp.taskPhotos[taskIdx][reqId]) || [];
+}
+function isTaskReadyToComplete(dayId, t, i, dp){
+  const timerSec = taskTimerDurationSeconds(t);
+  if(timerSec>0){
+    const timerState = dp.taskTimers[i];
+    if(!timerState || !timerState.startedAt) return false;
+    const elapsedSec = (Date.now() - new Date(timerState.startedAt).getTime())/1000;
+    if(timerSec - elapsedSec > 0) return false;
+  }
+  const reqs = taskPhotoRequirements(t);
+  for(const req of reqs){
+    if(req.mandatory===false) continue;
+    const photos = taskRequirementPhotos(dp, i, req.id);
+    if(photos.length < (req.minCount||1)) return false;
+  }
+  if(taskNoteRequired(t) && !(dp.taskNotes[i]||'').trim()) return false;
+  return true;
+}
+function renderRichTaskCard(dayId, t, i, dp, reqs, noteRequired){
+  const timerSec = taskTimerDurationSeconds(t);
+  const timerState = dp.taskTimers[i];
+  const checked = dp.tasksChecked[i];
+  const ready = isTaskReadyToComplete(dayId, t, i, dp);
+  let timerBlock = '';
+  if(timerSec>0 && !checked){
+    if(!timerState || !timerState.startedAt){
+      timerBlock = `<button class="btn small amber" onclick="startTaskTimer(${dayId},${i})">Start Task Timer</button>`;
+    } else {
+      const elapsedSec = (Date.now() - new Date(timerState.startedAt).getTime())/1000;
+      const remainingSec = Math.max(0, Math.round(timerSec - elapsedSec));
+      const mins = Math.floor(remainingSec/60), secs = remainingSec%60;
+      timerBlock = remainingSec>0
+        ? `<span id="task-timer-display-${i}" style="font-family:monospace;font-weight:700;color:var(--brand);">${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}</span>`
+        : `<span style="color:var(--success);font-size:12px;">Timer complete</span>`;
+    }
+  }
+  return `<div class="card" style="background:var(--porcelain);margin-bottom:10px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <span style="font-weight:700;">${esc(taskText(t))}</span>
+      ${checked ? `<span class="pill open">Completed</span>` : timerBlock}
+    </div>
+    ${reqs.map(req=>{
+      const photos = taskRequirementPhotos(dp, i, req.id);
+      const canAddMore = req.allowMultiple ? photos.length < (req.maxCount||1) : photos.length===0;
+      return `<div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:8px;">
+        <p style="font-weight:600;font-size:13px;margin:0 0 4px;">${esc(photoRequirementLabel(req))}${req.mandatory!==false?' <span style="color:var(--danger);">*</span>':' <span style="font-size:11px;color:var(--ink-soft);">(optional)</span>'}</p>
+        ${req.instructions ? `<p style="font-size:12px;color:var(--ink-soft);margin:0 0 8px;">${esc(req.instructions)}</p>` : ''}
+        ${photos.map((p,pi)=>`<div style="margin-bottom:6px;"><img src="${esc(p.url)}" style="max-width:160px;max-height:120px;border-radius:6px;display:block;margin-bottom:4px;">${req.allowReupload!==false && !checked ? `<button class="btn small secondary" onclick="removeTaskPhoto(${dayId},${i},'${req.id}',${pi})">Remove</button>`:''}</div>`).join('')}
+        ${(canAddMore && !checked) ? `<label class="btn small secondary" style="cursor:pointer;display:inline-block;">
+          ${photos.length>0?'+ Add another photo':'+ Upload photo'}
+          <input type="file" accept="image/*" style="display:none;" onchange="handleTaskPhotoUpload(event,${dayId},${i},'${req.id}')">
+        </label>` : ''}
+      </div>`;
+    }).join('')}
+    ${noteRequired ? `<div style="margin-top:8px;">
+      <span class="field-label">Partner Note <span style="color:var(--danger);">*</span></span>
+      <textarea class="field-input reflect" style="min-height:60px;" ${checked?'disabled':''} onchange="saveTaskNote(${dayId},${i},this.value)" placeholder="Describe what you observed or did for this task">${esc(dp.taskNotes[i]||'')}</textarea>
+    </div>` : ''}
+    ${!checked ? `<div style="margin-top:10px;">
+      <input type="checkbox" id="task-${i}" ${ready?'':'disabled'} onchange="toggleTask(${dayId},${i})">
+      <label for="task-${i}" style="${ready?'':'color:var(--ink-soft);'}">${ready ? 'Mark this task complete' : 'Complete all required photos and notes above to finish this task'}</label>
+    </div>` : ''}
+  </div>`;
+}
+async function handleTaskPhotoUpload(event, dayId, taskIdx, reqId){
+  const el = event.target;
+  const file = el.files[0];
+  if(!file) return;
+  const check = rteValidateImageFile(file);
+  if(!check.ok){ showToast(check.reason, 'error'); el.value=''; return; }
+  const tasks = getEffectiveTasks(dayId);
+  const t = tasks[taskIdx];
+  const req = taskPhotoRequirements(t).find(r=>r.id===reqId);
+  if(!req) return;
+  showToast('Uploading...', 'info');
+  const path = `task-photos/${currentUser.id}/${dayId}/${taskIdx}/${reqId}/${Date.now()}_${file.name}`;
+  const uploadResult = await uploadFile(path, file);
+  el.value = '';
+  if(!uploadResult.ok){ showToast(`Upload failed — try again. (${uploadResult.error})`, 'error'); return; }
+
+  let aiResult = null;
+  if(req.aiAuditEnabled && currentAiSettings.enabled && currentAiSettings.proxyUrl){
+    showToast('Uploaded — running AI review...', 'info');
+    try{
+      const base64 = await fileToBase64(file);
+      aiResult = await runAIPhotoReview(base64, file.type, `Task ${taskIdx+1} — ${photoRequirementLabel(req)}`, req.instructions);
+    }catch(e){
+      aiResult = { result:'Manual Review', score:null, mistakes:[], feedback:'AI review could not be completed automatically — please review manually.', aiError:true };
+    }
+  }
+  const activityIndex = `task-${taskIdx}-${reqId}`;
+  const priorForThisReq = (myMediaCache[dayId]||[]).filter(m=>m.activityIndex===activityIndex).sort((a,b)=>new Date(b.uploadedAt)-new Date(a.uploadedAt))[0];
+  const record = await createMediaRecord({
+    partnerId: currentUser.id, partnerName: currentUser.name, trainerName: currentUser.trainer, trainerId: currentUser.trainerId, city: currentUser.city,
+    dayId, activityIndex, activityLabel: `Task ${taskIdx+1} — ${photoRequirementLabel(req)}`, type:'photo', storagePath: path, url: uploadResult.url,
+    status: req.requiresTrainerApproval===false ? 'Pass' : 'Pending',
+    resubmissionOf: priorForThisReq ? priorForThisReq.id : null,
+    attemptNumber: priorForThisReq ? (priorForThisReq.attemptNumber||1)+1 : 1,
+    aiResult: aiResult ? aiResult.result : null,
+    aiScore: aiResult ? aiResult.score : null,
+    aiMistakes: aiResult ? aiResult.mistakes : null,
+    aiConfidence: aiResult ? aiResult.confidence : null,
+    aiFeedback: aiResult ? aiResult.feedback : null,
+    aiAnalyzedAt: aiResult ? new Date().toISOString() : null,
+  });
+  const dp = currentUserProgress[dayId];
+  if(!dp.taskPhotos) dp.taskPhotos = {};
+  if(!dp.taskPhotos[taskIdx]) dp.taskPhotos[taskIdx] = {};
+  if(!dp.taskPhotos[taskIdx][reqId]) dp.taskPhotos[taskIdx][reqId] = [];
+  dp.taskPhotos[taskIdx][reqId].push({ url: uploadResult.url, storagePath: path, mediaRecordId: record ? record.id : null, uploadedAt: new Date().toISOString() });
+  await setProgress(currentUser.id, currentUserProgress);
+  showToast(aiResult ? `Uploaded — AI first look: ${aiResult.result}.` : 'Uploaded.', 'success');
+  await loadMyMedia(dayId);
+  renderMainOnly();
+}
+async function removeTaskPhoto(dayId, taskIdx, reqId, photoIdx){
+  const dp = currentUserProgress[dayId];
+  if(!dp.taskPhotos || !dp.taskPhotos[taskIdx] || !dp.taskPhotos[taskIdx][reqId]) return;
+  dp.taskPhotos[taskIdx][reqId].splice(photoIdx,1);
+  await setProgress(currentUser.id, currentUserProgress);
+  renderMainOnly();
+}
+async function saveTaskNote(dayId, taskIdx, note){
+  const dp = currentUserProgress[dayId];
+  if(!dp.taskNotes) dp.taskNotes = {};
+  dp.taskNotes[taskIdx] = note;
+  await setProgress(currentUser.id, currentUserProgress);
+  renderMainOnly();
+}
 function renderAssignment(day){
   const dp = currentUserProgress[day.id];
   const tasks = getEffectiveTasks(day.id);
   const intro = getEffectiveAssignmentIntro(day.id);
   while(dp.tasksChecked.length < tasks.length) dp.tasksChecked.push(false);
   if(!dp.taskTimers) dp.taskTimers = {};
+  if(!dp.taskPhotos) dp.taskPhotos = {};
+  if(!dp.taskNotes) dp.taskNotes = {};
   const myMedia = myMediaCache[day.id] || [];
   const uploadEnabled = getEffectiveMediaUploadEnabled(day.id);
   return `
     <div class="card"><h3>Hands-on assignment</h3><div class="rte-content ql-editor">${intro||''}</div>
       ${tasks.map((t,i)=>{
-        const timerSec = taskTimerDurationSeconds(t);
-        if(timerSec<=0){
-          return `<div class="task-row"><input type="checkbox" id="task-${i}" ${dp.tasksChecked[i]?'checked':''} onchange="toggleTask(${day.id},${i})"><label for="task-${i}">${esc(taskText(t))}</label></div>`;
-        }
-        const timerState = dp.taskTimers[i];
-        if(dp.tasksChecked[i]){
-          return `<div class="task-row"><input type="checkbox" id="task-${i}" checked onchange="toggleTask(${day.id},${i})"><label for="task-${i}">${esc(taskText(t))}</label></div>`;
-        }
-        if(!timerState || !timerState.startedAt){
-          return `<div class="task-row" style="align-items:center;">
-            <span style="flex:1;">${esc(taskText(t))} <span style="font-size:11px;color:var(--ink-soft);">(min. ${Math.round(timerSec/60)} min before this can be checked off)</span></span>
-            <button class="btn small amber" onclick="startTaskTimer(${day.id},${i})">Start Task</button>
-          </div>`;
-        }
-        const elapsedSec = (Date.now() - new Date(timerState.startedAt).getTime())/1000;
-        const remainingSec = Math.max(0, Math.round(timerSec - elapsedSec));
-        const timerDone = remainingSec<=0;
-        const mins = Math.floor(remainingSec/60), secs = remainingSec%60;
-        return `<div class="task-row" style="align-items:center;">
-          <span style="flex:1;">${esc(taskText(t))}</span>
-          ${timerDone
-            ? `<input type="checkbox" id="task-${i}" onchange="toggleTask(${day.id},${i})">`
-            : `<span id="task-timer-display-${i}" style="font-family:monospace;font-weight:700;color:var(--brand);">${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}</span>`}
-        </div>`;
+        const reqs = taskPhotoRequirements(t);
+        const noteRequired = taskNoteRequired(t);
+        if(reqs.length===0 && !noteRequired) return renderSimpleTaskRow(day.id, t, i, dp);
+        return renderRichTaskCard(day.id, t, i, dp, reqs, noteRequired);
       }).join('')}
       <div class="save-note">${dp.tasksChecked.filter(Boolean).length} of ${tasks.length} tasks checked off &middot; saved automatically</div>
     </div>
@@ -9890,7 +10029,26 @@ function syncModuleDraftFromDOM(){
     }
     const customEl = g('task-customtimermins-'+i);
     const customTimerMinutes = customEl ? Math.max(1, parseInt(customEl.value)||30) : taskCustomTimerMinutes(t);
-    moduleDraft.tasks[i] = { text: textEl.value, timerMinutes, customTimerMinutes };
+    const existingReqs = taskPhotoRequirements(t);
+    const photoRequirements = existingReqs.map((req,ri)=>{
+      const typeEl = g(`task-req-type-${i}-${ri}`);
+      if(!typeEl) return req;
+      return {
+        id: req.id || uid(),
+        type: typeEl.value,
+        customLabel: (g(`task-req-customlabel-${i}-${ri}`)||{}).value || '',
+        instructions: (g(`task-req-instructions-${i}-${ri}`)||{}).value || '',
+        mandatory: (g(`task-req-mandatory-${i}-${ri}`)||{}).checked !== false,
+        allowMultiple: !!(g(`task-req-multiple-${i}-${ri}`)||{}).checked,
+        allowReupload: (g(`task-req-reupload-${i}-${ri}`)||{}).checked !== false,
+        minCount: Math.max(1, parseInt((g(`task-req-mincount-${i}-${ri}`)||{}).value)||1),
+        maxCount: Math.max(1, parseInt((g(`task-req-maxcount-${i}-${ri}`)||{}).value)||1),
+        requiresTrainerApproval: (g(`task-req-trainerapproval-${i}-${ri}`)||{}).checked !== false,
+        aiAuditEnabled: !!(g(`task-req-aiaudit-${i}-${ri}`)||{}).checked,
+      };
+    });
+    const noteRequired = !!(g('task-noterequired-'+i)||{}).checked;
+    moduleDraft.tasks[i] = { text: textEl.value, timerMinutes, customTimerMinutes, photoRequirements, noteRequired };
   });
   moduleDraft.quiz.forEach((q,i)=>{
     if(g('quiz-q-'+i)) q.question = g('quiz-q-'+i).value;
@@ -10119,12 +10277,39 @@ function onContentDrop(i){
   dragFromIndex = null;
   refreshModuleEditor();
 }
-function addTask(){ syncModuleDraftFromDOM(); moduleDraft.tasks.push({text:'New task', timerMinutes:null, customTimerMinutes:30}); refreshModuleEditor(); }
+function addTask(){ syncModuleDraftFromDOM(); moduleDraft.tasks.push({text:'New task', timerMinutes:null, customTimerMinutes:30, photoRequirements:[], noteRequired:false}); refreshModuleEditor(); }
 function removeTask(i){ syncModuleDraftFromDOM(); moduleDraft.tasks.splice(i,1); refreshModuleEditor(); }
 function moveTask(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.tasks.length) return; [moduleDraft.tasks[i],moduleDraft.tasks[j]]=[moduleDraft.tasks[j],moduleDraft.tasks[i]]; refreshModuleEditor(); }
 function taskText(t){ return typeof t==='string' ? t : (t.text||''); }
 function taskTimerMinutes(t){ return typeof t==='string' ? null : (t.timerMinutes||null); }
 function taskCustomTimerMinutes(t){ return typeof t==='string' ? 30 : (t.customTimerMinutes||30); }
+function taskPhotoRequirements(t){ return typeof t==='string' ? [] : (t.photoRequirements||[]); }
+function taskNoteRequired(t){ return typeof t==='string' ? false : !!t.noteRequired; }
+const PHOTO_REQUIREMENT_TYPES = [
+  ['good','Good Component Photo'], ['defective','Defective Component Photo'],
+  ['before','Before Repair Photo'], ['after','After Repair Photo'],
+  ['testing','Testing Photo'], ['custom','Custom Photo Type'],
+];
+function photoRequirementLabel(req){
+  const found = PHOTO_REQUIREMENT_TYPES.find(([k])=>k===req.type);
+  if(req.type==='custom') return req.customLabel || 'Custom Photo';
+  return found ? found[1] : 'Photo';
+}
+function addPhotoRequirement(taskIdx){
+  syncModuleDraftFromDOM();
+  const t = moduleDraft.tasks[taskIdx];
+  if(!t.photoRequirements) t.photoRequirements = [];
+  t.photoRequirements.push({
+    id: uid(), type:'good', customLabel:'', mandatory:true, minCount:1, maxCount:1, allowMultiple:false,
+    instructions:'', allowReupload:true, requiresTrainerApproval:true, aiAuditEnabled:false,
+  });
+  refreshModuleEditor();
+}
+function removePhotoRequirement(taskIdx, reqIdx){
+  syncModuleDraftFromDOM();
+  moduleDraft.tasks[taskIdx].photoRequirements.splice(reqIdx,1);
+  refreshModuleEditor();
+}
 function fmtMinSec(totalSeconds){
   totalSeconds = Math.max(0, Math.round(totalSeconds||0));
   const m = Math.floor(totalSeconds/60), s = totalSeconds%60;
@@ -10609,6 +10794,46 @@ function renderModuleEditorTab(){
           <span id="task-customtimer-row-${i}" style="display:${timerMins==='custom'?'inline-block':'none'};">
             <input class="field-input" style="width:90px;margin-bottom:0;display:inline-block;" id="task-customtimermins-${i}" type="number" min="1" value="${customMins}"> minutes
           </span>
+        </div>
+        <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line);">
+          <span class="field-label" style="margin:0 0 8px;">Photo Upload Settings for this task</span>
+          ${taskPhotoRequirements(t).map((req,ri)=>`
+            <div class="card" style="background:var(--porcelain);margin-bottom:8px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                <span style="font-weight:600;font-size:13px;">${esc(photoRequirementLabel(req))}</span>
+                <button class="btn small danger" type="button" onclick="removePhotoRequirement(${i},${ri})">Remove</button>
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                <div>
+                  <span class="field-label" style="margin:0;">Photo type</span>
+                  <select class="field-input" id="task-req-type-${i}-${ri}" onchange="document.getElementById('task-req-customlabel-row-${i}-${ri}').style.display=this.value==='custom'?'block':'none';">
+                    ${PHOTO_REQUIREMENT_TYPES.map(([k,label])=>`<option value="${k}" ${req.type===k?'selected':''}>${label}</option>`).join('')}
+                  </select>
+                </div>
+                <div id="task-req-customlabel-row-${i}-${ri}" style="display:${req.type==='custom'?'block':'none'};">
+                  <span class="field-label" style="margin:0;">Custom label</span>
+                  <input class="field-input" id="task-req-customlabel-${i}-${ri}" value="${esc(req.customLabel||'')}" placeholder="e.g. Wiring Close-up Photo">
+                </div>
+              </div>
+              <span class="field-label">Instructions for the partner</span>
+              <input class="field-input" id="task-req-instructions-${i}-${ri}" value="${esc(req.instructions||'')}" placeholder="e.g. Show the full motor casing with the label visible">
+              <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:8px;">
+                <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="checkbox" id="task-req-mandatory-${i}-${ri}" ${req.mandatory!==false?'checked':''}> Mandatory</label>
+                <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="checkbox" id="task-req-multiple-${i}-${ri}" ${req.allowMultiple?'checked':''}> Allow multiple photos</label>
+                <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="checkbox" id="task-req-reupload-${i}-${ri}" ${req.allowReupload!==false?'checked':''}> Allow re-upload</label>
+              </div>
+              <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:8px;">
+                <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;">Min photos: <input class="field-input" id="task-req-mincount-${i}-${ri}" type="number" min="1" style="width:60px;margin-bottom:0;" value="${req.minCount||1}"></label>
+                <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;">Max photos: <input class="field-input" id="task-req-maxcount-${i}-${ri}" type="number" min="1" style="width:60px;margin-bottom:0;" value="${req.maxCount||1}"></label>
+              </div>
+              <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:8px;">
+                <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="checkbox" id="task-req-trainerapproval-${i}-${ri}" ${req.requiresTrainerApproval!==false?'checked':''}> Requires Trainer approval</label>
+                <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="checkbox" id="task-req-aiaudit-${i}-${ri}" ${req.aiAuditEnabled?'checked':''}> Enable AI audit for this photo</label>
+              </div>
+            </div>
+          `).join('')}
+          <button class="btn small secondary" type="button" onclick="addPhotoRequirement(${i})">+ Add Photo Requirement</button>
+          <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;cursor:pointer;margin-top:10px;"><input type="checkbox" id="task-noterequired-${i}" ${taskNoteRequired(t)?'checked':''}> Require a written note from the partner for this task</label>
         </div>
       </div>
     `;}).join('')}
