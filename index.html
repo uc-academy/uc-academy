@@ -1728,6 +1728,10 @@ async function getCategoryById(id){ return id ? await kvGet('category:'+id) : nu
 async function handleProfilePhotoUpload(event){
   const file = event.target.files[0];
   if(!file) return;
+  if(currentUser.profilePhotoUrl){
+    showToast('Your profile photo is locked. Ask your Trainer or Admin to reset it first.', 'error');
+    event.target.value=''; return;
+  }
   const check = rteValidateImageFile(file);
   if(!check.ok){ showToast(check.reason, 'error'); event.target.value=''; return; }
   showToast('Uploading photo...', 'info');
@@ -2794,7 +2798,12 @@ function renderSidebar(){
   let html = `
     <div class="brand">${renderLogoMark('brand-mark')}<div class="brand-text"><div class="t1">${esc(COURSE_NAME)}</div><div class="t2">${esc(COURSE_SUB)}</div></div></div>
     <div class="who-card">
-      <div class="who-name">${esc(currentUser.name)}</div>
+      <div style="display:flex;gap:10px;align-items:center;margin-bottom:4px;">
+        ${currentUser.profilePhotoUrl
+          ? `<img src="${esc(currentUser.profilePhotoUrl)}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;flex-shrink:0;">`
+          : `<span style="width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,0.15);color:#fff;font-size:14px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;">${esc((currentUser.name||'?')[0].toUpperCase())}</span>`}
+        <div class="who-name" style="margin:0;">${esc(currentUser.name)}</div>
+      </div>
       <div class="who-meta">${esc(currentUser.city)} &middot; Trainer: ${esc(currentUser.trainer)}<br>ID: ${esc(currentUser.id)}</div>
       <div class="who-actions"><span onclick="checkOutNow()">Check out</span><span onclick="switchId()">Switch ID</span><span onclick="refreshPartnerData()">Refresh</span></div>
     </div>
@@ -3073,10 +3082,12 @@ function renderProgressCardPage(){
         <div style="flex:1;min-width:180px;">
           <p style="font-weight:700;font-size:16px;margin:0 0 2px;">${esc(currentUser.name)}</p>
           <p style="font-size:12.5px;color:var(--ink-soft);margin:0;">Partner ID: ${esc(currentUser.id)}</p>
-          <label class="btn secondary small" style="cursor:pointer;margin-top:8px;display:inline-block;">
-            ${currentUser.profilePhotoUrl?'Change photo':'Upload photo'}
-            <input type="file" accept="image/*" style="display:none;" onchange="handleProfilePhotoUpload(event)">
-          </label>
+          ${currentUser.profilePhotoUrl
+            ? `<p style="font-size:11.5px;color:var(--ink-soft);margin-top:8px;">Photo locked — ask your Trainer or Admin if it needs to change.</p>`
+            : `<label class="btn secondary small" style="cursor:pointer;margin-top:8px;display:inline-block;">
+                Upload photo
+                <input type="file" accept="image/*" style="display:none;" onchange="handleProfilePhotoUpload(event)">
+              </label>`}
         </div>
       </div>
       <div class="form-grid" style="font-size:13px;">
@@ -8313,8 +8324,8 @@ function renderPartnersTab(){
       <h3>All partners &middot; ${entries.length}</h3>
       ${entries.length===0?`<div class="empty-state">No partners added yet. Add your first partner above.</div>`:`
       <table class="data-table">
-        <tr><th>Name</th><th>Office ID</th><th>Partner password (ID)</th><th>City</th><th>Trainer</th><th>Course</th><th>Created</th><th></th></tr>
-        ${entries.map(([id,r])=>`<tr><td>${esc(r.name)}</td><td>${esc(r.officeId||'—')}</td><td class="mono">${esc(id)}</td><td>${esc(r.city)}</td><td>${esc(r.trainer)}</td><td>${esc(adminCourses[r.courseId]?.name||'—')}</td><td>${fmtDateTime(r.createdAt)}</td><td><button class="btn small secondary" onclick="resetPartnerProgress('${id}')">Reset Progress</button> <button class="btn small danger" onclick="deletePartnerRow('${id}')">Remove</button></td></tr>`).join('')}
+        <tr><th>Photo</th><th>Name</th><th>Office ID</th><th>Partner password (ID)</th><th>City</th><th>Trainer</th><th>Course</th><th>Created</th><th></th></tr>
+        ${entries.map(([id,r])=>`<tr><td>${r.profilePhotoUrl?`<img src="${esc(r.profilePhotoUrl)}" style="width:32px;height:32px;border-radius:50%;object-fit:cover;">`:`<span style="width:32px;height:32px;border-radius:50%;background:var(--brand-light);color:var(--brand);font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;">${esc((r.name||'?')[0].toUpperCase())}</span>`}</td><td>${esc(r.name)}</td><td>${esc(r.officeId||'—')}</td><td class="mono">${esc(id)}</td><td>${esc(r.city)}</td><td>${esc(r.trainer)}</td><td>${esc(adminCourses[r.courseId]?.name||'—')}</td><td>${fmtDateTime(r.createdAt)}</td><td style="display:flex;gap:6px;flex-wrap:wrap;"><button class="btn small secondary" onclick="resetPartnerProgress('${id}')">Reset Progress</button> ${r.profilePhotoUrl?`<button class="btn small secondary" onclick="resetPartnerPhoto('${id}')">Reset Photo</button>`:''} <button class="btn small danger" onclick="deletePartnerRow('${id}')">Remove</button></td></tr>`).join('')}
       </table>`}
     </div>
   `;
@@ -8360,6 +8371,19 @@ async function resetPartnerProgress(id){
     await setProgress(id, {});
     await logHistory('partner_progress_reset', `Course progress reset for ${name} by ${trainerIdentity.name}`, {partnerId:id});
     showToast(`${name}'s progress has been reset.`, 'success');
+    renderAdminMain();
+  });
+}
+async function resetPartnerPhoto(id){
+  const r = adminRoster[id];
+  const name = r?.name||id;
+  showConfirmModal(`Reset ${name}'s profile photo? This removes their current photo and lets them upload a new one.`, async ()=>{
+    const existing = await getRosterEntry(id);
+    if(!existing){ showToast("Couldn't find that partner's record.", 'error'); return; }
+    await setRosterEntry(id, { ...existing, profilePhotoUrl: '' });
+    await logHistory('partner_photo_reset', `Profile photo reset for ${name} by ${trainerIdentity.name}`, {partnerId:id});
+    showToast(`${name}'s profile photo has been reset.`, 'success');
+    adminRoster = await listRoster();
     renderAdminMain();
   });
 }
@@ -8518,7 +8542,7 @@ function renderTrackingTableInner(cityFilter, trainerFilter, zoneFilter, categor
       ? `Batch ${batch.batchNumber}${batch.status==='Active' ? `<br><button class="btn small secondary" style="margin-top:4px;" onclick="markBatchCompleteNow('${batch.id}')">Mark Batch Complete</button>` : ` <span class="pill scheduled" style="font-size:10px;">Completed</span>`}`
       : '<span style="color:var(--ink-soft);">—</span>';
     return `<tr>
-      <td>${esc(r.name)}</td>${isColumnVisible('officeId')?`<td>${esc(r.officeId||'—')}</td>`:''}${isColumnVisible('id')?`<td class="mono">${esc(id)}</td>`:''}${isColumnVisible('city')?`<td>${esc(r.city)}</td>`:''}${isColumnVisible('trainer')?`<td>${esc(r.trainer)}</td>`:''}
+      <td style="display:flex;align-items:center;gap:8px;">${r.profilePhotoUrl?`<img src="${esc(r.profilePhotoUrl)}" style="width:28px;height:28px;border-radius:50%;object-fit:cover;flex-shrink:0;">`:`<span style="width:28px;height:28px;border-radius:50%;background:var(--brand-light);color:var(--brand);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;">${esc((r.name||'?')[0].toUpperCase())}</span>`}${esc(r.name)}</td>${isColumnVisible('officeId')?`<td>${esc(r.officeId||'—')}</td>`:''}${isColumnVisible('id')?`<td class="mono">${esc(id)}</td>`:''}${isColumnVisible('city')?`<td>${esc(r.city)}</td>`:''}${isColumnVisible('trainer')?`<td>${esc(r.trainer)}</td>`:''}
       ${isColumnVisible('batch')?`<td style="white-space:normal;">${batchCell}</td>`:''}
       ${isColumnVisible('lastCheckin')?`<td>${last?fmtDate(last.date)+' '+last.checkinTime:'<span style="color:var(--ink-soft);">Never</span>'}</td>`:''}
       ${isColumnVisible('lastCheckout')?`<td>${last&&last.checkoutTime?fmtDate(last.date)+' '+last.checkoutTime:'<span style="color:var(--ink-soft);">—</span>'}</td>`:''}
