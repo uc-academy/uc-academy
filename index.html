@@ -4374,9 +4374,65 @@ function getEffectiveMediaUploadEnabled(dayId){
   if(ov && typeof ov.mediaUploadEnabled === 'boolean') return ov.mediaUploadEnabled;
   return true;
 }
+function getEffectiveComponentPhotosEnabled(dayId){
+  const ov = contentOverrides[dayId];
+  return !!(ov && ov.componentPhotosEnabled);
+}
 function taskTimerDurationSeconds(t){
   const mins = taskTimerMinutes(t)==='custom' ? taskCustomTimerMinutes(t) : (taskTimerMinutes(t)||0);
   return mins*60;
+}
+function renderComponentPhotosCard(dayId, dp){
+  if(!dp.componentPhotos) dp.componentPhotos = {};
+  const slot = (key, label) => {
+    const s = dp.componentPhotos[key] || {};
+    return `
+      <div style="flex:1;min-width:220px;border:1px solid var(--line);border-radius:10px;padding:12px;">
+        <p style="font-weight:600;margin:0 0 8px;">${esc(label)}</p>
+        ${s.url ? `<img src="${esc(s.url)}" style="max-width:100%;max-height:160px;border-radius:8px;display:block;margin-bottom:8px;">` : ''}
+        <label class="btn secondary small" style="cursor:pointer;display:inline-block;margin-bottom:8px;">
+          ${s.url ? 'Replace photo' : '+ Upload photo'}
+          <input type="file" accept="image/*" style="display:none;" onchange="handleComponentPhotoUpload(event, ${dayId}, '${key}')">
+        </label>
+        <textarea class="field-input reflect" style="min-height:60px;" placeholder="Add a note for this photo (optional)" onchange="saveComponentPhotoNote(${dayId}, '${key}', this.value)">${esc(s.note||'')}</textarea>
+      </div>`;
+  };
+  return `<div class="card"><h3>Component Photos</h3><p style="margin-bottom:10px;">Upload a photo of the good component and the defective component, with a short note for each.</p>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;">
+      ${slot('good', 'Good Component Photo')}
+      ${slot('defective', 'Defective Component Photo')}
+    </div>
+  </div>`;
+}
+async function handleComponentPhotoUpload(event, dayId, key){
+  const el = event.target;
+  const file = el.files[0];
+  if(!file) return;
+  const check = rteValidateImageFile(file);
+  if(!check.ok){ showToast(check.reason, 'error'); el.value=''; return; }
+  showToast('Uploading...', 'info');
+  const path = `component-photos/${currentUser.id}/${dayId}/${key}_${Date.now()}_${file.name}`;
+  const uploadResult = await uploadFile(path, file);
+  el.value = '';
+  if(!uploadResult.ok){ showToast(`Upload failed — try again. (${uploadResult.error})`, 'error'); return; }
+  const dp = currentUserProgress[dayId];
+  if(!dp.componentPhotos) dp.componentPhotos = {};
+  const existingNote = (dp.componentPhotos[key]||{}).note || '';
+  dp.componentPhotos[key] = { url: uploadResult.url, note: existingNote, uploadedAt: new Date().toISOString() };
+  await setProgress(currentUser.id, currentUserProgress);
+  await createMediaRecord({
+    partnerId: currentUser.id, partnerName: currentUser.name, trainerName: currentUser.trainer, trainerId: currentUser.trainerId, city: currentUser.city,
+    dayId, activityLabel: `Day ${dayId} — ${key==='good'?'Good':'Defective'} Component Photo`, type:'photo', storagePath: path, url: uploadResult.url
+  });
+  showToast('Photo uploaded.', 'success');
+  renderMainOnly();
+}
+async function saveComponentPhotoNote(dayId, key, note){
+  const dp = currentUserProgress[dayId];
+  if(!dp.componentPhotos) dp.componentPhotos = {};
+  if(!dp.componentPhotos[key]) dp.componentPhotos[key] = {};
+  dp.componentPhotos[key].note = note;
+  await setProgress(currentUser.id, currentUserProgress);
 }
 function renderAssignment(day){
   const dp = currentUserProgress[day.id];
@@ -4416,6 +4472,7 @@ function renderAssignment(day){
       }).join('')}
       <div class="save-note">${dp.tasksChecked.filter(Boolean).length} of ${tasks.length} tasks checked off &middot; saved automatically</div>
     </div>
+    ${getEffectiveComponentPhotosEnabled(day.id) ? renderComponentPhotosCard(day.id, dp) : ''}
     ${uploadEnabled ? `<div class="card"><h3>Photo & video upload</h3><p style="margin-bottom:10px;">Upload photos or videos of your practical work for your trainer to review.</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap;">
         <label class="btn secondary small" style="cursor:pointer;">+ Upload photo<input type="file" accept="image/*" style="display:none;" onchange="handleMediaUpload(event, ${day.id}, 'photo')"></label>
@@ -9724,6 +9781,7 @@ function syncModuleDraftFromDOM(){
   if(g('draft-sub')) moduleDraft.sub = g('draft-sub').value;
   { const ai = rteGetValue('draft-assignment-intro'); if(ai!==undefined) moduleDraft.assignmentIntro = ai; }
   if(g('draft-media-upload-enabled')) moduleDraft.mediaUploadEnabled = g('draft-media-upload-enabled').checked;
+  if(g('draft-component-photos-enabled')) moduleDraft.componentPhotosEnabled = g('draft-component-photos-enabled').checked;
   if(g('draft-ai-assistant-disabled')) moduleDraft.aiAssistantDisabled = g('draft-ai-assistant-disabled').checked;
   moduleDraft.content.forEach((item,i)=>{
     if(item.type==='theory'){
@@ -10561,6 +10619,10 @@ function renderModuleEditorTab(){
       <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
         <input type="checkbox" id="draft-media-upload-enabled" ${d.mediaUploadEnabled!==false?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
         <span>Let partners upload photos/videos of their practical work on this day (for you to review in Media Review)</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-top:12px;">
+        <input type="checkbox" id="draft-component-photos-enabled" ${d.componentPhotosEnabled?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
+        <span>Require Good Component &amp; Defective Component photos, with a note field for each</span>
       </label>
       <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-top:12px;">
         <input type="checkbox" id="draft-ai-assistant-disabled" ${d.aiAssistantDisabled?'checked':''} style="width:18px;height:18px;accent-color:var(--brand);">
