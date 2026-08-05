@@ -1037,6 +1037,8 @@ async function getOrCreateActiveBatch(trainerId, trainerName, city, courseId){
 
 
 async function getRosterEntry(id){ return await kvGet('roster:'+id); }
+async function getAdminProfile(){ return (await kvGet('adminProfile:main')) || {}; }
+async function setAdminProfile(data){ return await kvSet('adminProfile:main', data); }
 async function setRosterEntry(id, data){ return await kvSet('roster:'+id, data); }
 async function listRoster(){
   const keys = await kvList('roster:');
@@ -2407,7 +2409,7 @@ async function loginAsTrainer(trainerId, opts){
       if(stored && opts.sessionToken!==stored) return { ok:false, reason:'session_replaced' };
     }
   }
-  trainerIdentity = { isAdmin:false, trainerId, name:t.name, phone:t.phone, category:t.category, city:t.city, assignedCourses:t.assignedCourses||[] };
+  trainerIdentity = { isAdmin:false, trainerId, name:t.name, phone:t.phone, category:t.category, city:t.city, assignedCourses:t.assignedCourses||[], profilePhotoUrl:t.profilePhotoUrl||'' };
   let sessionToken = opts.sessionToken;
   if(!opts.silent){
     sessionToken = newSessionToken();
@@ -2478,7 +2480,7 @@ async function loginAsCC(ccId, opts){
       if(stored && opts.sessionToken!==stored) return { ok:false, reason:'session_replaced' };
     }
   }
-  trainerIdentity = { isAdmin:false, isCC:true, ccId, name:c.name, phone:c.phone, assignedCategories:c.assignedCategories||[], assignedCourses:c.assignedCourses||[], assignedLanguages:c.assignedLanguages||[], permissions: effectiveCCPermissions(c), sosAssignedCategories:c.sosAssignedCategories||[], sosAssignedLanguages:c.sosAssignedLanguages||[], sosPermissions: effectiveSosCCPermissions(c) };
+  trainerIdentity = { isAdmin:false, isCC:true, ccId, name:c.name, phone:c.phone, assignedCategories:c.assignedCategories||[], assignedCourses:c.assignedCourses||[], assignedLanguages:c.assignedLanguages||[], permissions: effectiveCCPermissions(c), sosAssignedCategories:c.sosAssignedCategories||[], sosAssignedLanguages:c.sosAssignedLanguages||[], sosPermissions: effectiveSosCCPermissions(c), profilePhotoUrl:c.profilePhotoUrl||'' };
   let sessionToken = opts.sessionToken;
   if(!opts.silent){
     sessionToken = newSessionToken();
@@ -2547,7 +2549,7 @@ async function loginAsZT(ztId, opts){
       if(stored && opts.sessionToken!==stored) return { ok:false, reason:'session_replaced' };
     }
   }
-  trainerIdentity = { isAdmin:false, isZT:true, ztId, name:z.name, phone:z.phone, assignedZones:z.assignedZones||[], assignedCities:z.assignedCities||[], assignedCategories:z.assignedCategories||[], assignedTrainerIds:z.assignedTrainerIds||[] };
+  trainerIdentity = { isAdmin:false, isZT:true, ztId, name:z.name, phone:z.phone, assignedZones:z.assignedZones||[], assignedCities:z.assignedCities||[], assignedCategories:z.assignedCategories||[], assignedTrainerIds:z.assignedTrainerIds||[], profilePhotoUrl:z.profilePhotoUrl||'' };
   let sessionToken = opts.sessionToken;
   if(!opts.silent){
     sessionToken = newSessionToken();
@@ -2703,7 +2705,8 @@ async function submitAdminLogin(){
   if(sec.failedAttempts) await kvSet('adminSecurity:global', { ...sec, failedAttempts:0 });
   const sessionToken = newSessionToken();
   await setStoredSessionToken('admin', 'global', sessionToken);
-  trainerIdentity = { isAdmin:true, name: getSavedAdminName() };
+  const adminProfile = await getAdminProfile();
+  trainerIdentity = { isAdmin:true, name: getSavedAdminName(), profilePhotoUrl: adminProfile.profilePhotoUrl||'' };
   await logHistory('admin_login', 'Admin logged in', {});
   await logLoginEvent('admin', 'admin', trainerIdentity.name, 'success', { enteredIdentifier:'admin' });
   saveSession({ role:'admin', sessionToken });
@@ -2715,6 +2718,35 @@ async function submitAdminLogin(){
 }
 function getSavedAdminName(){
   try{ return localStorage.getItem('uca_admin_name') || 'Admin'; }catch(e){ return 'Admin'; }
+}
+async function handleStaffPhotoUpload(event){
+  const file = event.target.files[0];
+  if(!file) return;
+  const check = rteValidateImageFile(file);
+  if(!check.ok){ showToast(check.reason, 'error'); event.target.value=''; return; }
+  showToast('Uploading photo...', 'info');
+  const roleKey = isAdminRole()?'admin':isCCRole()?'cc':isZTRole()?'zt':'trainer';
+  const path = `staff-photos/${roleKey}-${trainerIdentity.trainerId||trainerIdentity.ccId||trainerIdentity.ztId||'main'}/${Date.now()}_${file.name}`;
+  const uploadResult = await uploadFile(path, file);
+  event.target.value = '';
+  if(!uploadResult.ok){ showToast(`Upload failed — try again. (${uploadResult.error})`, 'error'); return; }
+  let saved = false;
+  if(isAdminRole()){
+    saved = await setAdminProfile({ ...(await getAdminProfile()), profilePhotoUrl: uploadResult.url });
+  } else if(isCCRole()){
+    const existing = await kvGet('cc:'+trainerIdentity.ccId);
+    if(existing) saved = await kvSet('cc:'+trainerIdentity.ccId, { ...existing, profilePhotoUrl: uploadResult.url });
+  } else if(isZTRole()){
+    const existing = await kvGet('zt:'+trainerIdentity.ztId);
+    if(existing) saved = await kvSet('zt:'+trainerIdentity.ztId, { ...existing, profilePhotoUrl: uploadResult.url });
+  } else {
+    const existing = await kvGet('trainer:'+trainerIdentity.trainerId);
+    if(existing) saved = await kvSet('trainer:'+trainerIdentity.trainerId, { ...existing, profilePhotoUrl: uploadResult.url });
+  }
+  if(!saved){ showToast("Couldn't save your photo — check your connection.", 'error'); return; }
+  trainerIdentity.profilePhotoUrl = uploadResult.url;
+  showToast('Profile photo updated.', 'success');
+  renderAdminSidebar();
 }
 function startEditAdminName(){ editingAdminName=true; renderAdminSidebar(); const el=document.getElementById('admin-name-input'); if(el) el.focus(); }
 function saveAdminName(){
@@ -2740,7 +2772,8 @@ async function tryRestoreSession(){
   if(!saved) return false;
   try{
     if(saved.role==='admin'){
-      trainerIdentity = { isAdmin:true, name: getSavedAdminName() };
+      const adminProfile = await getAdminProfile();
+      trainerIdentity = { isAdmin:true, name: getSavedAdminName(), profilePhotoUrl: adminProfile.profilePhotoUrl||'' };
       currentSessionToken = saved.sessionToken;
       currentSessionRole = 'admin'; currentSessionAccountId = 'global';
       adminTab='overview';
@@ -5216,6 +5249,15 @@ function renderAdminSidebar(){
     <div class="brand">${renderLogoMark('brand-mark')}<div class="brand-text"><div class="t1">${esc(COURSE_NAME)}</div><div class="t2">${esc(COURSE_SUB)}</div></div></div>
     <div class="who-card">
       <div class="who-role">${isAdminRole()?'Welcome':'Trainer'}</div>
+      <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px;">
+        ${trainerIdentity.profilePhotoUrl
+          ? `<img src="${esc(trainerIdentity.profilePhotoUrl)}" style="width:38px;height:38px;border-radius:50%;object-fit:cover;flex-shrink:0;">`
+          : `<span style="width:38px;height:38px;border-radius:50%;background:rgba(255,255,255,0.15);color:#fff;font-size:14px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;">${esc((trainerIdentity.name||'?')[0].toUpperCase())}</span>`}
+        <label style="cursor:pointer;font-size:11px;color:rgba(255,255,255,0.7);text-decoration:underline;">
+          ${trainerIdentity.profilePhotoUrl?'Change photo':'Add photo'}
+          <input type="file" accept="image/*" style="display:none;" onchange="handleStaffPhotoUpload(event)">
+        </label>
+      </div>
       ${nameBlock}
       <div class="who-meta">${roleLabel}</div>
       <div class="who-actions"><span onclick="switchId()">Exit &rarr;</span><span onclick="refreshAdminData()">Refresh</span>${isZTRole()?'<span onclick="changeZTScope()">Change Category/City</span>':''}</div>
