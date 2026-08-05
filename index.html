@@ -61,18 +61,32 @@
       console.log('Firestore ready.');
 
       try {
-        const { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } =
-          await import("https://www.gstatic.com/firebasejs/10.7.1/firebase-storage.js");
-        const storage = getStorage(app);
+        // ---- SUPABASE STORAGE CONFIG ----
+        // Fill these in after creating your Supabase project and bucket (see DEPLOY_INSTRUCTIONS.md).
+        const SUPABASE_URL = "PASTE_YOUR_SUPABASE_PROJECT_URL_HERE";
+        const SUPABASE_ANON_KEY = "PASTE_YOUR_SUPABASE_ANON_KEY_HERE";
+        const SUPABASE_BUCKET = "uca-uploads";
+
+        if(SUPABASE_URL.startsWith("PASTE_") || SUPABASE_ANON_KEY.startsWith("PASTE_")){
+          throw new Error("Supabase Storage is not configured yet — see DEPLOY_INSTRUCTIONS.md.");
+        }
+
+        const { createClient } = await import("https://esm.sh/@supabase/supabase-js@2");
+        const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
         window.__fbUploadFile = async (path, file) => {
-          const r = ref(storage, path);
-          await uploadBytes(r, file);
-          return await getDownloadURL(r);
+          const { error: uploadErr } = await supabase.storage
+            .from(SUPABASE_BUCKET)
+            .upload(path, file, { upsert: true, contentType: file.type || undefined });
+          if(uploadErr) throw uploadErr;
+          const { data } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(path);
+          if(!data || !data.publicUrl) throw new Error("Upload succeeded but no public URL was returned.");
+          return data.publicUrl;
         };
         window.__fbDeleteFile = async (path) => {
-          try{ await deleteObject(ref(storage, path)); }catch(e){}
+          try{ await supabase.storage.from(SUPABASE_BUCKET).remove([path]); }catch(e){}
         };
-        console.log('Storage ready.');
+        console.log('Supabase Storage ready.');
       } catch (storageErr) {
         console.error('Storage initialization failed (uploads will be unavailable, but the rest of the app is unaffected):', storageErr);
       }
@@ -694,12 +708,17 @@ async function uploadFile(path, file){
 }
 function uploadErrorToFriendlyMessage(e){
   const code = e && e.code;
+  const msg = (e && e.message) || '';
   if(code==='client/upload-timeout') return "Upload timed out after 45 seconds. Check your connection, or the file may be too large for your network speed.";
   if(code==='storage/unauthorized') return "Upload blocked by storage permissions. Contact your Admin.";
   if(code==='storage/canceled') return "Upload was canceled.";
   if(code==='storage/quota-exceeded') return "Storage quota exceeded. Contact your Admin.";
   if(code==='storage/retry-limit-exceeded') return "Upload timed out — check your connection and try again.";
   if(code==='storage/unauthenticated') return "Your session may have expired. Please log in again.";
+  if(msg.includes('row-level security') || msg.includes('Unauthorized')) return "Upload blocked by storage permissions. Contact your Admin — the storage bucket policy may need to be checked.";
+  if(msg.includes('Bucket not found')) return "Storage bucket is not set up correctly. Contact your Admin.";
+  if(msg.includes('not configured yet')) return "File storage has not been set up yet. Contact your Admin.";
+  if(msg.includes('exceeded the maximum allowed size') || msg.includes('Payload too large')) return "File is too large for storage. Try a smaller file.";
   if(e && e.message) return e.message;
   return "Upload failed for an unknown reason. Please try again.";
 }
