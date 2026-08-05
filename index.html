@@ -2971,6 +2971,7 @@ function renderMainOnly(){
   if(currentDay>0 && currentDay<98 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
   if(currentDay===0 && contentOverrides['home']) initOverrideVideoPlayers({id:'home'});
   ensureAnyInProgressQaTimerTicking();
+  ensureAnyTaskTimerTicking();
 }
 function renderMain(){
   document.getElementById('main').innerHTML = renderCurrentPage();
@@ -2978,6 +2979,7 @@ function renderMain(){
   if(currentDay>0 && currentDay<98 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
   if(currentDay===0 && contentOverrides['home']) initOverrideVideoPlayers({id:'home'});
   ensureAnyInProgressQaTimerTicking();
+  ensureAnyTaskTimerTicking();
 }
 function renderCurrentPage(){
   if(currentDay===-1) return renderProgressCardPage();
@@ -4372,16 +4374,46 @@ function getEffectiveMediaUploadEnabled(dayId){
   if(ov && typeof ov.mediaUploadEnabled === 'boolean') return ov.mediaUploadEnabled;
   return true;
 }
+function taskTimerDurationSeconds(t){
+  const mins = taskTimerMinutes(t)==='custom' ? taskCustomTimerMinutes(t) : (taskTimerMinutes(t)||0);
+  return mins*60;
+}
 function renderAssignment(day){
   const dp = currentUserProgress[day.id];
   const tasks = getEffectiveTasks(day.id);
   const intro = getEffectiveAssignmentIntro(day.id);
   while(dp.tasksChecked.length < tasks.length) dp.tasksChecked.push(false);
+  if(!dp.taskTimers) dp.taskTimers = {};
   const myMedia = myMediaCache[day.id] || [];
   const uploadEnabled = getEffectiveMediaUploadEnabled(day.id);
   return `
     <div class="card"><h3>Hands-on assignment</h3><div class="rte-content ql-editor">${intro||''}</div>
-      ${tasks.map((t,i)=>`<div class="task-row"><input type="checkbox" id="task-${i}" ${dp.tasksChecked[i]?'checked':''} onchange="toggleTask(${day.id},${i})"><label for="task-${i}">${esc(t)}</label></div>`).join('')}
+      ${tasks.map((t,i)=>{
+        const timerSec = taskTimerDurationSeconds(t);
+        if(timerSec<=0){
+          return `<div class="task-row"><input type="checkbox" id="task-${i}" ${dp.tasksChecked[i]?'checked':''} onchange="toggleTask(${day.id},${i})"><label for="task-${i}">${esc(taskText(t))}</label></div>`;
+        }
+        const timerState = dp.taskTimers[i];
+        if(dp.tasksChecked[i]){
+          return `<div class="task-row"><input type="checkbox" id="task-${i}" checked onchange="toggleTask(${day.id},${i})"><label for="task-${i}">${esc(taskText(t))}</label></div>`;
+        }
+        if(!timerState || !timerState.startedAt){
+          return `<div class="task-row" style="align-items:center;">
+            <span style="flex:1;">${esc(taskText(t))} <span style="font-size:11px;color:var(--ink-soft);">(min. ${Math.round(timerSec/60)} min before this can be checked off)</span></span>
+            <button class="btn small amber" onclick="startTaskTimer(${day.id},${i})">Start Task</button>
+          </div>`;
+        }
+        const elapsedSec = (Date.now() - new Date(timerState.startedAt).getTime())/1000;
+        const remainingSec = Math.max(0, Math.round(timerSec - elapsedSec));
+        const timerDone = remainingSec<=0;
+        const mins = Math.floor(remainingSec/60), secs = remainingSec%60;
+        return `<div class="task-row" style="align-items:center;">
+          <span style="flex:1;">${esc(taskText(t))}</span>
+          ${timerDone
+            ? `<input type="checkbox" id="task-${i}" onchange="toggleTask(${day.id},${i})">`
+            : `<span id="task-timer-display-${i}" style="font-family:monospace;font-weight:700;color:var(--brand);">${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}</span>`}
+        </div>`;
+      }).join('')}
       <div class="save-note">${dp.tasksChecked.filter(Boolean).length} of ${tasks.length} tasks checked off &middot; saved automatically</div>
     </div>
     ${uploadEnabled ? `<div class="card"><h3>Photo & video upload</h3><p style="margin-bottom:10px;">Upload photos or videos of your practical work for your trainer to review.</p>
@@ -4467,6 +4499,48 @@ async function handleResubmission(event, originalId){
   await logMediaAudit({ mediaId: record.id, partnerId: currentUser.id, action:'resubmission_uploaded', previousStatus:null, newStatus:'Pending', by: currentUser.name, byRole:'Partner', remark:`Replacement for ${originalId}` });
   showToast('Replacement uploaded — waiting for review.', 'success');
   await loadMyMedia(original.dayId);
+}
+let taskTimerInterval = null;
+let taskTimerIntervalKey = null;
+async function startTaskTimer(dayId, idx){
+  const dp = currentUserProgress[dayId];
+  if(!dp.taskTimers) dp.taskTimers = {};
+  dp.taskTimers[idx] = { startedAt: new Date().toISOString() };
+  await setProgress(currentUser.id, currentUserProgress);
+  renderMainOnly();
+  ensureTaskTimerTicking(dayId, idx);
+}
+function ensureTaskTimerTicking(dayId, idx){
+  const el = document.getElementById('task-timer-display-'+idx);
+  if(!el) return;
+  if(taskTimerInterval && taskTimerIntervalKey===`${dayId}-${idx}`) return;
+  if(taskTimerInterval) clearInterval(taskTimerInterval);
+  taskTimerIntervalKey = `${dayId}-${idx}`;
+  taskTimerInterval = setInterval(()=>{
+    const el = document.getElementById('task-timer-display-'+idx);
+    if(!el){ clearInterval(taskTimerInterval); taskTimerInterval=null; taskTimerIntervalKey=null; return; }
+    const dp = currentUserProgress[dayId];
+    const state = dp.taskTimers && dp.taskTimers[idx];
+    if(!state || !state.startedAt){ clearInterval(taskTimerInterval); taskTimerInterval=null; taskTimerIntervalKey=null; return; }
+    const tasks = getEffectiveTasks(dayId);
+    const timerSec = taskTimerDurationSeconds(tasks[idx]);
+    const elapsedSec = (Date.now() - new Date(state.startedAt).getTime())/1000;
+    const remainingSec = Math.max(0, Math.round(timerSec - elapsedSec));
+    if(remainingSec<=0){ clearInterval(taskTimerInterval); taskTimerInterval=null; taskTimerIntervalKey=null; renderMainOnly(); return; }
+    const mins = Math.floor(remainingSec/60), secs = remainingSec%60;
+    el.textContent = `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
+  }, 1000);
+}
+function ensureAnyTaskTimerTicking(){
+  const dayId = currentDay;
+  if(!(dayId>0 && dayId<98)) return;
+  const dp = currentUserProgress[dayId];
+  if(!dp || !dp.taskTimers) return;
+  const tasks = getEffectiveTasks(dayId);
+  tasks.forEach((t,idx)=>{
+    const state = dp.taskTimers[idx];
+    if(state && state.startedAt && !dp.tasksChecked[idx]) ensureTaskTimerTicking(dayId, idx);
+  });
 }
 async function toggleTask(dayId, idx){
   const cb = document.getElementById('task-'+idx);
@@ -9749,7 +9823,16 @@ function syncModuleDraftFromDOM(){
     }
   });
   moduleDraft.tasks.forEach((t,i)=>{
-    if(g('task-text-'+i)) moduleDraft.tasks[i] = g('task-text-'+i).value;
+    const textEl = g('task-text-'+i);
+    if(!textEl) return;
+    const timerSel = g('task-timer-'+i);
+    let timerMinutes = null;
+    if(timerSel && timerSel.value){
+      timerMinutes = timerSel.value==='custom' ? 'custom' : parseInt(timerSel.value);
+    }
+    const customEl = g('task-customtimermins-'+i);
+    const customTimerMinutes = customEl ? Math.max(1, parseInt(customEl.value)||30) : taskCustomTimerMinutes(t);
+    moduleDraft.tasks[i] = { text: textEl.value, timerMinutes, customTimerMinutes };
   });
   moduleDraft.quiz.forEach((q,i)=>{
     if(g('quiz-q-'+i)) q.question = g('quiz-q-'+i).value;
@@ -9978,9 +10061,12 @@ function onContentDrop(i){
   dragFromIndex = null;
   refreshModuleEditor();
 }
-function addTask(){ syncModuleDraftFromDOM(); moduleDraft.tasks.push('New task'); refreshModuleEditor(); }
+function addTask(){ syncModuleDraftFromDOM(); moduleDraft.tasks.push({text:'New task', timerMinutes:null, customTimerMinutes:30}); refreshModuleEditor(); }
 function removeTask(i){ syncModuleDraftFromDOM(); moduleDraft.tasks.splice(i,1); refreshModuleEditor(); }
 function moveTask(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.tasks.length) return; [moduleDraft.tasks[i],moduleDraft.tasks[j]]=[moduleDraft.tasks[j],moduleDraft.tasks[i]]; refreshModuleEditor(); }
+function taskText(t){ return typeof t==='string' ? t : (t.text||''); }
+function taskTimerMinutes(t){ return typeof t==='string' ? null : (t.timerMinutes||null); }
+function taskCustomTimerMinutes(t){ return typeof t==='string' ? 30 : (t.customTimerMinutes||30); }
 function fmtMinSec(totalSeconds){
   totalSeconds = Math.max(0, Math.round(totalSeconds||0));
   const m = Math.floor(totalSeconds/60), s = totalSeconds%60;
@@ -10443,14 +10529,31 @@ function renderModuleEditorTab(){
       <span class="field-label">Intro text</span>
       ${rteMount('draft-assignment-intro', d.assignmentIntro||'', 'Introduce the assignment', rteCurrentContext())}
     </div>
-    ${d.tasks.map((t,i)=>`
-      <div class="card" style="display:flex;gap:10px;align-items:center;">
-        <input class="field-input" style="margin-bottom:0;flex:1;" id="task-text-${i}" value="${esc(t)}">
-        <button class="btn small secondary" onclick="moveTask(${i},-1)" ${i===0?'disabled':''}>&uarr;</button>
-        <button class="btn small secondary" onclick="moveTask(${i},1)" ${i===d.tasks.length-1?'disabled':''}>&darr;</button>
-        <button class="btn small danger" onclick="removeTask(${i})" ${ccCan('canDelete')?'':'disabled'}>Delete</button>
+    ${d.tasks.map((t,i)=>{
+      const timerMins = taskTimerMinutes(t);
+      const customMins = taskCustomTimerMinutes(t);
+      const timerPresets = [5,10,15,20,30,45,60];
+      return `
+      <div class="card">
+        <div style="display:flex;gap:10px;align-items:center;">
+          <input class="field-input" style="margin-bottom:0;flex:1;" id="task-text-${i}" value="${esc(taskText(t))}">
+          <button class="btn small secondary" onclick="moveTask(${i},-1)" ${i===0?'disabled':''}>&uarr;</button>
+          <button class="btn small secondary" onclick="moveTask(${i},1)" ${i===d.tasks.length-1?'disabled':''}>&darr;</button>
+          <button class="btn small danger" onclick="removeTask(${i})" ${ccCan('canDelete')?'':'disabled'}>Delete</button>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap;">
+          <span class="field-label" style="margin:0;">Minimum time before this task can be checked off:</span>
+          <select class="field-input" style="width:auto;margin-bottom:0;" id="task-timer-${i}" onchange="document.getElementById('task-customtimer-row-${i}').style.display=this.value==='custom'?'inline-block':'none';">
+            <option value="" ${!timerMins?'selected':''}>No timer</option>
+            ${timerPresets.map(m=>`<option value="${m}" ${String(timerMins)===String(m)?'selected':''}>${m<60?m+' minutes':'1 hour'}</option>`).join('')}
+            <option value="custom" ${timerMins==='custom'?'selected':''}>Custom duration</option>
+          </select>
+          <span id="task-customtimer-row-${i}" style="display:${timerMins==='custom'?'inline-block':'none'};">
+            <input class="field-input" style="width:90px;margin-bottom:0;display:inline-block;" id="task-customtimermins-${i}" type="number" min="1" value="${customMins}"> minutes
+          </span>
+        </div>
       </div>
-    `).join('')}
+    `;}).join('')}
     <button class="btn secondary" onclick="addTask()" ${ccCan('canCreate')?'':'disabled'}>+ Add task</button>
     </fieldset>
 
