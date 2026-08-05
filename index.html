@@ -10613,9 +10613,10 @@ Field requirements:
   }
 }
 let aiSuggestState = null;
-function openAiSuggestModal(blockIdx){
+function openAiSuggestModal(blockIdx, target){
   aiSuggestState = {
-    step:'config', blockIdx, count:10, questionType:'mcq', difficulty:'medium', scope:'day',
+    step:'config', blockIdx, target: target||'quickAssessment', count:10, questionType:'mcq', difficulty:'medium',
+    scope: (target==='legacyQuiz') ? 'day' : 'page',
     selectedDayIds:[], includeAnswers:true, includeExplanations:true, includeKLPs:true,
     questions:[], selected:{}, loading:false, error:'',
   };
@@ -10679,7 +10680,7 @@ function renderAiSuggestConfigStep(s){
 
       <span class="field-label">Content source</span>
       <select class="field-input" id="ai-suggest-scope" onchange="updateAiSuggestScope(this.value)">
-        <option value="page" ${s.scope==='page'?'selected':''}>Current Page</option>
+        ${s.target!=='legacyQuiz' ? `<option value="page" ${s.scope==='page'?'selected':''}>Current Page</option>` : ''}
         <option value="day" ${s.scope==='day'?'selected':''}>Current Day</option>
         <option value="selectedDays" ${s.scope==='selectedDays'?'selected':''}>Selected Days</option>
         <option value="course" ${s.scope==='course'?'selected':''}>Entire Course</option>
@@ -10811,6 +10812,21 @@ function addSelectedAiSuggestQuestions(){
   const s = aiSuggestState;
   const toAdd = s.questions.filter(q=>s.selected[q.id]);
   if(toAdd.length===0){ showToast('Select at least one question to add.', 'error'); return; }
+  if(s.target==='legacyQuiz'){
+    toAdd.forEach(q=>{
+      // The legacy Day-Wise Assessment format only supports single-choice questions with a fixed
+      // option list - multi-select/checkbox/short-answer questions are mapped down to their first
+      // correct option here, since this older format can't represent multiple correct answers.
+      let options = q.options.length ? [...q.options] : ['Option A','Option B','Option C','Option D'];
+      while(options.length<2) options.push('');
+      const correct = q.correctIndices.length ? q.correctIndices[0] : 0;
+      moduleDraft.quiz.push({ question: q.question, options, correct });
+    });
+    showToast(`${toAdd.length} question(s) added — still in Draft until you Save & Publish.`, 'success');
+    closeAiSuggestModal();
+    refreshModuleEditor();
+    return;
+  }
   const targetItem = moduleDraft.content[s.blockIdx];
   if(!targetItem || targetItem.type!=='quickAssessment'){ showToast('Could not find the target Quick Assessment block.', 'error'); return; }
   if(!targetItem.questions) targetItem.questions = [];
@@ -11634,6 +11650,7 @@ function renderModuleEditorTab(){
       </div>
     `).join('')}
     <button class="btn secondary" onclick="addQuizQuestion()" ${ccCan('canCreate')?'':'disabled'}>+ Add question</button>
+    <button class="btn amber" onclick="openAiSuggestModal(null,'legacyQuiz')" ${ccCan('canCreate')?'':'disabled'}>🤖 Suggest Questions &amp; Answers</button>
     </fieldset>
     `}
 
