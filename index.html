@@ -10418,6 +10418,339 @@ function insertContentItem(afterIndex, type){
 }
 function removeContentItem(i){ syncModuleDraftFromDOM(); moduleDraft.content.splice(i,1); refreshModuleEditor(); }
 function duplicateContentItem(i){ syncModuleDraftFromDOM(); const copy = JSON.parse(JSON.stringify(moduleDraft.content[i])); moduleDraft.content.splice(i+1,0,copy); refreshModuleEditor(); }
+function findPageIndexForBlockIndex(blockIdx){
+  const groups = getModulePageGroups();
+  let flatIdx = 0;
+  for(let pi=0; pi<groups.length; pi++){
+    for(let k=0; k<groups[pi].length; k++){
+      if(flatIdx===blockIdx) return pi;
+      flatIdx++;
+    }
+  }
+  return 0;
+}
+function contentBlocksToPlainText(items){
+  const opts = { includeAnswers:true, includeAssessmentResults:false, includeMediaLinks:true };
+  return items.map(item=>blockToExportText(item, opts)).filter(Boolean).join('\n\n');
+}
+async function gatherAiSuggestContent(scope, blockIdx, selectedDayIds){
+  syncModuleDraftFromDOM();
+  if(scope==='page'){
+    const groups = getModulePageGroups();
+    const pageIdx = findPageIndexForBlockIndex(blockIdx);
+    return contentBlocksToPlainText(groups[pageIdx]||[]);
+  }
+  if(scope==='day'){
+    return contentBlocksToPlainText(moduleDraft.content||[]);
+  }
+  if(scope==='selectedDays' || scope==='course'){
+    const dayIds = scope==='course' ? await getDayRegistry(editingCourseId) : (selectedDayIds||[]);
+    const parts = [];
+    for(const dayId of dayIds){
+      const ov = dayId===editingDayId ? moduleDraft : ((await getContentOverride(dayId, editingCourseId, editingLanguage)) || (await getContentOverride(dayId, editingCourseId, DEFAULT_LANGUAGE)));
+      if(!ov) continue;
+      const text = contentBlocksToPlainText(ov.content||[]);
+      if(text) parts.push(`--- Day ${dayId}: ${ov.title||''} ---\n${text}`);
+    }
+    return parts.join('\n\n');
+  }
+  return '';
+}
+async function runAiSuggestQuestions(config){
+  if(!currentAiSettings.enabled || !currentAiSettings.proxyUrl){
+    return { ok:false, error:'AI features are not enabled. Turn them on in Theme & Branding first.' };
+  }
+  const content = await gatherAiSuggestContent(config.scope, config.blockIdx, config.selectedDayIds);
+  if(!content || !content.trim()){
+    return { ok:false, error:'No content was found in the selected scope to generate questions from. Add some Theory, Video, or other content first.' };
+  }
+  const typeInstructions = {
+    mcq: 'single-choice MCQ (one correct answer)',
+    multiple: 'multiple-select (more than one correct answer allowed)',
+    checkbox: 'checkbox question (more than one correct answer allowed)',
+    truefalse: 'True/False (exactly two options: "True" and "False")',
+    short: 'short answer (no options - just a model answer)',
+    mixed: 'a healthy mix of single-choice MCQ, multiple-select, True/False, and short answer questions',
+  };
+  const difficultyInstructions = config.difficulty==='mixed' ? 'a mix of easy, medium, and hard questions' : `${config.difficulty} difficulty only`;
+  try{
+    const data = await callAiProxy({
+      model:'claude-sonnet-4-6',
+      max_tokens: Math.min(8000, 400*config.count + 800),
+      messages:[{
+        role:'user',
+        content:[{ type:'text', text: `You are helping a technical trainer write assessment questions for a washing machine repair training course. Generate exactly ${config.count} question(s) based ONLY on the training content below — do not use outside general knowledge, and do not invent facts not present in this content.
+
+TRAINING CONTENT:
+${content.slice(0, 12000)}
+
+Requirements:
+- Question type: ${typeInstructions[config.questionType]||typeInstructions.mixed}
+- Difficulty: ${difficultyInstructions}
+- Every question must be answerable directly from the content above.
+- Avoid duplicate or near-duplicate questions.
+- Avoid trivial or irrelevant questions.
+
+Respond with ONLY a raw JSON array, no markdown formatting, no other text, in exactly this shape:
+[{"question":"...","type":"mcq","options":["...","...","...","..."],"correctIndices":[0],"explanation":"...","relatedTopic":"...","difficulty":"medium","marks":1,"keyLearningPoint":"...","sourceReference":"e.g. Theory section on wiring"}]
+
+Field requirements:
+- "type": one of "mcq", "multiple", "checkbox", "truefalse", "short".
+- "options": for "short" type, use an empty array []. For "truefalse", exactly ["True","False"]. Otherwise 3-5 plausible options.
+- "correctIndices": array of correct option indices (0-based). For "short" type, use an empty array and instead put the model answer directly in "explanation".
+- "difficulty": one of "easy", "medium", "hard".
+- "marks": a small integer, typically 1-3.
+- Keep "explanation" and "keyLearningPoint" concise — 1-2 sentences each.
+- Do not add any text before or after the JSON array.` }]
+      }]
+    });
+    const textBlock = (data.content||[]).find(c=>c.type==='text');
+    if(!textBlock) throw new Error('No text content in AI response.');
+    const rawText = textBlock.text;
+    const jsonMatch = rawText.match(/\[[\s\S]*\]/);
+    const clean = (jsonMatch ? jsonMatch[0] : rawText.replace(/```json|```/g,'')).trim();
+    const parsed = JSON.parse(clean);
+    if(!Array.isArray(parsed)) throw new Error('Expected a JSON array of questions.');
+    const questions = parsed.map(q=>({
+      id: uid(),
+      question: q.question||'Untitled question',
+      type: ['mcq','multiple','checkbox','truefalse','short'].includes(q.type) ? q.type : 'mcq',
+      options: Array.isArray(q.options) ? q.options : [],
+      correctIndices: Array.isArray(q.correctIndices) ? q.correctIndices : [],
+      explanation: q.explanation||'',
+      relatedTopic: q.relatedTopic||'',
+      difficulty: ['easy','medium','hard'].includes(q.difficulty) ? q.difficulty : 'medium',
+      marks: typeof q.marks==='number' ? q.marks : 1,
+      keyLearningPoint: q.keyLearningPoint||'',
+      sourceReference: q.sourceReference||'',
+    }));
+    return { ok:true, questions };
+  }catch(e){
+    console.error('AI question suggestion failed:', e);
+    return { ok:false, error:'Could not generate questions — please try again. ('+(e.message||'unknown error')+')' };
+  }
+}
+let aiSuggestState = null;
+function openAiSuggestModal(blockIdx){
+  aiSuggestState = {
+    step:'config', blockIdx, count:10, questionType:'mcq', difficulty:'medium', scope:'day',
+    selectedDayIds:[], includeAnswers:true, includeExplanations:true, includeKLPs:true,
+    questions:[], selected:{}, loading:false, error:'',
+  };
+  renderAiSuggestOverlay();
+}
+function closeAiSuggestModal(){
+  aiSuggestState = null;
+  const el = document.getElementById('ai-suggest-overlay');
+  if(el && el.parentNode) el.parentNode.removeChild(el);
+}
+function renderAiSuggestOverlay(){
+  const s = aiSuggestState;
+  if(!s) return;
+  let overlay = document.getElementById('ai-suggest-overlay');
+  if(!overlay){
+    overlay = document.createElement('div');
+    overlay.id = 'ai-suggest-overlay';
+    overlay.className = 'confirm-overlay';
+    document.body.appendChild(overlay);
+  }
+  overlay.innerHTML = s.step==='config' ? renderAiSuggestConfigStep(s) : renderAiSuggestReviewStep(s);
+}
+async function updateAiSuggestScope(scope){
+  aiSuggestState.scope = scope;
+  if((scope==='selectedDays') && aiSuggestState.selectedDayIds.length===0){
+    aiSuggestState.selectedDayIds = await getDayRegistry(editingCourseId);
+  }
+  renderAiSuggestOverlay();
+}
+function toggleAiSuggestDay(dayId, checked){
+  const s = aiSuggestState;
+  if(checked){ if(!s.selectedDayIds.includes(dayId)) s.selectedDayIds.push(dayId); }
+  else { s.selectedDayIds = s.selectedDayIds.filter(d=>d!==dayId); }
+}
+function renderAiSuggestConfigStep(s){
+  return `
+    <div class="confirm-box" style="max-width:540px;width:92%;text-align:left;max-height:85vh;overflow-y:auto;">
+      <h3 style="margin-top:0;">Suggest Questions &amp; Answers</h3>
+      <p style="font-size:12.5px;color:var(--ink-soft);margin-top:-6px;">The AI reads your actual course content and drafts questions from it — nothing is added to the assessment until you review and accept it.</p>
+
+      <span class="field-label">Number of questions</span>
+      <input class="field-input" type="number" min="1" max="50" id="ai-suggest-count" value="${s.count}">
+
+      <span class="field-label">Question type</span>
+      <select class="field-input" id="ai-suggest-type">
+        <option value="mcq" ${s.questionType==='mcq'?'selected':''}>MCQ (single choice)</option>
+        <option value="multiple" ${s.questionType==='multiple'?'selected':''}>Multiple-select</option>
+        <option value="checkbox" ${s.questionType==='checkbox'?'selected':''}>Checkbox</option>
+        <option value="truefalse" ${s.questionType==='truefalse'?'selected':''}>True/False</option>
+        <option value="short" ${s.questionType==='short'?'selected':''}>Short answer</option>
+        <option value="mixed" ${s.questionType==='mixed'?'selected':''}>Mixed question types</option>
+      </select>
+
+      <span class="field-label">Difficulty</span>
+      <select class="field-input" id="ai-suggest-difficulty">
+        <option value="easy" ${s.difficulty==='easy'?'selected':''}>Easy</option>
+        <option value="medium" ${s.difficulty==='medium'?'selected':''}>Medium</option>
+        <option value="hard" ${s.difficulty==='hard'?'selected':''}>Hard</option>
+        <option value="mixed" ${s.difficulty==='mixed'?'selected':''}>Mixed</option>
+      </select>
+
+      <span class="field-label">Content source</span>
+      <select class="field-input" id="ai-suggest-scope" onchange="updateAiSuggestScope(this.value)">
+        <option value="page" ${s.scope==='page'?'selected':''}>Current Page</option>
+        <option value="day" ${s.scope==='day'?'selected':''}>Current Day</option>
+        <option value="selectedDays" ${s.scope==='selectedDays'?'selected':''}>Selected Days</option>
+        <option value="course" ${s.scope==='course'?'selected':''}>Entire Course</option>
+      </select>
+      ${s.scope==='selectedDays' ? `<div style="max-height:120px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:12px;">
+        ${s.selectedDayIds.length===0 ? '<p style="font-size:12px;color:var(--ink-soft);margin:0;">Loading days...</p>' :
+          s.selectedDayIds.map(d=>`<label style="display:flex;gap:6px;align-items:center;font-size:12.5px;margin-bottom:4px;"><input type="checkbox" checked onchange="toggleAiSuggestDay(${d},this.checked)"> Day ${d}</label>`).join('')}
+      </div>` : ''}
+
+      <label style="display:flex;gap:8px;align-items:center;margin-bottom:6px;cursor:pointer;"><input type="checkbox" id="ai-suggest-answers" ${s.includeAnswers?'checked':''}> Include answers</label>
+      <label style="display:flex;gap:8px;align-items:center;margin-bottom:6px;cursor:pointer;"><input type="checkbox" id="ai-suggest-explanations" ${s.includeExplanations?'checked':''}> Include explanations</label>
+      <label style="display:flex;gap:8px;align-items:center;margin-bottom:16px;cursor:pointer;"><input type="checkbox" id="ai-suggest-klps" ${s.includeKLPs?'checked':''}> Include key learning points</label>
+
+      ${s.error ? `<p style="color:var(--danger);font-size:12.5px;margin-bottom:10px;">${esc(s.error)}</p>` : ''}
+      <div class="confirm-actions">
+        <button class="btn secondary" onclick="closeAiSuggestModal()">Cancel</button>
+        <button class="btn amber" id="ai-suggest-generate-btn" onclick="runAiSuggestGeneration()" ${s.loading?'disabled':''}>${s.loading?'Generating…':'Generate'}</button>
+      </div>
+    </div>`;
+}
+async function runAiSuggestGeneration(){
+  const s = aiSuggestState;
+  s.count = Math.max(1, Math.min(50, parseInt((document.getElementById('ai-suggest-count')||{}).value)||10));
+  s.questionType = (document.getElementById('ai-suggest-type')||{}).value || 'mcq';
+  s.difficulty = (document.getElementById('ai-suggest-difficulty')||{}).value || 'medium';
+  s.includeAnswers = !!(document.getElementById('ai-suggest-answers')||{}).checked;
+  s.includeExplanations = !!(document.getElementById('ai-suggest-explanations')||{}).checked;
+  s.includeKLPs = !!(document.getElementById('ai-suggest-klps')||{}).checked;
+  s.loading = true; s.error = '';
+  renderAiSuggestOverlay();
+  const result = await runAiSuggestQuestions(s);
+  s.loading = false;
+  if(!result.ok){ s.error = result.error; renderAiSuggestOverlay(); return; }
+  s.questions = result.questions;
+  s.selected = {};
+  result.questions.forEach(q=>{ s.selected[q.id] = true; });
+  s.step = 'review';
+  renderAiSuggestOverlay();
+}
+function renderAiSuggestReviewStep(s){
+  const allSelected = s.questions.length>0 && s.questions.every(q=>s.selected[q.id]);
+  return `
+    <div class="confirm-box" style="max-width:640px;width:94%;text-align:left;max-height:88vh;overflow-y:auto;">
+      <h3 style="margin-top:0;">Review suggested questions</h3>
+      <p style="font-size:12.5px;color:var(--ink-soft);margin-top:-6px;">Nothing is added to the assessment yet — pick which ones to keep, edit anything, then Add to Assessment.</p>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <label style="display:flex;gap:6px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="checkbox" ${allSelected?'checked':''} onchange="toggleAiSuggestSelectAll(this.checked)"> Select all</label>
+        <button class="btn small secondary" onclick="aiSuggestState.step='config'; renderAiSuggestOverlay();">&larr; Back to options</button>
+      </div>
+      ${s.questions.length===0 ? '<p style="color:var(--ink-soft);">No questions left — regenerate or go back.</p>' : s.questions.map((q,qi)=>renderAiSuggestQuestionCard(q,qi,s)).join('')}
+      <div class="confirm-actions" style="flex-wrap:wrap;">
+        <button class="btn secondary" onclick="closeAiSuggestModal()">Cancel</button>
+        <button class="btn amber" onclick="addSelectedAiSuggestQuestions()">Add selected to Assessment</button>
+      </div>
+    </div>`;
+}
+function renderAiSuggestQuestionCard(q, qi, s){
+  const isEditing = s.editingId===q.id;
+  return `<div class="card" style="background:var(--porcelain);margin-bottom:8px;">
+    <div style="display:flex;gap:8px;align-items:flex-start;">
+      <input type="checkbox" style="margin-top:4px;" ${s.selected[q.id]?'checked':''} onchange="toggleAiSuggestSelect('${q.id}',this.checked)">
+      <div style="flex:1;">
+        ${isEditing ? `<input class="field-input" id="ai-suggest-edit-q-${q.id}" value="${esc(q.question)}">` : `<p style="font-weight:600;margin:0 0 4px;">${qi+1}. ${esc(q.question)}</p>`}
+        <p style="font-size:11px;color:var(--ink-soft);margin:0 0 6px;">${esc(q.type)} &middot; ${esc(q.difficulty)} &middot; ${q.marks} mark(s)${q.sourceReference?' &middot; Source: '+esc(q.sourceReference):''}</p>
+        ${q.options.length ? `<ul style="margin:0 0 6px;padding-left:20px;font-size:13px;">${q.options.map((o,oi)=>`<li${q.correctIndices.includes(oi)?' style="color:var(--success);font-weight:600;"':''}>${esc(o)}${q.correctIndices.includes(oi)?' ✓':''}</li>`).join('')}</ul>` : (q.explanation?`<p style="font-size:12.5px;margin:0 0 6px;"><b>Model answer:</b> ${esc(q.explanation)}</p>`:'')}
+        ${q.options.length && q.explanation ? `<p style="font-size:12px;color:var(--ink-soft);margin:0 0 4px;"><b>Explanation:</b> ${esc(q.explanation)}</p>` : ''}
+        ${q.keyLearningPoint ? `<p style="font-size:12px;color:var(--ink-soft);margin:0 0 6px;"><b>Key learning point:</b> ${esc(q.keyLearningPoint)}</p>` : ''}
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          ${isEditing
+            ? `<button class="btn small amber" onclick="saveAiSuggestEdit('${q.id}')">Save</button><button class="btn small secondary" onclick="aiSuggestState.editingId=null; renderAiSuggestOverlay();">Cancel</button>`
+            : `<button class="btn small secondary" onclick="aiSuggestState.editingId='${q.id}'; renderAiSuggestOverlay();">Edit</button>`}
+          <button class="btn small secondary" onclick="duplicateAiSuggestQuestion('${q.id}')">Duplicate</button>
+          <button class="btn small secondary" onclick="moveAiSuggestQuestion('${q.id}',-1)" ${qi===0?'disabled':''}>&uarr;</button>
+          <button class="btn small secondary" onclick="moveAiSuggestQuestion('${q.id}',1)" ${qi===s.questions.length-1?'disabled':''}>&darr;</button>
+          <button class="btn small secondary" onclick="regenerateAiSuggestQuestion('${q.id}')">Regenerate</button>
+          <button class="btn small danger" onclick="deleteAiSuggestQuestion('${q.id}')">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+function toggleAiSuggestSelect(id, checked){ aiSuggestState.selected[id] = checked; }
+function toggleAiSuggestSelectAll(checked){
+  aiSuggestState.questions.forEach(q=>{ aiSuggestState.selected[q.id] = checked; });
+  renderAiSuggestOverlay();
+}
+function deleteAiSuggestQuestion(id){
+  aiSuggestState.questions = aiSuggestState.questions.filter(q=>q.id!==id);
+  delete aiSuggestState.selected[id];
+  renderAiSuggestOverlay();
+}
+function duplicateAiSuggestQuestion(id){
+  const s = aiSuggestState;
+  const idx = s.questions.findIndex(q=>q.id===id);
+  if(idx<0) return;
+  const copy = { ...JSON.parse(JSON.stringify(s.questions[idx])), id: uid() };
+  s.questions.splice(idx+1, 0, copy);
+  s.selected[copy.id] = true;
+  renderAiSuggestOverlay();
+}
+function moveAiSuggestQuestion(id, dir){
+  const s = aiSuggestState;
+  const idx = s.questions.findIndex(q=>q.id===id);
+  const j = idx+dir;
+  if(idx<0 || j<0 || j>=s.questions.length) return;
+  [s.questions[idx], s.questions[j]] = [s.questions[j], s.questions[idx]];
+  renderAiSuggestOverlay();
+}
+function saveAiSuggestEdit(id){
+  const el = document.getElementById('ai-suggest-edit-q-'+id);
+  if(el){ const q = aiSuggestState.questions.find(x=>x.id===id); if(q) q.question = el.value; }
+  aiSuggestState.editingId = null;
+  renderAiSuggestOverlay();
+}
+async function regenerateAiSuggestQuestion(id){
+  const s = aiSuggestState;
+  const idx = s.questions.findIndex(q=>q.id===id);
+  if(idx<0) return;
+  showToast('Regenerating question...', 'info');
+  const result = await runAiSuggestQuestions({ ...s, count:1 });
+  if(!result.ok || !result.questions.length){ showToast(result.error||'Could not regenerate.', 'error'); return; }
+  const newQ = result.questions[0];
+  delete s.selected[id];
+  s.questions[idx] = newQ;
+  s.selected[newQ.id] = true;
+  renderAiSuggestOverlay();
+}
+function addSelectedAiSuggestQuestions(){
+  const s = aiSuggestState;
+  const toAdd = s.questions.filter(q=>s.selected[q.id]);
+  if(toAdd.length===0){ showToast('Select at least one question to add.', 'error'); return; }
+  const targetItem = moduleDraft.content[s.blockIdx];
+  if(!targetItem || targetItem.type!=='quickAssessment'){ showToast('Could not find the target Quick Assessment block.', 'error'); return; }
+  if(!targetItem.questions) targetItem.questions = [];
+  toAdd.forEach(q=>{
+    const mode = (q.type==='multiple' || q.type==='checkbox') ? 'multiple' : 'single';
+    targetItem.questions.push({
+      question: q.question,
+      options: q.type==='short' ? ['Model answer'] : (q.options.length?q.options:['','']),
+      correct: mode==='single' ? (q.correctIndices[0]??0) : 0,
+      correctIndices: mode==='multiple' ? q.correctIndices : [],
+      answerMode: mode,
+      keyLearningPoint: [q.explanation, q.keyLearningPoint].filter(Boolean).join(' '),
+      marks: q.marks,
+      mandatory: true,
+      enabled: true,
+      disabledOptions: [],
+    });
+  });
+  showToast(`${toAdd.length} question(s) added — still in Draft until you Save & Publish.`, 'success');
+  closeAiSuggestModal();
+  refreshModuleEditor();
+}
 function addQuickAssessmentQuestion(i){
   syncModuleDraftFromDOM();
   const item = moduleDraft.content[i];
@@ -11021,6 +11354,7 @@ function renderContentItemCard(item, i, total){
         </div>
       `;}).join('')}
       <button class="btn secondary small" onclick="addQuickAssessmentQuestion(${i})">+ Add question</button>
+      <button class="btn amber small" onclick="openAiSuggestModal(${i})">✨ Suggest Questions &amp; Answers</button>
     `;
   } else if(item.type==='checkboxQuestion' || item.type==='mcqQuestion'){
     const isMcq = item.type==='mcqQuestion';
