@@ -3462,12 +3462,14 @@ function renderQuickAssessmentBlock(dayId, item, idx, dp){
       </div>
       <p style="font-size:12px;color:var(--ink-soft);margin-top:-4px;margin-bottom:12px;">${timerDone ? 'Time is up — submit when ready.' : 'You can answer now, but Submit unlocks only once the timer reaches 00:00. This is a minimum duration, not a time limit.'}</p>
       ${(item.questions||[]).map((q,qi)=>{
+        if(q.enabled===false) return '';
         const mode = q.answerMode||'single';
         const currentMulti = Array.isArray(state.currentAnswers[qi]) ? state.currentAnswers[qi] : [];
+        const disabledOpts = q.disabledOptions||[];
         return `
         <div style="margin-bottom:16px;">
           <p style="font-weight:600;margin-bottom:8px;">${qi+1}. ${esc(q.question)}${mode==='multiple'?' <span style="font-weight:400;font-size:11.5px;color:var(--ink-soft);">(select all that apply)</span>':''}</p>
-          ${(q.options||[]).map((opt,oi)=>`
+          ${(q.options||[]).map((opt,oi)=>disabledOpts.includes(oi) ? '' : `
             <label style="display:flex;gap:8px;align-items:center;padding:8px;border-radius:8px;cursor:pointer;" class="qa-option-label">
               ${mode==='multiple'
                 ? `<input type="checkbox" name="qa-answer-${idx}-${qi}" value="${oi}" ${currentMulti.includes(oi)?'checked':''} onchange="saveQuickAssessmentAnswerMulti(${jsDayId(dayId)},${idx},${qi},${oi},this.checked)">`
@@ -3489,6 +3491,7 @@ function renderQuickAssessmentBlock(dayId, item, idx, dp){
       ${!last.passed ? `<div style="margin-top:10px;">
         <p style="font-weight:600;margin-bottom:6px;">Questions to review:</p>
         ${(item.questions||[]).map((q,qi)=>{
+          if(q.enabled===false) return '';
           const mode = q.answerMode||'single';
           let isWrong, correctText;
           if(mode==='multiple'){
@@ -3588,8 +3591,9 @@ async function submitQuickAssessment(dayId, idx, isAutoSubmit){
     const checked = document.querySelector(`input[name="qa-answer-${idx}-${qi}"]:checked`);
     return checked ? parseInt(checked.value) : (state.currentAnswers[qi] ?? -1);
   });
-  const total = (item.questions||[]).length;
+  const total = (item.questions||[]).filter(q=>q.enabled!==false).length;
   const score = (item.questions||[]).reduce((sum,q,qi)=>{
+    if(q.enabled===false) return sum;
     const mode = q.answerMode||'single';
     if(mode==='multiple'){
       const correct = [...(q.correctIndices||[])].sort((a,b)=>a-b);
@@ -9584,6 +9588,7 @@ function syncModuleDraftFromDOM(){
       if(item.questions){
         item.questions.forEach((q,qi)=>{
           if(g(`qa-q-${i}-${qi}`)) q.question = g(`qa-q-${i}-${qi}`).value;
+          if(g(`qa-marks-${i}-${qi}`)) q.marks = Math.max(0, parseInt(g(`qa-marks-${i}-${qi}`).value)||0);
           if(!q.options) q.options = ['','','',''];
           q.options.forEach((o,oi)=>{ if(g(`qa-opt-${i}-${qi}-${oi}`)) q.options[oi] = g(`qa-opt-${i}-${qi}-${oi}`).value; });
           const correctEl = document.querySelector(`input[name="qa-correct-${i}-${qi}"]:checked`);
@@ -9649,7 +9654,31 @@ function addQuickAssessmentQuestion(i){
   syncModuleDraftFromDOM();
   const item = moduleDraft.content[i];
   if(!item.questions) item.questions = [];
-  item.questions.push({ question:'New question', options:['','','',''], correct:0, correctIndices:[], answerMode:'single', keyLearningPoint:'' });
+  item.questions.push({ question:'New question', options:['','','',''], correct:0, correctIndices:[], answerMode:'single', keyLearningPoint:'', marks:1, mandatory:true, enabled:true, disabledOptions:[] });
+  refreshModuleEditor();
+}
+function duplicateQuickAssessmentQuestion(i, qi){
+  syncModuleDraftFromDOM();
+  const qs = moduleDraft.content[i].questions;
+  const copy = JSON.parse(JSON.stringify(qs[qi]));
+  qs.splice(qi+1, 0, copy);
+  refreshModuleEditor();
+}
+function toggleQaQuestionEnabled(i, qi, enabled){
+  syncModuleDraftFromDOM();
+  moduleDraft.content[i].questions[qi].enabled = enabled;
+  refreshModuleEditor();
+}
+function toggleQaQuestionMandatory(i, qi, mandatory){
+  syncModuleDraftFromDOM();
+  moduleDraft.content[i].questions[qi].mandatory = mandatory;
+}
+function toggleQaOptionEnabled(i, qi, oi, enabled){
+  syncModuleDraftFromDOM();
+  const q = moduleDraft.content[i].questions[qi];
+  if(!q.disabledOptions) q.disabledOptions = [];
+  if(enabled) q.disabledOptions = q.disabledOptions.filter(x=>x!==oi);
+  else if(!q.disabledOptions.includes(oi)) q.disabledOptions.push(oi);
   refreshModuleEditor();
 }
 function removeQuickAssessmentQuestion(i, qi){
@@ -10149,33 +10178,47 @@ function renderContentItemCard(item, i, total){
       ${(item.questions||[]).length===0?`<div class="empty-state" style="padding:10px;">No questions yet — click "+ Add question" below.</div>`:''}
       ${(item.questions||[]).map((q,qi)=>{
         const mode = q.answerMode||'single';
+        const qEnabled = q.enabled!==false;
+        const disabledOpts = q.disabledOptions||[];
         return `
-        <div class="card" style="background:var(--porcelain);margin-bottom:8px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-            <span class="field-label" style="margin:0;">Question ${qi+1}</span>
-            <button class="btn small danger" onclick="removeQuickAssessmentQuestion(${i},${qi})">Remove</button>
+        <div class="card" style="background:var(--porcelain);margin-bottom:8px;${qEnabled?'':'opacity:0.6;'}">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:6px;">
+            <span class="field-label" style="margin:0;">Question ${qi+1}${qEnabled?'':' (disabled — hidden from partners)'}</span>
+            <div style="display:flex;gap:6px;">
+              <button class="btn small secondary" type="button" onclick="toggleQaQuestionEnabled(${i},${qi},${!qEnabled})">${qEnabled?'Disable':'Enable'}</button>
+              <button class="btn small secondary" type="button" onclick="duplicateQuickAssessmentQuestion(${i},${qi})">Duplicate</button>
+              <button class="btn small danger" onclick="removeQuickAssessmentQuestion(${i},${qi})">Remove</button>
+            </div>
           </div>
           <input class="field-input" id="qa-q-${i}-${qi}" value="${esc(q.question||'')}" placeholder="Question text">
+          <div style="display:flex;gap:14px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+            <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="checkbox" id="qa-mandatory-${i}-${qi}" ${q.mandatory!==false?'checked':''} onchange="toggleQaQuestionMandatory(${i},${qi},this.checked)"> Mandatory</label>
+            <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;">Marks: <input class="field-input" id="qa-marks-${i}-${qi}" type="number" min="0" style="width:70px;margin-bottom:0;" value="${q.marks??1}"></label>
+          </div>
           <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
             <span class="field-label" style="margin:0;">Answer type:</span>
-            <label style="display:flex;gap:4px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="radio" name="qa-mode-${i}-${qi}" ${mode==='single'?'checked':''} onchange="setQaAnswerMode(${i},${qi},'single')"> Single-choice</label>
-            <label style="display:flex;gap:4px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="radio" name="qa-mode-${i}-${qi}" ${mode==='multiple'?'checked':''} onchange="setQaAnswerMode(${i},${qi},'multiple')"> Multiple-choice</label>
+            <label style="display:flex;gap:4px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="radio" name="qa-mode-${i}-${qi}" ${mode==='single'?'checked':''} onchange="setQaAnswerMode(${i},${qi},'single')"> MCQ (Single Choice)</label>
+            <label style="display:flex;gap:4px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="radio" name="qa-mode-${i}-${qi}" ${mode==='multiple'?'checked':''} onchange="setQaAnswerMode(${i},${qi},'multiple')"> Multiple Choice / Checkbox (Multiple Correct)</label>
             <button class="btn small secondary" type="button" onclick="setQaTrueFalse(${i},${qi})">Set as True/False</button>
           </div>
-          ${(q.options||['','','','']).map((opt,oi)=>`
-            <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
+          <p style="font-size:11.5px;color:var(--ink-soft);margin-top:-6px;margin-bottom:8px;">Switching answer type keeps your existing options and text — nothing is deleted.</p>
+          ${(q.options||['','','','']).map((opt,oi)=>{
+            const optEnabled = !disabledOpts.includes(oi);
+            return `
+            <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;${optEnabled?'':'opacity:0.55;'}">
               ${mode==='multiple'
                 ? `<input type="checkbox" onchange="toggleQaCorrectOption(${i},${qi},${oi},this.checked)" ${(q.correctIndices||[]).includes(oi)?'checked':''}>`
                 : `<input type="radio" name="qa-correct-${i}-${qi}" value="${oi}" ${q.correct===oi?'checked':''}>`}
               <input class="field-input" style="margin-bottom:0;flex:1;" id="qa-opt-${i}-${qi}-${oi}" value="${esc(opt)}" placeholder="Option ${oi+1}">
+              <button class="btn small secondary" type="button" title="${optEnabled?'Disable':'Enable'} option" onclick="toggleQaOptionEnabled(${i},${qi},${oi},${!optEnabled})">${optEnabled?'Disable':'Enable'}</button>
               <button class="btn small secondary" type="button" title="Move up" onclick="moveQaOption(${i},${qi},${oi},-1)" ${oi===0?'disabled':''}>&uarr;</button>
               <button class="btn small secondary" type="button" title="Move down" onclick="moveQaOption(${i},${qi},${oi},1)" ${oi===(q.options.length-1)?'disabled':''}>&darr;</button>
               <button class="btn small secondary" type="button" title="Duplicate" onclick="duplicateQaOption(${i},${qi},${oi})">Duplicate</button>
               <button class="btn small danger" type="button" title="Delete" onclick="removeQaOption(${i},${qi},${oi})">&times;</button>
             </div>
-          `).join('')}
+          `;}).join('')}
           <button class="btn small secondary" type="button" onclick="addQaOption(${i},${qi})">+ Add option</button>
-          <span class="field-label">Key learning point (shown if this question is answered incorrectly)</span>
+          <span class="field-label">Key learning point / explanation (shown if this question is answered incorrectly)</span>
           ${rteMount(`qa-klp-${i}-${qi}`, q.keyLearningPoint||'', 'Shown when this question is answered incorrectly', rteCurrentContext())}
         </div>
       `;}).join('')}
