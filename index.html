@@ -1053,12 +1053,13 @@ const CC_CONTENT_TYPES = [
 ];
 const CC_ACTION_TYPES = [
   ['canCreate','Create new content'], ['canEdit','Edit existing content'], ['canDelete','Delete content'],
-  ['canSaveDraft','Save as Draft'], ['canPublish','Save & Publish'],
+  ['canSaveDraft','Save as Draft'], ['canPublish','Save & Publish'], ['canExport','Export module (PDF/Text)'],
 ];
 function defaultCCPermissions(){
   const perms = { viewOnly:false };
   CC_CONTENT_TYPES.forEach(([key])=>{ perms[key] = true; });
   CC_ACTION_TYPES.forEach(([key])=>{ perms[key] = true; });
+  perms.canExport = false; // export requires explicit authorization, unlike other CC actions
   return perms;
 }
 function effectiveCCPermissions(cc){
@@ -5281,7 +5282,10 @@ function renderCategoryManageTab(){
                 ${COURSE_STATUSES.map(s=>`<option value="${s}" ${st===s?'selected':''}>${s}</option>`).join('')}
               </select>`}
             </td>
-            <td><button class="btn small secondary" onclick="openCourseModuleEditor('${courseId}')">Edit modules</button></td>
+            <td style="display:flex;gap:6px;flex-wrap:wrap;">
+              <button class="btn small secondary" onclick="openCourseModuleEditor('${courseId}')">Edit modules</button>
+              ${(isAdminRole() || (isCC && trainerIdentity.permissions.canExport)) ? `<button class="btn small secondary" onclick="openExportModal('${courseId}')">Export</button>` : ''}
+            </td>
             ${isCC ? '' : `<td style="display:flex;gap:6px;flex-wrap:wrap;">
               <button class="btn small secondary" onclick="renameCourse('${courseId}')">Rename</button>
               <button class="btn small danger" onclick="removeCourse('${courseId}')">Remove</button>
@@ -8122,6 +8126,308 @@ function jumpToCourseModules(){
   localStorage.setItem('uca_last_admin_category', catId);
   localStorage.setItem('uca_last_admin_course', courseId);
   openCourseModuleEditor(courseId);
+}
+let exportModalState = null;
+async function openExportModal(courseId){
+  const course = adminCourses[courseId];
+  if(!course) return;
+  const category = adminCategories[course.categoryId];
+  await seedDefaultLanguageIfEmpty();
+  adminLanguages = await listLanguages();
+  const dayIds = await getDayRegistry(courseId);
+  const dayTitles = {};
+  await Promise.all(dayIds.map(async id=>{
+    const ov = await getContentOverride(id, courseId, DEFAULT_LANGUAGE);
+    dayTitles[id] = ov ? ov.title : `Day ${id}`;
+  }));
+  const homeOv = await getContentOverride('home', courseId, DEFAULT_LANGUAGE);
+  exportModalState = {
+    courseId, categoryId: course.categoryId, categoryName: category ? category.name : '', courseName: course.name,
+    language: DEFAULT_LANGUAGE, dayIds, dayTitles, hasHome: !!homeOv,
+    selectedDays: [...dayIds], includeHome: !!homeOv,
+    includeAnswers: true, includeAssessmentResults: false, includeMediaLinks: true, includeUnpublished: false,
+  };
+  renderExportModal();
+}
+function closeExportModal(){
+  exportModalState = null;
+  const el = document.getElementById('export-modal-overlay');
+  if(el && el.parentNode) el.parentNode.removeChild(el);
+}
+function renderExportModal(){
+  const s = exportModalState;
+  if(!s) return;
+  let overlay = document.getElementById('export-modal-overlay');
+  if(!overlay){
+    overlay = document.createElement('div');
+    overlay.id = 'export-modal-overlay';
+    overlay.className = 'confirm-overlay';
+    document.body.appendChild(overlay);
+  }
+  overlay.innerHTML = `
+    <div class="confirm-box" style="max-width:560px;width:92%;text-align:left;max-height:85vh;overflow-y:auto;">
+      <h3 style="margin-top:0;">Export module</h3>
+      <p style="font-size:13px;color:var(--ink-soft);margin-top:-6px;">${esc(s.categoryName)} → ${esc(s.courseName)}</p>
+
+      <span class="field-label">Language</span>
+      <select class="field-input" id="export-language" onchange="updateExportLanguage(this.value)">
+        ${Object.values(adminLanguages).filter(l=>l.active!==false).map(l=>`<option value="${esc(l.name)}" ${s.language===l.name?'selected':''}>${esc(l.name)}${l.isDefault?' (default)':''}</option>`).join('')}
+      </select>
+
+      <span class="field-label">Days to include</span>
+      <div style="margin-bottom:6px;">
+        <label style="display:flex;gap:8px;align-items:center;margin-bottom:6px;cursor:pointer;">
+          <input type="checkbox" id="export-include-home" ${s.includeHome?'checked':''} onchange="toggleExportHome(this.checked)" ${!s.hasHome?'disabled':''}>
+          <span>Home Page${!s.hasHome?' (none set up for this course)':''}</span>
+        </label>
+        <label style="display:flex;gap:8px;align-items:center;margin-bottom:6px;cursor:pointer;">
+          <input type="checkbox" ${s.selectedDays.length===s.dayIds.length && s.dayIds.length>0?'checked':''} onchange="toggleExportAllDays(this.checked)">
+          <span><b>All days</b> (${s.dayIds.length})</span>
+        </label>
+      </div>
+      <div style="max-height:160px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:14px;">
+        ${s.dayIds.length===0 ? '<p style="font-size:12.5px;color:var(--ink-soft);margin:0;">This course has no days yet.</p>' :
+          s.dayIds.map(id=>`
+          <label style="display:flex;gap:8px;align-items:center;margin-bottom:4px;cursor:pointer;font-size:13px;">
+            <input type="checkbox" class="export-day-check" value="${id}" ${s.selectedDays.includes(id)?'checked':''} onchange="toggleExportDay(${id}, this.checked)">
+            <span>Day ${id} — ${esc(s.dayTitles[id]||'Untitled')}</span>
+          </label>`).join('')}
+      </div>
+
+      <span class="field-label">Include in export</span>
+      <label style="display:flex;gap:8px;align-items:center;margin-bottom:6px;cursor:pointer;">
+        <input type="checkbox" ${s.includeAnswers?'checked':''} onchange="exportModalState.includeAnswers=this.checked">
+        <span>Correct answers &amp; key learning points</span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:center;margin-bottom:6px;cursor:pointer;">
+        <input type="checkbox" ${s.includeAssessmentResults?'checked':''} onchange="exportModalState.includeAssessmentResults=this.checked">
+        <span>Assessment scoring details (passing %, timer, attempts)</span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:center;margin-bottom:6px;cursor:pointer;">
+        <input type="checkbox" ${s.includeMediaLinks?'checked':''} onchange="exportModalState.includeMediaLinks=this.checked">
+        <span>Media links &amp; QR codes (video/audio)</span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:center;margin-bottom:16px;cursor:pointer;">
+        <input type="checkbox" ${s.includeUnpublished?'checked':''} onchange="exportModalState.includeUnpublished=this.checked">
+        <span>Include unpublished draft content</span>
+      </label>
+
+      <div class="confirm-actions" style="flex-wrap:wrap;">
+        <button class="btn secondary" onclick="closeExportModal()">Cancel</button>
+        <button class="btn secondary" id="export-text-btn" onclick="runTextExport()">Export Editable Text</button>
+        <button class="btn amber" id="export-pdf-btn" onclick="runPdfExport()">Export to PDF</button>
+      </div>
+      <p id="export-status-note" style="font-size:12px;color:var(--ink-soft);margin-top:10px;"></p>
+    </div>`;
+}
+function updateExportLanguage(lang){ exportModalState.language = lang; }
+function toggleExportHome(checked){ exportModalState.includeHome = checked; }
+function toggleExportAllDays(checked){
+  exportModalState.selectedDays = checked ? [...exportModalState.dayIds] : [];
+  renderExportModal();
+}
+function toggleExportDay(dayId, checked){
+  const s = exportModalState;
+  if(checked){ if(!s.selectedDays.includes(dayId)) s.selectedDays.push(dayId); }
+  else { s.selectedDays = s.selectedDays.filter(d=>d!==dayId); }
+}
+async function buildExportContent(s){
+  const sections = [];
+  if(s.includeHome){
+    const homeOv = s.includeUnpublished
+      ? (await getDraftContentOverride('home', s.courseId, s.language)) || (await getContentOverride('home', s.courseId, s.language)) || (await getContentOverride('home', s.courseId, DEFAULT_LANGUAGE))
+      : (await getContentOverride('home', s.courseId, s.language)) || (await getContentOverride('home', s.courseId, DEFAULT_LANGUAGE));
+    if(homeOv) sections.push({ id:'home', label:'Home Page', title: homeOv.title||'Home Page', ov: migrateOldOverrideToUnified(homeOv) });
+  }
+  for(const dayId of s.selectedDays){
+    const ov = s.includeUnpublished
+      ? (await getDraftContentOverride(dayId, s.courseId, s.language)) || (await getContentOverride(dayId, s.courseId, s.language)) || (await getContentOverride(dayId, s.courseId, DEFAULT_LANGUAGE))
+      : (await getContentOverride(dayId, s.courseId, s.language)) || (await getContentOverride(dayId, s.courseId, DEFAULT_LANGUAGE));
+    if(ov) sections.push({ id:'day-'+dayId, label:'Day '+dayId, title: ov.title||('Day '+dayId), ov: migrateOldOverrideToUnified(ov) });
+  }
+  return sections;
+}
+function exportQrImgTag(url, sizePx){
+  const size = sizePx||110;
+  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&data=${encodeURIComponent(url)}`;
+  return `<img src="${esc(qrUrl)}" width="${size}" height="${size}" style="display:block;" alt="QR code">`;
+}
+function blockToExportHtml(item, opts){
+  const t = item.type;
+  if(t==='theory') return `<div class="ex-block"><h3>${esc(item.heading||'')}</h3><div class="ex-rich">${item.body||''}</div></div>`;
+  if(t==='text') return `<div class="ex-block"><div class="ex-rich">${item.body||''}</div></div>`;
+  if(t==='banner') return `<div class="ex-block ex-banner">${item.imageUrl?`<img src="${esc(item.imageUrl)}" class="ex-img">`:''}<h3>${esc(item.headline||'')}</h3>${item.subtext?`<p>${esc(item.subtext)}</p>`:''}</div>`;
+  if(t==='button') return `<div class="ex-block"><p><b>Button:</b> ${esc(item.label||'')}${opts.includeMediaLinks && item.action?` — <a href="${esc(item.action)}">${esc(item.action)}</a>`:''}</p></div>`;
+  if(t==='photo') return `<div class="ex-block ex-avoid-break"><h4>${esc(item.title||'Photo')}</h4>${item.url?`<img src="${esc(item.url)}" class="ex-img">`:'<p><em>No image linked.</em></p>'}${item.caption?`<p class="ex-caption">${esc(item.caption)}</p>`:''}</div>`;
+  if(t==='video'){
+    if(!opts.includeMediaLinks) return `<div class="ex-block"><h4>Video: ${esc(item.title||'Untitled')}</h4><p><em>Media link excluded from this export.</em></p></div>`;
+    return `<div class="ex-block ex-avoid-break ex-media-row"><div><h4>Video: ${esc(item.title||'Untitled')}</h4><p class="ex-link">${esc(item.url||'')}</p></div>${item.url?exportQrImgTag(item.url):''}</div>`;
+  }
+  if(t==='audio'){
+    if(!opts.includeMediaLinks) return `<div class="ex-block"><h4>Audio: ${esc(item.title||'Untitled')}</h4><p><em>Media link excluded from this export.</em></p></div>`;
+    return `<div class="ex-block ex-avoid-break ex-media-row"><div><h4>Audio: ${esc(item.title||'Untitled')}</h4><p class="ex-link">${esc(item.url||'')}</p></div>${item.url?exportQrImgTag(item.url):''}</div>`;
+  }
+  if(t==='uploadActivity') return `<div class="ex-block"><h4>Upload Activity: ${esc(item.activityLabel||'')}</h4><p>${esc(item.instructions||'')}</p><p class="ex-meta">Accepts: ${item.mediaType==='video'?'Video':'Photo'}</p></div>`;
+  if(t==='quickAssessment' || t==='checkboxQuestion' || t==='mcqQuestion'){
+    const kindLabel = t==='quickAssessment'?'Quick Assessment':t==='checkboxQuestion'?'Checkbox Questions':'MCQ';
+    const qs = (item.questions||[]).map((q,qi)=>{
+      const opts_ = (q.options||[]).map((o,oi)=>{
+        const isCorrect = t==='quickAssessment' ? oi===q.correct : t==='mcqQuestion' ? oi===q.correct : (q.correctIndices||[]).includes(oi);
+        return `<li${opts.includeAnswers && isCorrect ? ' class="ex-correct"':''}>${esc(o)}${opts.includeAnswers && isCorrect ? ' ✓':''}</li>`;
+      }).join('');
+      const klp = opts.includeAnswers && q.keyLearningPoint ? `<p class="ex-klp"><b>Key learning point:</b> ${q.keyLearningPoint}</p>` : '';
+      const explain = opts.includeAnswers && q.explanation ? `<p class="ex-klp"><b>Explanation:</b> ${q.explanation}</p>` : '';
+      return `<div class="ex-question"><p><b>${qi+1}. ${esc(q.question||'')}</b></p><ul>${opts_}</ul>${klp}${explain}</div>`;
+    }).join('');
+    const meta = opts.includeAssessmentResults && t==='quickAssessment'
+      ? `<p class="ex-meta">Passing: ${item.passingPercent||70}% &middot; Time limit: ${item.timerMinutes==='custom'?(item.customTimerMinutes||0)+' min':(item.timerMinutes||10)+' min'} &middot; Max attempts: ${item.maxAttempts||3}</p>` : '';
+    return `<div class="ex-block ex-avoid-break"><h4>${kindLabel}: ${esc(item.title||'')}</h4>${meta}${qs}</div>`;
+  }
+  if(t==='pageBreak') return `<div class="ex-pagebreak-marker"></div>`;
+  return '';
+}
+function blockToExportText(item, opts){
+  const t = item.type;
+  const lines = [];
+  if(t==='theory'){ lines.push('## '+stripHtml(item.heading||'')); lines.push(stripHtml(item.body||'')); }
+  else if(t==='text'){ lines.push(stripHtml(item.body||'')); }
+  else if(t==='banner'){ lines.push('### '+stripHtml(item.headline||'')); if(item.subtext) lines.push(stripHtml(item.subtext)); }
+  else if(t==='button'){ lines.push(`[Button: ${item.label||''}]` + (opts.includeMediaLinks && item.action ? ' -> '+item.action : '')); }
+  else if(t==='photo'){ lines.push(`[Photo: ${item.title||'Untitled'}]`); if(opts.includeMediaLinks && item.url) lines.push('Image URL: '+item.url); if(item.caption) lines.push('Caption: '+item.caption); }
+  else if(t==='video'){ lines.push(`[Video: ${item.title||'Untitled'}]`); if(opts.includeMediaLinks && item.url) lines.push('Link: '+item.url); }
+  else if(t==='audio'){ lines.push(`[Audio: ${item.title||'Untitled'}]`); if(opts.includeMediaLinks && item.url) lines.push('Link: '+item.url); }
+  else if(t==='uploadActivity'){ lines.push(`[Upload Activity: ${item.activityLabel||''}]`); lines.push(item.instructions||''); }
+  else if(t==='quickAssessment' || t==='checkboxQuestion' || t==='mcqQuestion'){
+    const kindLabel = t==='quickAssessment'?'Quick Assessment':t==='checkboxQuestion'?'Checkbox Questions':'MCQ';
+    lines.push(`### ${kindLabel}: ${item.title||''}`);
+    (item.questions||[]).forEach((q,qi)=>{
+      lines.push(`${qi+1}. ${q.question||''}`);
+      (q.options||[]).forEach((o,oi)=>{
+        const isCorrect = t==='quickAssessment' ? oi===q.correct : t==='mcqQuestion' ? oi===q.correct : (q.correctIndices||[]).includes(oi);
+        lines.push(`   - ${o}${opts.includeAnswers && isCorrect ? ' [CORRECT]' : ''}`);
+      });
+      if(opts.includeAnswers && q.keyLearningPoint) lines.push('   Key learning point: '+stripHtml(q.keyLearningPoint));
+      if(opts.includeAnswers && q.explanation) lines.push('   Explanation: '+stripHtml(q.explanation));
+    });
+  }
+  return lines.filter(Boolean).join('\n');
+}
+function stripHtml(html){
+  return String(html||'').replace(/<[^>]+>/g,' ').replace(/&nbsp;/g,' ').replace(/\s+/g,' ').trim();
+}
+async function runPdfExport(){
+  const s = exportModalState;
+  const note = document.getElementById('export-status-note');
+  if(note) note.textContent = 'Preparing export...';
+  const sections = await buildExportContent(s);
+  if(sections.length===0){ if(note) note.textContent = 'Nothing selected to export.'; return; }
+  const opts = { includeAnswers:s.includeAnswers, includeAssessmentResults:s.includeAssessmentResults, includeMediaLinks:s.includeMediaLinks };
+  const tocHtml = sections.map((sec,i)=>`<li><a href="#ex-sec-${i}">${esc(sec.label)} — ${esc(sec.title)}</a></li>`).join('');
+  const bodyHtml = sections.map((sec,i)=>{
+    const blocks = (sec.ov.content||[]).map(item=>blockToExportHtml(item, opts)).join('');
+    const assignmentHtml = (opts.includeAnswers && sec.ov.assignmentIntro) ? `<div class="ex-block"><h4>Assignment</h4><div class="ex-rich">${sec.ov.assignmentIntro}</div></div>` : '';
+    return `<section class="ex-section" id="ex-sec-${i}">
+      <div class="ex-section-header">${esc(sec.label)}</div>
+      <h2>${esc(sec.title)}</h2>
+      ${blocks}
+      ${assignmentHtml}
+    </section>`;
+  }).join('');
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(s.courseName)} — Export</title>
+  <style>
+    @page { margin: 20mm 16mm; }
+    body { font-family: Arial, Helvetica, sans-serif; color:#1a1a2e; font-size:12.5px; line-height:1.5; }
+    h1,h2,h3,h4 { font-family: Arial, Helvetica, sans-serif; color:#1a1a2e; }
+    .ex-cover { text-align:center; padding-top:22vh; page-break-after: always; }
+    .ex-cover h1 { font-size:26px; margin-bottom:6px; }
+    .ex-cover p { color:#555; font-size:13px; margin:2px 0; }
+    .ex-toc { page-break-after: always; }
+    .ex-toc ol, .ex-toc ul { padding-left:20px; }
+    .ex-toc a { color:#1a1a2e; text-decoration:none; }
+    .ex-section { page-break-before: always; }
+    .ex-section:first-of-type { page-break-before: auto; }
+    .ex-section-header { font-size:10px; text-transform:uppercase; letter-spacing:0.05em; color:#888; border-bottom:1px solid #ddd; padding-bottom:4px; margin-bottom:10px; }
+    .ex-block { margin-bottom:16px; }
+    .ex-avoid-break { page-break-inside: avoid; }
+    .ex-img { max-width:100%; max-height:320px; border-radius:6px; display:block; margin:6px 0; }
+    .ex-caption { color:#666; font-size:11px; margin-top:2px; }
+    .ex-link { color:#333; word-break:break-all; font-size:11.5px; }
+    .ex-media-row { display:flex; gap:16px; align-items:flex-start; justify-content:space-between; }
+    .ex-meta { color:#777; font-size:11px; }
+    .ex-question { margin-bottom:12px; }
+    .ex-question ul { margin:4px 0; padding-left:20px; }
+    .ex-correct { color:#2E9E4F; font-weight:bold; }
+    .ex-klp { background:#F5F3FB; padding:6px 10px; border-radius:6px; font-size:11.5px; margin-top:6px; }
+    .ex-pagebreak-marker { page-break-after: always; }
+    .ex-rich img { max-width:100%; }
+    @media print {
+      @page { @bottom-center { content: counter(page) " / " counter(pages); font-size:10px; color:#888; } }
+    }
+  </style></head>
+  <body>
+    <div class="ex-cover">
+      <h1>${esc(s.courseName)}</h1>
+      <p>${esc(s.categoryName)}</p>
+      <p>Language: ${esc(s.language)}</p>
+      <p>Exported ${esc(new Date().toLocaleDateString())}</p>
+    </div>
+    <div class="ex-toc">
+      <h2>Table of Contents</h2>
+      <ol>${tocHtml}</ol>
+    </div>
+    ${bodyHtml}
+  </body></html>`;
+  const win = window.open('', '_blank');
+  if(!win){ if(note) note.textContent = 'Your browser blocked the export window — please allow pop-ups for this site and try again.'; return; }
+  win.document.open();
+  win.document.write(html);
+  win.document.close();
+  if(note) note.textContent = 'Export ready — use your browser\'s print dialog to save as PDF.';
+  win.onload = () => { setTimeout(()=>{ try{ win.focus(); win.print(); }catch(e){} }, 700); };
+}
+async function runTextExport(){
+  const s = exportModalState;
+  const note = document.getElementById('export-status-note');
+  if(note) note.textContent = 'Preparing export...';
+  const sections = await buildExportContent(s);
+  if(sections.length===0){ if(note) note.textContent = 'Nothing selected to export.'; return; }
+  const opts = { includeAnswers:s.includeAnswers, includeAssessmentResults:s.includeAssessmentResults, includeMediaLinks:s.includeMediaLinks };
+  const lines = [];
+  lines.push('='.repeat(60));
+  lines.push(s.courseName);
+  lines.push(s.categoryName);
+  lines.push('Language: '+s.language);
+  lines.push('Exported: '+new Date().toLocaleDateString());
+  lines.push('='.repeat(60));
+  lines.push('');
+  lines.push('TABLE OF CONTENTS');
+  sections.forEach(sec=>lines.push('- '+sec.label+' — '+sec.title));
+  lines.push('');
+  sections.forEach(sec=>{
+    lines.push('');
+    lines.push('-'.repeat(60));
+    lines.push(sec.label.toUpperCase()+': '+sec.title);
+    lines.push('-'.repeat(60));
+    (sec.ov.content||[]).forEach(item=>{
+      const t = blockToExportText(item, opts);
+      if(t){ lines.push(''); lines.push(t); }
+    });
+    if(opts.includeAnswers && sec.ov.assignmentIntro){
+      lines.push('');
+      lines.push('ASSIGNMENT');
+      lines.push(stripHtml(sec.ov.assignmentIntro));
+    }
+  });
+  const blob = new Blob([lines.join('\n')], { type:'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${s.courseName.replace(/[^a-zA-Z0-9]/g,'_')}_${s.language}_export.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  if(note) note.textContent = 'Downloaded.';
 }
 async function openCourseModuleEditor(courseId){
   if(isCCRole()){
