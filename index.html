@@ -1725,26 +1725,50 @@ function computeDayResult(dayId, ov){
 }
 async function getCourseById(id){ return id ? await kvGet('course:'+id) : null; }
 async function getCategoryById(id){ return id ? await kvGet('category:'+id) : null; }
+async function savePartnerProfilePhoto(file){
+  if(currentUser.profilePhotoUrl){
+    return { ok:false, error:'Your profile photo is locked. Ask your Trainer or Admin to reset it first.' };
+  }
+  const check = rteValidateImageFile(file);
+  if(!check.ok){ return { ok:false, error:check.reason }; }
+  const path = `profile-photos/${currentUser.id}/${Date.now()}_${file.name}`;
+  const uploadResult = await uploadFile(path, file);
+  if(!uploadResult.ok){ return { ok:false, error:`Upload failed — try again. (${uploadResult.error})` }; }
+  const existing = await getRosterEntry(currentUser.id);
+  if(!existing){ return { ok:false, error:"Couldn't find your partner record." }; }
+  const saved = await setRosterEntry(currentUser.id, { ...existing, profilePhotoUrl: uploadResult.url });
+  if(!saved){ return { ok:false, error:"Couldn't save your photo — check your connection." }; }
+  currentUser.profilePhotoUrl = uploadResult.url;
+  return { ok:true, url: uploadResult.url };
+}
 async function handleProfilePhotoUpload(event){
   const file = event.target.files[0];
   if(!file) return;
-  if(currentUser.profilePhotoUrl){
-    showToast('Your profile photo is locked. Ask your Trainer or Admin to reset it first.', 'error');
-    event.target.value=''; return;
-  }
-  const check = rteValidateImageFile(file);
-  if(!check.ok){ showToast(check.reason, 'error'); event.target.value=''; return; }
   showToast('Uploading photo...', 'info');
-  const path = `profile-photos/${currentUser.id}/${Date.now()}_${file.name}`;
-  const uploadResult = await uploadFile(path, file);
+  const result = await savePartnerProfilePhoto(file);
   event.target.value = '';
-  if(!uploadResult.ok){ showToast(`Upload failed — try again. (${uploadResult.error})`, 'error'); return; }
-  const existing = await getRosterEntry(currentUser.id);
-  if(!existing){ showToast("Couldn't find your partner record.", 'error'); return; }
-  const ok = await setRosterEntry(currentUser.id, { ...existing, profilePhotoUrl: uploadResult.url });
-  if(!ok){ showToast("Couldn't save your photo — check your connection.", 'error'); return; }
-  currentUser.profilePhotoUrl = uploadResult.url;
+  if(!result.ok){ showToast(result.error, 'error'); return; }
   showToast('Profile photo updated.', 'success');
+  renderApp();
+}
+async function handleLivePhotoUpload(event){
+  const file = event.target.files[0];
+  if(!file) return;
+  const btn = document.getElementById('live-photo-upload-btn');
+  const statusEl = document.getElementById('live-photo-status');
+  const originalLabel = btn ? btn.innerHTML : '';
+  if(btn){ btn.innerHTML = 'Uploading&hellip;'; btn.style.pointerEvents = 'none'; }
+  if(statusEl){ statusEl.style.color = 'var(--ink-soft)'; statusEl.textContent = 'Uploading your photo...'; }
+  showToast('Uploading photo...', 'info');
+  const result = await savePartnerProfilePhoto(file);
+  event.target.value = '';
+  if(!result.ok){
+    if(btn){ btn.innerHTML = originalLabel; btn.style.pointerEvents = ''; }
+    if(statusEl){ statusEl.style.color = 'var(--danger)'; statusEl.textContent = result.error; }
+    showToast(result.error, 'error');
+    return;
+  }
+  showToast('Live Photo saved — it now appears across your profile.', 'success');
   renderApp();
 }
 function isDayUnlocked(d){ return currentUserUnlockedDays.includes(d); }
@@ -3230,6 +3254,27 @@ async function runCertificateExport(){
   if(note) note.textContent = 'Certificate ready — use your browser\'s print dialog to save as PDF.';
   win.onload = () => { setTimeout(()=>{ try{ win.focus(); win.print(); }catch(e){} }, 600); };
 }
+function renderLivePhotoCard(){
+  const photoHtml = currentUser.profilePhotoUrl
+    ? `<img src="${esc(currentUser.profilePhotoUrl)}" style="width:72px;height:72px;border-radius:50%;object-fit:cover;border:2px solid var(--line);flex-shrink:0;">`
+    : `<div style="width:72px;height:72px;border-radius:50%;background:var(--brand-light);display:flex;align-items:center;justify-content:center;font-size:24px;color:var(--brand);font-weight:700;flex-shrink:0;">${esc((currentUser.name||'?')[0].toUpperCase())}</div>`;
+  return `<div class="card">
+    <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;">
+      ${photoHtml}
+      <div style="flex:1;min-width:180px;">
+        <h3 style="margin:0 0 4px;">Live Photo</h3>
+        ${currentUser.profilePhotoUrl
+          ? `<p id="live-photo-status" style="font-size:12px;color:var(--ink-soft);margin:0;">Photo locked — ask your Trainer or Admin if it needs to change.</p>`
+          : `<p style="font-size:12.5px;color:var(--ink-soft);margin:0 0 8px;">Upload a clear photo of yourself — this becomes your profile photo across the platform.</p>
+             <label class="btn amber small" id="live-photo-upload-btn" style="cursor:pointer;display:inline-block;">
+               Upload Live Photo
+               <input type="file" accept="image/*" style="display:none;" onchange="handleLivePhotoUpload(event)">
+             </label>
+             <p id="live-photo-status" style="font-size:12px;margin:8px 0 0;"></p>`}
+      </div>
+    </div>
+  </div>`;
+}
 function renderHome(){
   const s = overallStats();
   const ov = contentOverrides['home'];
@@ -3238,6 +3283,7 @@ function renderHome(){
     const dp = currentUserProgress['home'];
     let html = `<div class="crumb">Welcome, ${esc(currentUser.name)}</div><h1 class="page-title">${esc(ov.title||COURSE_NAME)}</h1>${ov.sub?`<p class="page-sub">${esc(ov.sub)}</p>`:''}`;
     html += `<div class="today-banner"><b>Class today:</b> Day ${currentUser.day} &middot; ${esc(currentUser.city)} &middot; Trainer ${esc(currentUser.trainer)} &middot; Check-in window ${esc(currentUser.open)}&ndash;${esc(currentUser.close)}</div>`;
+    html += renderLivePhotoCard();
     html += `<div class="home-grid"><div class="stat-card"><div class="n">${s.done}/${s.total}</div><div class="l">Days complete</div></div><div class="stat-card"><div class="n">${s.pct}%</div><div class="l">Course progress</div></div><div class="stat-card"><div class="n">${currentUserUnlockedDays.length}</div><div class="l">Days unlocked</div></div></div>`;
     const items = ov.content||[];
     items.forEach((item,idx)=>{ html += renderHomeContentItem(item, idx, dp, items); });
@@ -3250,6 +3296,7 @@ function renderHome(){
     <h1 class="page-title">${esc(COURSE_NAME)}</h1>
     <p class="page-sub">${esc(COURSE_SUB)} — ${s.total} day${s.total===1?'':'s'}.</p>
     <div class="today-banner"><b>Class today:</b> Day ${currentUser.day} &middot; ${esc(currentUser.city)} &middot; Trainer ${esc(currentUser.trainer)} &middot; Check-in window ${esc(currentUser.open)}&ndash;${esc(currentUser.close)}</div>
+    ${renderLivePhotoCard()}
     <div class="home-grid">
       <div class="stat-card"><div class="n">${s.done}/${s.total}</div><div class="l">Days complete</div></div>
       <div class="stat-card"><div class="n">${s.pct}%</div><div class="l">Course progress</div></div>
