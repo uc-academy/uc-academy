@@ -9578,8 +9578,11 @@ function closeModuleEditor(){
   else { renderAdminMain(); }
 }
 function refreshModuleEditor(){
+  const scrollY = window.scrollY;
   document.getElementById('main').innerHTML = renderModuleEditorTab();
   initRichTextEditors();
+  window.scrollTo(0, scrollY);
+  requestAnimationFrame(()=>{ window.scrollTo(0, scrollY); });
 }
 function syncModuleDraftFromDOM(){
   if(!moduleDraft) return;
@@ -10039,7 +10042,7 @@ async function saveModuleAsDraft(){
   const label = editingDayId==='home' ? 'Home Page' : 'Day '+editingDayId;
   await logHistory('module_draft_saved', `${label} saved as draft by ${trainerIdentity.name}${editingCourseId?` (course ${adminCourses[editingCourseId]?.name||editingCourseId})`:''}`, {dayId:editingDayId, courseId:editingCourseId||null, lang:editingLanguage});
   showToast('Saved as draft — partners still see the previous published version.', 'success');
-  renderAdminMain();
+  refreshModuleEditor();
 }
 function findMissingCorrectAnswer(content){
   for(const item of (content||[])){
