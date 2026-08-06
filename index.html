@@ -120,6 +120,7 @@
   .gate-card{ width:100%; max-width:440px; background:var(--panel); border-radius:20px; padding:34px 30px; box-shadow:0 20px 60px rgba(91,63,163,0.14); border:1px solid var(--line); }
   .gate-brand{ display:flex; align-items:center; gap:12px; margin-bottom:22px; }
   .gate-mark{ width:42px;height:42px;border-radius:50%; background:radial-gradient(circle at 32% 28%, var(--brand-mid), var(--brand-dark)); display:flex;align-items:center;justify-content:center; font-family:var(--font-heading);font-weight:700;color:#fff;font-size:15px; flex-shrink:0;}
+  .gate-mark-solo{ width:72px;height:72px;border-radius:50%; background:radial-gradient(circle at 32% 28%, var(--brand-mid), var(--brand-dark)); display:flex;align-items:center;justify-content:center; font-family:var(--font-heading);font-weight:700;color:#fff;font-size:24px; flex-shrink:0; margin:0 auto;}
   .gate-brand-text .t1{ font-family:var(--font-body); font-size:12px; letter-spacing:0.03em; color:var(--ink-soft); }
   .gate-brand-text .t2{ font-family:var(--font-heading); font-weight:700; font-size:17px; letter-spacing:0.01em; color:var(--brand); }
   .gate-toggle{ display:flex; gap:4px; margin-bottom:22px; background:var(--porcelain); border-radius:12px; padding:4px; border:1px solid var(--line); }
@@ -1845,9 +1846,8 @@ function renderGate(){
   root.innerHTML = `
     <div class="gate-wrap">
       <div class="gate-card">
-        <div class="gate-brand">
-          ${renderLogoMark('gate-mark')}
-          <div class="gate-brand-text"><div class="t1">${esc(COURSE_NAME)}</div><div class="t2">${esc(COURSE_SUB)}</div></div>
+        <div class="gate-brand" style="justify-content:center;">
+          ${renderLogoMark('gate-mark-solo')}
         </div>
         ${storageWarningBanner()}
         <div class="gate-toggle">
