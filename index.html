@@ -3074,9 +3074,13 @@ async function changePartnerLanguage(lang){
     const result = await getContentOverrideWithFallback(d.id, currentUser.courseId, lang);
     if(result.data) contentOverrides[d.id] = migrateOldOverrideToUnified(result.data);
   }));
+  const homeResult = await getContentOverrideWithFallback('home', currentUser.courseId, lang);
+  if(homeResult.data) contentOverrides['home'] = migrateOldOverrideToUnified(homeResult.data);
   if(currentDay>0 && currentDay<98){
     const result = await getContentOverrideWithFallback(currentDay, currentUser.courseId, lang);
     contentUsedFallbackLanguage = result.usedFallback;
+  } else if(currentDay===0){
+    contentUsedFallbackLanguage = homeResult.usedFallback;
   }
   renderApp();
 }
