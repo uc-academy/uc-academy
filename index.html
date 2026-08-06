@@ -1729,7 +1729,12 @@ function computeDayResult(dayId, ov){
   const allVideosDone = videoIndices.every(i => dp.videoItemProgress[i]?.done);
   const allQAPassed = qaIndices.every(i => dp.quickAssessments && dp.quickAssessments[i] && dp.quickAssessments[i].passed);
   const allOptionQSubmitted = optionQIndices.every(i => (dp.checkboxQuestions&&dp.checkboxQuestions[i]&&dp.checkboxQuestions[i].submitted) || (dp.mcqQuestions&&dp.mcqQuestions[i]&&dp.mcqQuestions[i].submitted));
-  const complete = allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed && allOptionQSubmitted;
+  const liveComplete = allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed && allOptionQSubmitted;
+  if(liveComplete && !dp.dayFullyCompleted){
+    dp.dayFullyCompleted = true;
+    setProgress(currentUser.id, currentUserProgress);
+  }
+  const complete = dp.dayFullyCompleted || liveComplete;
   if(!complete) return { status:'inProgress', label:'In Progress', percent:null };
 
   // Compute an aggregate score from mandatory Quick Assessments (the only blocks with a real percent score)
@@ -3489,7 +3494,20 @@ function renderTheory(day){
     const allQAPassed = mandatoryQAIndices.every(i => dp.quickAssessments && dp.quickAssessments[i] && dp.quickAssessments[i].passed);
     const mandatoryOptionQIndices = items.map((it,i)=>((it.type==='checkboxQuestion'||it.type==='mcqQuestion') && it.enabled!==false && it.mandatory!==false && (!visibleIndices||visibleIndices.has(i)))?i:null).filter(i=>i!==null);
     const allOptionQSubmitted = mandatoryOptionQIndices.every(i => (dp.checkboxQuestions&&dp.checkboxQuestions[i]&&dp.checkboxQuestions[i].submitted) || (dp.mcqQuestions&&dp.mcqQuestions[i]&&dp.mcqQuestions[i].submitted));
-    const canComplete = allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed && allOptionQSubmitted;
+    const liveCanComplete = allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed && allOptionQSubmitted;
+    // Permanent, one-way unlock: once the live check passes for this page, that fact is saved permanently
+    // and never re-derived from live video/QA state again - a later video-loading hiccup, refresh, or
+    // screen lock can never make an already-completed page look locked again. Only an explicit manual
+    // lock from Admin/Trainer (checked first, below) can reverse it.
+    if(!dp.pageUnlocked) dp.pageUnlocked = {};
+    if(liveCanComplete && !dp.pageUnlocked[pageIdx]){
+      dp.pageUnlocked[pageIdx] = true;
+      if(!dp.pageUnlockedAt) dp.pageUnlockedAt = {};
+      dp.pageUnlockedAt[pageIdx] = new Date().toISOString();
+      setProgress(currentUser.id, currentUserProgress); // fire-and-forget: save this the instant it happens
+    }
+    const isManuallyLocked = !!(dp.pageManualLock && dp.pageManualLock[pageIdx]);
+    const canComplete = isManuallyLocked ? false : (dp.pageUnlocked[pageIdx] || liveCanComplete);
     const fullyDone = dp.theoryDone && dp.videoDone;
     const isLastPage = !isPaginated || pageIdx===pageRanges.length-1;
     if(isPaginated){
@@ -3499,6 +3517,7 @@ function renderTheory(day){
           ${pageIdx>0 ? `<button class="btn secondary" onclick="goToTheoryPage(${day.id},${pageIdx-1})">&larr; Previous Page</button>` : ''}
           ${!isLastPage ? `<button class="btn amber" id="theory-complete-btn" ${!canComplete?'disabled':''} onclick="goToTheoryPage(${day.id},${pageIdx+1})">Next Page &rarr;</button>` : ''}
         </div>
+        ${isManuallyLocked ? `<p style="width:100%;font-size:11.5px;color:var(--danger);margin:4px 0 0;">This page has been locked by your Trainer or Admin.</p>` : ''}
       </div>`;
     }
     if(isLastPage){
@@ -3566,7 +3585,16 @@ function updateTheoryCompleteButtonState(dayId){
     const allQAPassed = mandatoryQAIndices.every(i => dp.quickAssessments && dp.quickAssessments[i] && dp.quickAssessments[i].passed);
     const mandatoryOptionQIndices = items.map((it,i)=>((it.type==='checkboxQuestion'||it.type==='mcqQuestion') && it.enabled!==false && it.mandatory!==false && (!visibleIndices||visibleIndices.has(i)))?i:null).filter(i=>i!==null);
     const allOptionQSubmitted = mandatoryOptionQIndices.every(i => (dp.checkboxQuestions&&dp.checkboxQuestions[i]&&dp.checkboxQuestions[i].submitted) || (dp.mcqQuestions&&dp.mcqQuestions[i]&&dp.mcqQuestions[i].submitted));
-    btn.disabled = !(allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed && allOptionQSubmitted);
+    const liveCanComplete = allVideosDone && (!hasAudio || dp.audioPlayed) && allQAPassed && allOptionQSubmitted;
+    if(!dp.pageUnlocked) dp.pageUnlocked = {};
+    if(liveCanComplete && !dp.pageUnlocked[pageIdx]){
+      dp.pageUnlocked[pageIdx] = true;
+      if(!dp.pageUnlockedAt) dp.pageUnlockedAt = {};
+      dp.pageUnlockedAt[pageIdx] = new Date().toISOString();
+      setProgress(currentUser.id, currentUserProgress);
+    }
+    const isManuallyLocked = !!(dp.pageManualLock && dp.pageManualLock[pageIdx]);
+    btn.disabled = isManuallyLocked ? true : !(dp.pageUnlocked[pageIdx] || liveCanComplete);
   } else {
     const audioUrl = audiosCache[dayId];
     btn.disabled = !!(audioUrl && !dp.audioPlayed);
@@ -6695,7 +6723,7 @@ function computePartnerStatus(partnerId, r){
   const allSubmitted = daysSubmitted.length === DAYS.length;
   const avgPct = allSubmitted ? daysSubmitted.reduce((s,d)=>s+(prog[d.id].quizPct||0),0)/DAYS.length : null;
   const overallPassFail = allSubmitted ? (avgPct>=PASS_THRESHOLD && daysSubmitted.every(d=>(prog[d.id].quizPct||0)>=PASS_THRESHOLD) ? 'Pass' : 'Fail') : '—';
-  return { currentDay, unlocked, assessUnlocked, dp, theoryDone: !!dp.theoryDone, videoDone, videoPct, audioPlayed: !!dp.audioPlayed, hasAudio: !!audiosCache[currentDay] || (ov && ov.content && ov.content.some(c=>c.type==='audio')), assignmentDone, assessmentStatus, overallPct, overallPassFail };
+  return { currentDay, unlocked, assessUnlocked, dp, theoryDone: !!dp.theoryDone, videoDone, videoPct, audioPlayed: !!dp.audioPlayed, hasAudio: !!audiosCache[currentDay] || (ov && ov.content && ov.content.some(c=>c.type==='audio')), assignmentDone, assessmentStatus, overallPct, overallPassFail, currentPageIndex: dp.currentPageIndex||0, pageUnlocked: dp.pageUnlocked||{}, pageManualLock: dp.pageManualLock||{} };
 }
 function renderProgressControlTab(){
   if(previewPartnerId) return renderAdminPreviewMode();
@@ -6886,6 +6914,9 @@ function openOverridePanel(partnerId){
     <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">
       <button class="btn danger" ${!s.unlocked.includes(s.currentDay)?'disabled':''} onclick="promptLockAction('${partnerId}',${s.currentDay},'day','Lock Day ${s.currentDay} for this partner? They will lose access until re-unlocked.')">Lock Day ${s.currentDay}</button>
       <button class="btn danger" ${!s.assessUnlocked.includes(s.currentDay)?'disabled':''} onclick="promptLockAction('${partnerId}',${s.currentDay},'assessment','Lock this day\\'s Assessment for this partner?')">Lock this day's Assessment</button>
+      ${s.pageManualLock[s.currentPageIndex]
+        ? `<button class="btn secondary" onclick="promptUnlockPageAction('${partnerId}',${s.currentDay},${s.currentPageIndex},'Unlock Page ${s.currentPageIndex+1} for this partner?')">Unlock Page ${s.currentPageIndex+1}</button>`
+        : `<button class="btn danger" onclick="promptLockPageAction('${partnerId}',${s.currentDay},${s.currentPageIndex},'Lock Page ${s.currentPageIndex+1} for this partner? Even if already completed, they will not be able to move past it until unlocked.')">Lock Page ${s.currentPageIndex+1} (their current page)</button>`}
     </div>
 
     <span class="field-label">Reset (clears existing progress for Day ${s.currentDay} — cannot be undone)</span>
@@ -6971,6 +7002,33 @@ function promptLockAction(partnerId, dayId, kind, confirmMsg){
     }
     await logProgressOverride(partnerId, r?r.name:partnerId, dayId, kind==='day'?'Day Lock':'Assessment Lock', 'unlocked', 'locked', reason);
     showToast(`${kind==='day'?'Day':'Assessment'} locked for ${r?r.name:partnerId}.`, 'success');
+    renderAdminMain();
+  });
+}
+async function promptLockPageAction(partnerId, dayId, pageIdx, confirmMsg){
+  document.querySelectorAll('.confirm-overlay').forEach(o=>o.remove());
+  promptForResetReason(confirmMsg, async (reason)=>{
+    const r = adminRoster[partnerId];
+    const prog = await getProgress(partnerId);
+    ensureDayInProgObj(prog, dayId);
+    if(!prog[dayId].pageManualLock) prog[dayId].pageManualLock = {};
+    prog[dayId].pageManualLock[pageIdx] = { by: trainerIdentity.name, reason, at: new Date().toISOString() };
+    await setProgress(partnerId, prog);
+    await logProgressOverride(partnerId, r?r.name:partnerId, dayId, `Page ${pageIdx+1} Lock`, 'unlocked', 'locked', reason);
+    showToast(`Page ${pageIdx+1} locked for ${r?r.name:partnerId}.`, 'success');
+    renderAdminMain();
+  });
+}
+async function promptUnlockPageAction(partnerId, dayId, pageIdx, confirmMsg){
+  document.querySelectorAll('.confirm-overlay').forEach(o=>o.remove());
+  promptForResetReason(confirmMsg, async (reason)=>{
+    const r = adminRoster[partnerId];
+    const prog = await getProgress(partnerId);
+    ensureDayInProgObj(prog, dayId);
+    if(prog[dayId].pageManualLock) delete prog[dayId].pageManualLock[pageIdx];
+    await setProgress(partnerId, prog);
+    await logProgressOverride(partnerId, r?r.name:partnerId, dayId, `Page ${pageIdx+1} Unlock`, 'locked', 'unlocked', reason);
+    showToast(`Page ${pageIdx+1} unlocked for ${r?r.name:partnerId}.`, 'success');
     renderAdminMain();
   });
 }
