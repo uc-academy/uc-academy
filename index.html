@@ -378,9 +378,20 @@
 </head>
 <body>
 <button class="hamburger" id="hamburger" onclick="toggleSidebar()">&#9776;</button>
-<div id="root"></div>
+<div id="root">
+  <!-- Boot loading state: shown while saved login + course progress are being restored, so the app
+       never flashes "Page 1 / logged out" while the real position is still loading. Replaced by
+       renderGate()/renderApp() as soon as restore resolves. -->
+  <div id="boot-loader" style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;font-family:Inter,system-ui,sans-serif;color:#5B3FA3;">
+    <div style="width:38px;height:38px;border:4px solid rgba(91,63,163,0.2);border-top-color:#5B3FA3;border-radius:50%;animation:ucaSpin 0.8s linear infinite;"></div>
+    <div style="font-size:13.5px;color:#6b6b80;">Loading your course&hellip;</div>
+  </div>
+</div>
 
-<script src="https://www.youtube.com/iframe_api"></script>
+<!-- The YouTube IFrame API is intentionally NOT loaded here anymore. A synchronous script tag at this
+     position blocked the entire app from parsing/rendering until youtube.com responded, which is why
+     modules were slow to open. The API is now injected on demand by ensureYtApi(), only on the first
+     tap of a Play button. -->
 <script>
 let COURSE_NAME = "Urban Company Academy Expert Courses";
 let COURSE_SUB = "Professional Expert Courses";
@@ -600,7 +611,7 @@ function renderAudioEmbed(url, onPlayJs){
 }
 function normalizeUrl(url, kind){
   if(!url) return { embedUrl:'', kind:'none' };
-  const yt = url.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([\w-]+)/);
+  const yt = url.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/|youtube\.com\/shorts\/|youtube\.com\/live\/)([\w-]+)/);
   if(yt) return { embedUrl:`https://www.youtube.com/embed/${yt[1]}`, kind:'youtube', videoId: yt[1] };
   const vm = url.match(/vimeo\.com\/(\d+)/);
   if(vm) return { embedUrl:`https://player.vimeo.com/video/${vm[1]}`, kind:'vimeo' };
@@ -1193,17 +1204,177 @@ async function listCheckinsForPartner(pid){
   await Promise.all(keys.map(async k=>{ const v = await kvGet(k); if(v) out.push(v); }));
   return out.sort((a,b)=>(b.date).localeCompare(a.date));
 }
+/* ================= PROGRESS PERSISTENCE CORE =================
+   Design rules (permanent, one-way progress):
+   1. Reads must distinguish "no saved data yet" from "the fetch FAILED". Treating a failed fetch as
+      empty progress was the root cause of progress "resetting": the app would boot with {} and the
+      next autosave would overwrite the partner's real record in the backend with that empty state.
+   2. Saves NEVER downgrade: before a normal write, the stored record is merged in with Math.max /
+      boolean-OR semantics, so a completed video or unlocked page can never be overwritten by a fresh
+      player state of zero. Only explicit Trainer/Admin actions pass {allowDowngrade:true}.
+   3. Every save is mirrored to localStorage first (write-behind backup), so progress made during a
+      network interruption survives an app kill and is merged back to the backend on next login.   */
+async function getProgressStrict(pid){
+  // Throws on storage/network failure instead of silently returning {} - callers MUST handle it.
+  await window.__fbReady;
+  if(typeof window.__fbGet !== 'function') throw new Error('storage-unavailable');
+  const v = await window.__fbGet('progress:'+pid);
+  return v || {};
+}
 async function getProgress(pid){ const v = await kvGet('progress:'+pid); return v || {}; }
+function progressBackupKey(pid){ return 'uca_progress_backup_'+pid; }
+function saveLocalProgressBackup(pid, data){
+  try{ localStorage.setItem(progressBackupKey(pid), JSON.stringify({ data, savedAt: Date.now() })); }catch(e){}
+}
+function loadLocalProgressBackup(pid){
+  // Returns { data, savedAt } or null. savedAt lets the login merge discard a backup that predates an
+  // authorized Trainer/Admin reset (the stored record's _resetAt), so a reset can never be undone by
+  // a stale device backup.
+  try{
+    const raw = localStorage.getItem(progressBackupKey(pid));
+    if(!raw) return null;
+    const parsed = JSON.parse(raw);
+    return (parsed && parsed.data) ? parsed : null;
+  }catch(e){ return null; }
+}
+// Merges the stored (server) progress INTO the local object, field by field, never downgrading either
+// side. Mutates `local` in place (so live references like currentUserProgress[dayId] stay valid) and
+// returns it. Semantics per field: completion flags OR, percentages/seconds Math.max, watch ranges
+// union, page unlocks union. Trainer-set manual locks come from the server side (partners can't set
+// them, so the stored copy is authoritative).
+function mergeProgressData(server, local, opts){
+  opts = opts || {};
+  if(!server) return local;
+  if(server._resetAt && (!local._resetAt || server._resetAt > local._resetAt)) local._resetAt = server._resetAt;
+  Object.keys(server).forEach(dayId=>{
+    if(dayId.charAt(0)==='_') return; // metadata keys (e.g. _resetAt), not day records
+    const s = server[dayId];
+    if(!s) return;
+    if(!local[dayId]){ local[dayId] = JSON.parse(JSON.stringify(s)); return; }
+    const l = local[dayId];
+    ['theoryDone','audioPlayed','videoDone','quizSubmitted','dayFullyCompleted'].forEach(k=>{ if(s[k]) l[k] = true; });
+    ['videoPct','currentPageIndex'].forEach(k=>{ l[k] = Math.max(l[k]||0, s[k]||0); });
+    if((s.quizPct||0) > (l.quizPct||0)){
+      l.quizPct = s.quizPct; l.quizScore = s.quizScore; l.quizTotal = s.quizTotal;
+      if(s.quizAnswers && s.quizAnswers.length) l.quizAnswers = s.quizAnswers;
+      if(s.quizDate) l.quizDate = s.quizDate;
+    }
+    if(s.reflection && !l.reflection) l.reflection = s.reflection;
+    if(s.videoRanges && s.videoRanges.length) l.videoRanges = mergeWatchRanges((l.videoRanges||[]).concat(s.videoRanges));
+    if(s.videoLastTime!==null && s.videoLastTime!==undefined) l.videoLastTime = Math.max(l.videoLastTime||0, s.videoLastTime);
+    if(s.tasksChecked && s.tasksChecked.length){
+      if(!l.tasksChecked) l.tasksChecked = [];
+      s.tasksChecked.forEach((v,i)=>{ if(v) l.tasksChecked[i] = true; });
+    }
+    if(s.videoItemProgress){
+      if(!l.videoItemProgress) l.videoItemProgress = {};
+      Object.keys(s.videoItemProgress).forEach(idx=>{
+        const sv = s.videoItemProgress[idx];
+        const lv = l.videoItemProgress[idx];
+        if(!sv) return;
+        if(!lv){ l.videoItemProgress[idx] = JSON.parse(JSON.stringify(sv)); return; }
+        lv.pct = Math.max(lv.pct||0, sv.pct||0);
+        if(sv.done) lv.done = true;
+        if(sv.readyForUnlock && !lv.done) lv.readyForUnlock = true;
+        if(sv.ranges && sv.ranges.length) lv.ranges = mergeWatchRanges((lv.ranges||[]).concat(sv.ranges));
+        if(sv.lastTime!==null && sv.lastTime!==undefined) lv.lastTime = Math.max(lv.lastTime||0, sv.lastTime);
+        if(sv.completedAt && !lv.completedAt) lv.completedAt = sv.completedAt;
+      });
+    }
+    ['pageUnlocked'].forEach(k=>{
+      if(s[k]){ if(!l[k]) l[k] = {}; Object.keys(s[k]).forEach(p=>{ if(s[k][p]) l[k][p] = true; }); }
+    });
+    ['pageUnlockedAt'].forEach(k=>{
+      if(s[k]){ if(!l[k]) l[k] = {}; Object.keys(s[k]).forEach(p=>{ if(!l[k][p]) l[k][p] = s[k][p]; }); }
+    });
+    // Trainer/Admin manual page locks: the authoritative (stored) copy replaces the local one
+    // entirely - including a lock the trainer has since REMOVED. Skipped only when merging a device
+    // backup into freshly loaded server data (keepLocalManualLocks), where "local" is authoritative.
+    if(!opts.keepLocalManualLocks){
+      if(s.pageManualLock) l.pageManualLock = s.pageManualLock;
+      else delete l.pageManualLock;
+    }
+    ['quickAssessments'].forEach(k=>{
+      if(s[k]){
+        if(!l[k]) l[k] = {};
+        Object.keys(s[k]).forEach(idx=>{
+          const sv=s[k][idx], lv=l[k][idx];
+          if(!lv || (sv && sv.passed && !lv.passed) || (sv && sv.attempts && lv.attempts && sv.attempts.length>lv.attempts.length && !lv.passed)) l[k][idx]=sv;
+        });
+      }
+    });
+    ['checkboxQuestions','mcqQuestions'].forEach(k=>{
+      if(s[k]){
+        if(!l[k]) l[k] = {};
+        Object.keys(s[k]).forEach(idx=>{ const sv=s[k][idx], lv=l[k][idx]; if(!lv || (sv && sv.submitted && !lv.submitted)) l[k][idx]=sv; });
+      }
+    });
+    if(s.inVideoQuizAnswers){
+      if(!l.inVideoQuizAnswers) l.inVideoQuizAnswers = {};
+      Object.keys(s.inVideoQuizAnswers).forEach(idx=>{
+        if(!l.inVideoQuizAnswers[idx]){ l.inVideoQuizAnswers[idx] = s.inVideoQuizAnswers[idx]; return; }
+        Object.keys(s.inVideoQuizAnswers[idx]||{}).forEach(qi=>{
+          const sv = s.inVideoQuizAnswers[idx][qi], lv = l.inVideoQuizAnswers[idx][qi];
+          if(!lv || (sv && sv.resolved && !lv.resolved)) l.inVideoQuizAnswers[idx][qi] = sv;
+        });
+      });
+    }
+  });
+  return local;
+}
+// While this is set to a partner ID, that partner's initial progress load FAILED and in-memory state
+// may be emptier than what's stored - normal saves to the backend are refused (localStorage backup
+// still records everything) until a successful re-read + merge proves it's safe again.
+let progressLoadFailedFor = null;
+// When this session's in-memory progress was (re)loaded from the backend. Used to detect an
+// authorized Trainer/Admin reset that happened AFTER this session started, so the reset wins over
+// the session's stale in-memory copy instead of being silently resurrected by a later autosave.
+let progressStateLoadedAt = 0;
+let progressHeartbeatTimer = null;
 const progressWriteQueues = {};
-async function setProgress(pid, data){
+async function setProgress(pid, data, opts){
+  opts = opts || {};
   // Serialize writes per-partner: on a real mobile network, multiple saves can be in flight at once
   // (a video-progress poll, then immediately after, a page-unlock save) with unpredictable, variable
   // latency. Without this queue, an older save could complete AFTER a newer one and silently overwrite
-  // it with stale data - including erasing a permanent page unlock that was just set. Chaining every
-  // write behind the previous one guarantees they always land in the order they were requested, not
-  // the order their network round-trips happened to finish in.
+  // it with stale data - including erasing a permanent page unlock that was just set.
   const prior = progressWriteQueues[pid] || Promise.resolve();
-  const thisWrite = prior.then(()=> kvSet('progress:'+pid, data)).catch(()=>false);
+  const thisWrite = prior.then(async ()=>{
+    if(opts.allowDowngrade){
+      // Explicit, authorized Trainer/Admin action (reset / manual lock / unlock) - written verbatim.
+      return await kvSet('progress:'+pid, data);
+    }
+    // 1. Local write-behind backup FIRST - succeeds even fully offline, survives an app kill.
+    saveLocalProgressBackup(pid, data);
+    // 2. If the initial load for this partner failed, re-verify against the stored record before
+    //    letting anything reach the backend - never blind-write over a record we never saw.
+    if(progressLoadFailedFor === pid || !opts.fast){
+      let server = null;
+      try{ server = await getProgressStrict(pid); }catch(e){ server = null; }
+      if(server === null){
+        // Still can't read the stored record - refuse the remote write rather than risk clobbering
+        // a completed record with emptier data. The localStorage backup above keeps it safe locally.
+        return false;
+      }
+      if(server._resetAt && (!currentUser || pid===currentUser.id)){
+        const resetTime = Date.parse(server._resetAt);
+        if(resetTime && resetTime > progressStateLoadedAt){
+          // An authorized Trainer/Admin reset landed AFTER this session loaded its progress. The
+          // reset is the one sanctioned way progress may go backwards - adopt the server state
+          // in place (references stay valid) instead of resurrecting pre-reset progress.
+          Object.keys(data).forEach(k=>{ delete data[k]; });
+          Object.keys(server).forEach(k=>{ data[k] = server[k]; });
+          progressStateLoadedAt = Date.now();
+          saveLocalProgressBackup(pid, data);
+          if(currentUser && pid===currentUser.id){ try{ renderApp(); }catch(e){} }
+          return true; // server already holds the authoritative state - nothing to write
+        }
+      }
+      mergeProgressData(server, data); // in-place: data can only gain, never lose
+      if(progressLoadFailedFor === pid) progressLoadFailedFor = null;
+    }
+    return await kvSet('progress:'+pid, data);
+  }).catch(()=>false);
   progressWriteQueues[pid] = thisWrite;
   return await thisWrite;
 }
@@ -1614,10 +1785,17 @@ document.addEventListener('visibilitychange', ()=>{
     // as possible, to maximize the chance it completes before that happens. This duplicates whatever
     // save already happened after the last action - that's intentional, it's a safety net, not the
     // primary save path.
-    try{ setProgress(currentUser.id, currentUserProgress); }catch(e){}
+    try{ setProgress(currentUser.id, currentUserProgress, {fast:true}); }catch(e){}
   }
 });
 window.addEventListener('pagehide', ()=>{
+  if(currentUser && currentUser.id && Object.keys(currentUserProgress).length){
+    try{ setProgress(currentUser.id, currentUserProgress, {fast:true}); }catch(e){}
+  }
+});
+window.addEventListener('online', ()=>{
+  // Connection came back: flush the latest in-memory progress (it was still being mirrored to the
+  // localStorage backup while offline) to the backend with full merge protection.
   if(currentUser && currentUser.id && Object.keys(currentUserProgress).length){
     try{ setProgress(currentUser.id, currentUserProgress); }catch(e){}
   }
@@ -1686,7 +1864,62 @@ let ytPlayers = {};
 let videoPlayerTapped = {};
 let ytPollTimers = {};
 let ytApiReady = false;
+let lastProgressAutosaveAt = 0; // throttles while-playing autosaves to roughly every 8 seconds
 window.onYouTubeIframeAPIReady = function(){ ytApiReady = true; };
+/* Lazy, on-demand YouTube IFrame API loader. The API script is injected only when a partner actually
+   taps Play on a tracked video - never at page load. It is injected at most ONCE per session (the
+   promise is cached), so re-renders, remounts, and multiple videos can never trigger duplicate API
+   script loads. On failure the cached promise is cleared so "Retry Video" can attempt a fresh load. */
+let ytApiPromise = null;
+function ensureYtApi(){
+  if(window.YT && window.YT.Player){ ytApiReady = true; return Promise.resolve(); }
+  if(ytApiPromise) return ytApiPromise;
+  ytApiPromise = new Promise((resolve, reject)=>{
+    let settled = false;
+    const prev = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = function(){
+      ytApiReady = true;
+      if(typeof prev === 'function'){ try{ prev(); }catch(e){} }
+      if(!settled){ settled = true; resolve(); }
+    };
+    const s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    s.async = true;
+    s.onerror = ()=>{ if(!settled){ settled = true; ytApiPromise = null; reject(new Error('yt-api-script-failed')); } };
+    document.head.appendChild(s);
+    setTimeout(()=>{
+      if(!settled && !(window.YT && window.YT.Player)){
+        settled = true; ytApiPromise = null; reject(new Error('yt-api-timeout'));
+      }
+    }, 20000);
+  });
+  return ytApiPromise;
+}
+/* Click-to-load facade for plain (untracked) video embeds - completed videos, extra videos, and
+   non-YouTube links. Renders instantly (a thumbnail for YouTube, a dark play card otherwise) and only
+   creates the real iframe when tapped, so opening a page never waits on any video embed. */
+function lazyEmbedFacade(embedUrl, videoId, label){
+  return `<div style="width:100%;height:100%;position:relative;cursor:pointer;background:#000;" data-embed="${esc(embedUrl)}" onclick="activateLazyEmbed(this)">
+    ${videoId?`<img src="https://img.youtube.com/vi/${esc(videoId)}/hqdefault.jpg" loading="lazy" alt="" style="width:100%;height:100%;object-fit:cover;opacity:0.7;">`:''}
+    <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;">
+      <div style="width:56px;height:56px;border-radius:50%;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;">
+        <div style="width:0;height:0;border-top:12px solid transparent;border-bottom:12px solid transparent;border-left:20px solid #fff;margin-left:4px;"></div>
+      </div>
+      ${label?`<span style="color:#fff;font-size:12px;text-shadow:0 1px 3px rgba(0,0,0,0.8);max-width:90%;text-align:center;">${esc(label)}</span>`:''}
+    </div>
+  </div>`;
+}
+function activateLazyEmbed(el){
+  const src = el.getAttribute('data-embed') || '';
+  if(!src) return;
+  const sep = src.indexOf('?') > -1 ? '&' : '?';
+  const iframe = document.createElement('iframe');
+  iframe.src = src + sep + 'autoplay=1';
+  iframe.allow = 'autoplay; encrypted-media; fullscreen';
+  iframe.allowFullscreen = true;
+  iframe.style.cssText = 'width:100%;height:100%;border:0;';
+  el.replaceWith(iframe);
+}
 
 function defaultDayProgress(){
   return { theoryDone:false, audioPlayed:false, videoPct:0, videoDone:false,
@@ -2102,33 +2335,30 @@ function initSosVideoTracking(){
   if(!tr.videoUrl) return;
   const info = normalizeUrl(tr.videoUrl);
   if(info.kind!=='youtube') return;
-  const m = tr.videoUrl.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([\w-]+)/);
+  const m = tr.videoUrl.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/|youtube\.com\/shorts\/|youtube\.com\/live\/)([\w-]+)/);
   if(!m) return;
   const videoId = m[1];
-  let attempts = 0;
-  const tryInit = ()=>{
-    attempts++;
+  ensureYtApi().then(()=>{
     if(!document.getElementById('sos-yt-player')) return;
-    if(ytApiReady || (window.YT && window.YT.Player)){
-      sosYtPlayer = new YT.Player('sos-yt-player', {
-        videoId,
-        events:{
-          onStateChange:(e)=>{
-            if(e.data===YT.PlayerState.PLAYING){
-              if(sosYtPollTimer) clearInterval(sosYtPollTimer);
-              sosYtPollTimer = setInterval(pollSosVideo, 2000);
-            } else if(sosYtPollTimer){
-              clearInterval(sosYtPollTimer); sosYtPollTimer = null;
-              persistSosWatchData();
-            }
+    sosYtPlayer = new YT.Player('sos-yt-player', {
+      videoId,
+      events:{
+        onStateChange:(e)=>{
+          if(e.data===YT.PlayerState.PLAYING){
+            if(sosYtPollTimer) clearInterval(sosYtPollTimer);
+            sosYtPollTimer = setInterval(pollSosVideo, 2000);
+          } else if(sosYtPollTimer){
+            clearInterval(sosYtPollTimer); sosYtPollTimer = null;
+            persistSosWatchData();
           }
         }
-      });
-    } else if(attempts<10){
-      setTimeout(tryInit, 300);
-    }
-  };
-  tryInit();
+      }
+    });
+  }).catch(()=>{
+    // SOS video tracking is best-effort: fall back to a plain embed so the video still plays.
+    const c = document.getElementById('sos-yt-player');
+    if(c) c.innerHTML = `<iframe src="https://www.youtube.com/embed/${esc(videoId)}" style="width:100%;height:100%;border:0;" allowfullscreen></iframe>`;
+  });
 }
 function pollSosVideo(){
   if(!sosYtPlayer || typeof sosYtPlayer.getCurrentTime!=='function') return;
@@ -2363,7 +2593,45 @@ async function loginAsPartner(id, opts){
   currentUserHomeEnabled = partnerDayEnabledMap['home'] !== false;
   currentUserDisabledDayIds = Object.entries(partnerDayEnabledMap).filter(([k,v])=>v===false && k!=='home').map(([k])=>parseInt(k));
   currentUserAssessmentUnlockedDays = await getAssessmentUnlock(r.city, r.trainer);
-  currentUserProgress = await getProgress(id);
+  // Load saved progress with STRICT failure detection + retries. A failed fetch must never be
+  // mistaken for "no progress yet" - that is exactly how completed pages used to get wiped: the app
+  // would boot with {} and the next autosave overwrote the partner's real record with empty state.
+  let loadedProgress = null;
+  for(let attempt=0; attempt<3 && loadedProgress===null; attempt++){
+    try{ loadedProgress = await getProgressStrict(id); }
+    catch(e){ await new Promise(res=>setTimeout(res, 600*(attempt+1))); }
+  }
+  const localBackup = loadLocalProgressBackup(id);
+  if(loadedProgress===null){
+    // Backend unreachable: fall back to the local backup (never emptier than the last thing this
+    // device saved) and BLOCK remote writes until a successful read+merge proves it's safe.
+    progressLoadFailedFor = id;
+    currentUserProgress = localBackup ? JSON.parse(JSON.stringify(localBackup.data)) : {};
+    showToast("Couldn't reach the server to load saved progress — using this device's saved copy. Nothing will be lost.", 'error');
+  } else {
+    progressLoadFailedFor = null;
+    currentUserProgress = loadedProgress;
+    const backupPredatesReset = localBackup && loadedProgress._resetAt &&
+      (!localBackup.savedAt || localBackup.savedAt < Date.parse(loadedProgress._resetAt));
+    if(localBackup && !backupPredatesReset){
+      // Progress made offline (or that failed to upload last session) is merged back in - highest
+      // percentage and completed status always win - then pushed so the backend catches up.
+      mergeProgressData(localBackup.data, currentUserProgress, {keepLocalManualLocks:true});
+      setProgress(id, currentUserProgress, {fast:true});
+    } else if(backupPredatesReset){
+      // A Trainer/Admin reset happened after this backup was taken - the reset wins, drop the backup.
+      try{ localStorage.removeItem(progressBackupKey(id)); }catch(e){}
+    }
+  }
+  progressStateLoadedAt = Date.now();
+  // Heartbeat: a merge-protected save every 60s while logged in. Keeps the backend copy fresh and
+  // propagates an admin-side reset into any session that's still open, within a minute.
+  if(progressHeartbeatTimer) clearInterval(progressHeartbeatTimer);
+  progressHeartbeatTimer = setInterval(()=>{
+    if(currentUser && currentUser.id===id && Object.keys(currentUserProgress).length){
+      try{ setProgress(id, currentUserProgress); }catch(e){}
+    }
+  }, 60000);
   await loadAndApplyDayRegistry(r.courseId||null);
   for(const d of DAYS) ensureDay(d.id);
   videosCache = {}; audiosCache = {}; contentOverrides = {}; extraVideosCache = {}; extraAudiosCache = {};
@@ -2843,7 +3111,16 @@ function saveAdminName(){
 
 function switchId(){
   if(ytPollTimer) clearInterval(ytPollTimer);
+  if(progressHeartbeatTimer){ clearInterval(progressHeartbeatTimer); progressHeartbeatTimer = null; }
   stopIssuePolling();
+  // Final save BEFORE logout so nothing achieved this session can be lost. Fire-and-forget on the
+  // ordered per-partner queue + localStorage backup - it completes (or is preserved locally) even
+  // though the UI moves on immediately.
+  if(currentUser && currentUser.id && Object.keys(currentUserProgress).length){
+    try{ setProgress(currentUser.id, currentUserProgress); }catch(e){}
+  }
+  cleanupPlayer();
+  videoPlayerTapped = {};
   currentUser = null; currentUserProgress={}; currentUserUnlockedDays=[]; trainerIdentity = null;
   gateError=''; gateMode='partner'; showRecovery=false;
   clearSession();
@@ -2952,8 +3229,9 @@ function renderApp(){
   renderSidebar(); renderMain();
 }
 function renderSidebar(){
-  const s = overallStats();
   const el = document.getElementById('sidebar');
+  if(!el) return; // layout not built yet - safe no-op
+  const s = overallStats();
   let html = `
     <div class="brand">${renderLogoMark('brand-mark')}<div class="brand-text"><div class="t1">${esc(COURSE_NAME)}</div><div class="t2">${esc(COURSE_SUB)}</div></div></div>
     <div class="who-card">
@@ -3135,7 +3413,9 @@ async function loadMyMedia(dayId){
   if((currentTab==='assignment' || currentTab==='theory') && viewingSameLocation) renderMainOnly();
 }
 function renderMainOnly(){
-  document.getElementById('main').innerHTML = renderCurrentPage();
+  const mainEl = document.getElementById('main');
+  if(!mainEl) return; // app layout not built yet (e.g. an async load finishing during session restore) - renderApp() draws everything shortly
+  mainEl.innerHTML = renderCurrentPage();
   if(currentDay>0 && currentDay<98 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay));
   if(currentDay>0 && currentDay<98 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
   if(currentDay===0 && contentOverrides['home']) initOverrideVideoPlayers({id:'home'});
@@ -3143,7 +3423,9 @@ function renderMainOnly(){
   ensureAnyTaskTimerTicking();
 }
 function renderMain(){
-  document.getElementById('main').innerHTML = renderCurrentPage();
+  const mainEl = document.getElementById('main');
+  if(!mainEl) return;
+  mainEl.innerHTML = renderCurrentPage();
   if(currentDay>0 && currentDay<98 && currentTab==='video' && !contentOverrides[currentDay]) initVideoTab(DAYS.find(d=>d.id===currentDay));
   if(currentDay>0 && currentDay<98 && currentTab==='theory' && contentOverrides[currentDay]) initOverrideVideoPlayers(DAYS.find(d=>d.id===currentDay));
   if(currentDay===0 && contentOverrides['home']) initOverrideVideoPlayers({id:'home'});
@@ -4028,6 +4310,26 @@ async function handleActivityUpload(event){
 function startVideoPlayback(dayId, idx){
   const key = `${dayId}_${idx}`;
   videoPlayerTapped[key] = true;
+  ensureYtApi().catch(()=>{}); // kick off the API download in parallel with the re-render; errors surface in the player init below
+  renderMainOnly();
+}
+// "Retry Video" - tears down the failed player instance (and, if the API script itself failed, its
+// cached load promise) and re-runs the normal tap-to-play flow. Never touches saved progress and
+// never locks the course.
+function retryOverrideVideo(dayId, idx){
+  const key = `${dayId}_${idx}`;
+  if(ytPollTimers[key]){ clearInterval(ytPollTimers[key]); delete ytPollTimers[key]; }
+  if(ytPlayers[key]){ try{ ytPlayers[key].destroy(); }catch(e){} delete ytPlayers[key]; }
+  startVideoPlayback(dayId, idx);
+}
+function retryLegacyVideo(dayId){
+  if(ytPollTimer){ clearInterval(ytPollTimer); ytPollTimer = null; }
+  if(ytPlayer){ try{ ytPlayer.destroy(); }catch(e){} ytPlayer = null; }
+  startLegacyVideoPlayback(dayId);
+}
+function startLegacyVideoPlayback(dayId){
+  videoPlayerTapped['legacy_'+dayId] = true;
+  ensureYtApi().catch(()=>{});
   renderMainOnly();
 }
 function renderOverrideVideoItem(dayId, item, idx, dp){
@@ -4044,7 +4346,9 @@ function renderOverrideVideoItem(dayId, item, idx, dp){
   // is created at all once a video is done.
   let inner;
   if(itemProgress.done && n.embedUrl){
-    inner = `<iframe src="${esc(n.embedUrl)}" allowfullscreen></iframe>`;
+    // Completed video: instant thumbnail facade; tapping loads a plain iframe (no tracking player, so
+    // rewatching can never touch the saved completion).
+    inner = lazyEmbedFacade(n.embedUrl, n.kind==='youtube'?n.videoId:null, 'Completed — tap to rewatch');
   } else if(n.kind==='youtube'){
     const key = `${dayId}_${idx}`;
     if(!videoPlayerTapped[key]){
@@ -4065,7 +4369,7 @@ function renderOverrideVideoItem(dayId, item, idx, dp){
       </div>`;
     }
   } else if(n.embedUrl){
-    inner = `<iframe src="${esc(n.embedUrl)}" allowfullscreen></iframe>`;
+    inner = lazyEmbedFacade(n.embedUrl, null, item.title||'Tap to play');
   } else if(item.url){
     inner = `<div class="video-placeholder">Video link not recognised.</div>`;
   } else {
@@ -4106,7 +4410,7 @@ function initOverrideVideoPlayers(day){
     if(!item.url) return;
     const n = normalizeUrl(item.url);
     if(n.kind!=='youtube') return;
-    const m = item.url.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([\w-]+)/);
+    const m = item.url.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/|youtube\.com\/shorts\/|youtube\.com\/live\/)([\w-]+)/);
     if(!m) return;
     const videoId = m[1];
     const elId = `yt-player-${day.id}-${idx}`;
@@ -4116,8 +4420,14 @@ function initOverrideVideoPlayers(day){
     if(alreadyDone) return; // already completed - rendered as a plain embed instead, no tracking player needed
     if(!videoPlayerTapped[key]) return; // not tapped yet - stays a lightweight thumbnail, no player, no API calls
     const fail = (reason)=>{
+      // A failed video NEVER locks anything: navigation, theory, and already-unlocked pages all stay
+      // usable. The partner gets a Retry button; only this one player slot shows the error.
+      if(ytPollTimers[key]){ clearInterval(ytPollTimers[key]); delete ytPollTimers[key]; }
+      delete ytPlayers[key];
       const c = document.getElementById(elId);
-      if(c) c.innerHTML = `<div class="video-placeholder">${reason}<br><span style="font-size:11.5px;">This can't be skipped — if the video won't load, ask your trainer to unlock it for you.</span></div>`;
+      if(c) c.innerHTML = `<div class="video-placeholder">${reason}<br>
+        <button class="btn amber small" style="margin-top:10px;" onclick="retryOverrideVideo(${jsDayId(day.id)},${idx})">Retry Video</button>
+        <br><span style="font-size:11.5px;">If it still won't load, ask your trainer to confirm this video for you — the rest of the course stays available.</span></div>`;
     };
     const ytErrorMessage = (code)=>{
       if(code===2) return 'This video link looks invalid.';
@@ -4126,44 +4436,42 @@ function initOverrideVideoPlayers(day){
       if(code===101 || code===150) return 'The video owner has disabled playback on other websites for this video.';
       return 'This video link could not be played.';
     };
-    let attempts = 0;
-    const tryInit = ()=>{
-      attempts++;
-      if(!document.getElementById(elId)) return;
-      if((ytApiReady || (window.YT && window.YT.Player))){
-        ytPlayers[key] = new YT.Player(elId, {
-          width:'100%', height:'100%',
-          videoId,
-          events:{
-            onReady:(e)=>{
-              const savedRanges = dp.videoItemProgress[idx]?.ranges;
-              if(savedRanges && savedRanges.length>0 && !alreadyDone){
-                const lastRange = savedRanges[savedRanges.length-1];
-                const resumeTime = lastRange ? lastRange[1] : 0;
-                if(resumeTime > 3){
-                  try{ e.target.seekTo(resumeTime, true); }catch(err){}
-                }
+    ensureYtApi().then(()=>{
+      if(!document.getElementById(elId)) return; // page changed while the API loaded - nothing to do
+      if(ytPlayers[key]) return; // guard against double-init from overlapping renders
+      ytPlayers[key] = new YT.Player(elId, {
+        width:'100%', height:'100%',
+        videoId,
+        events:{
+          onReady:(e)=>{
+            const savedRanges = dp.videoItemProgress[idx]?.ranges;
+            if(savedRanges && savedRanges.length>0 && !alreadyDone){
+              const lastRange = savedRanges[savedRanges.length-1];
+              const resumeTime = lastRange ? lastRange[1] : 0;
+              if(resumeTime > 3){
+                try{ e.target.seekTo(resumeTime, true); }catch(err){}
               }
-            },
-            onError:(e)=>{ fail(ytErrorMessage(e && e.data)); },
-            onStateChange:(e)=>{
-              if(alreadyDone) return;
-              if(e.data===YT.PlayerState.PLAYING){
-                if(ytPollTimers[key]) clearInterval(ytPollTimers[key]);
-                ytPollTimers[key] = setInterval(()=>pollOverrideYT(day.id, idx, key), 2000);
-              } else if(ytPollTimers[key]){
-                clearInterval(ytPollTimers[key]); delete ytPollTimers[key];
+            }
+          },
+          onError:(e)=>{ fail(ytErrorMessage(e && e.data)); },
+          onStateChange:(e)=>{
+            if(alreadyDone) return;
+            if(e.data===YT.PlayerState.PLAYING){
+              if(ytPollTimers[key]) clearInterval(ytPollTimers[key]);
+              ytPollTimers[key] = setInterval(()=>pollOverrideYT(day.id, idx, key), 2000);
+            } else {
+              if(ytPollTimers[key]){ clearInterval(ytPollTimers[key]); delete ytPollTimers[key]; }
+              // Save on pause/end so watch progress is never more than a couple of seconds stale.
+              if((e.data===YT.PlayerState.PAUSED || e.data===YT.PlayerState.ENDED) && currentUser){
+                setProgress(currentUser.id, currentUserProgress, {fast:true});
               }
             }
           }
-        });
-      } else if(attempts<25){
-        setTimeout(tryInit, 400);
-      } else {
-        fail('Video player unavailable — check your internet connection and try refreshing.');
-      }
-    };
-    tryInit();
+        }
+      });
+    }).catch(()=>{
+      fail('Video player unavailable — check your internet connection.');
+    });
   });
 }
 function showManualFallbackOverride(dayId, idx){
@@ -4230,7 +4538,18 @@ async function pollOverrideYT(dayId, idx, key){
       const label = document.getElementById(`ov-progress-label-${dayId}-${idx}`);
       if(fill) fill.style.width = pct+'%';
       if(label) label.innerHTML = pct+'% watched '+(done?'&middot; <span style="color:var(--success);">Done</span>':readyForUnlock?'&middot; <span style="color:var(--amber);">Watched — waiting for your Trainer to confirm</span>':`&middot; needs ${minPercent}% to continue`);
-      if(pct % 6 === 0 || done || readyForUnlock) await setProgress(currentUser.id, currentUserProgress);
+      const nowMs = Date.now();
+      if(done || readyForUnlock){
+        // Completion is a permanent milestone: record when it happened and save with full merge
+        // protection, awaited, BEFORE the next-page unlock becomes tappable.
+        if(!dp.videoItemProgress[idx].completedAt) dp.videoItemProgress[idx].completedAt = new Date().toISOString();
+        lastProgressAutosaveAt = nowMs;
+        await setProgress(currentUser.id, currentUserProgress);
+      } else if(nowMs - lastProgressAutosaveAt > 8000){
+        // Regular while-playing autosave every ~8s (fast path - local backup + ordered write).
+        lastProgressAutosaveAt = nowMs;
+        await setProgress(currentUser.id, currentUserProgress, {fast:true});
+      }
       if(done){
         if(ytPollTimers[key]){ clearInterval(ytPollTimers[key]); delete ytPollTimers[key]; }
         updateTheoryCompleteButtonState(dayId);
@@ -4244,11 +4563,11 @@ function renderVideo(day){
   if(ov){
     const videos = ov.videos||[];
     const frames = videos.map(v=>{
-      const yt = (v.url||'').match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([\w-]+)/);
+      const yt = (v.url||'').match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/|youtube\.com\/shorts\/|youtube\.com\/live\/)([\w-]+)/);
       const vm = (v.url||'').match(/vimeo\.com\/(\d+)/);
       let inner = `<div class="video-placeholder">${esc(v.title||'Video')}<br><span style="font-size:11.5px;">No video linked yet.</span></div>`;
-      if(yt) inner = `<iframe src="https://www.youtube.com/embed/${yt[1]}" allowfullscreen></iframe>`;
-      else if(vm) inner = `<iframe src="https://player.vimeo.com/video/${vm[1]}" allowfullscreen></iframe>`;
+      if(yt) inner = lazyEmbedFacade(`https://www.youtube.com/embed/${yt[1]}`, yt[1], v.title||'Tap to play');
+      else if(vm) inner = lazyEmbedFacade(`https://player.vimeo.com/video/${vm[1]}`, null, v.title||'Tap to play');
       else if(v.url) inner = `<div class="video-placeholder">Video link not recognised.</div>`;
       return `<div class="card"><h3>${esc(v.title||'Video')}</h3><div class="video-frame">${inner}</div></div>`;
     }).join('');
@@ -4262,18 +4581,33 @@ function renderVideo(day){
     `;
   }
   const url = videosCache[day.id]||'';
-  const yt = url.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([\w-]+)/);
+  const yt = url.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/|youtube\.com\/shorts\/|youtube\.com\/live\/)([\w-]+)/);
   const pct = Math.round(dp.videoPct||0);
   let body = '';
   if(!url){
     body = `<div class="video-frame"><div class="video-placeholder">${esc(day.video.title)}<br><span style="font-size:11.5px;">No video linked yet — ask your trainer.</span></div></div>`;
   } else if(yt){
-    body = `<div class="video-frame"><div id="yt-player-${day.id}" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#fff;">
-      <div style="text-align:center;">
-        <div style="width:32px;height:32px;border:3px solid rgba(255,255,255,0.3);border-top-color:#fff;border-radius:50%;animation:ucaSpin 0.8s linear infinite;margin:0 auto 8px;"></div>
-        <span style="font-size:12px;">Loading video&hellip;</span>
-      </div>
-    </div></div>`;
+    if(dp.videoDone){
+      // Already completed: plain tap-to-play embed, no tracking player, saved progress untouchable.
+      body = `<div class="video-frame">${lazyEmbedFacade(`https://www.youtube.com/embed/${yt[1]}`, yt[1], 'Completed — tap to rewatch')}</div>`;
+    } else if(!videoPlayerTapped['legacy_'+day.id]){
+      // Instant thumbnail facade - the YouTube API and player load only after the partner taps Play.
+      body = `<div class="video-frame"><div style="width:100%;height:100%;position:relative;cursor:pointer;background:#000;" onclick="startLegacyVideoPlayback(${day.id})">
+        <img src="https://img.youtube.com/vi/${yt[1]}/hqdefault.jpg" loading="lazy" alt="" style="width:100%;height:100%;object-fit:cover;opacity:0.7;">
+        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">
+          <div style="width:56px;height:56px;border-radius:50%;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;">
+            <div style="width:0;height:0;border-top:12px solid transparent;border-bottom:12px solid transparent;border-left:20px solid #fff;margin-left:4px;"></div>
+          </div>
+        </div>
+      </div></div>`;
+    } else {
+      body = `<div class="video-frame"><div id="yt-player-${day.id}" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#fff;">
+        <div style="text-align:center;">
+          <div style="width:32px;height:32px;border:3px solid rgba(255,255,255,0.3);border-top-color:#fff;border-radius:50%;animation:ucaSpin 0.8s linear infinite;margin:0 auto 8px;"></div>
+          <span style="font-size:12px;">Loading video&hellip;</span>
+        </div>
+      </div></div>`;
+    }
   } else {
     const vm = url.match(/vimeo\.com\/(\d+)/);
     const embed = vm ? `https://player.vimeo.com/video/${vm[1]}` : '';
@@ -4294,7 +4628,7 @@ function renderExtraVideos(dayId){
   if(extras.length===0) return '';
   return extras.map(v=>{
     const n = normalizeUrl(v.url);
-    const inner = n.embedUrl ? `<iframe src="${esc(n.embedUrl)}" allowfullscreen></iframe>` : `<div class="video-placeholder">${v.url?'Video link not recognised.':'No video linked yet.'}</div>`;
+    const inner = n.embedUrl ? lazyEmbedFacade(n.embedUrl, n.kind==='youtube'?n.videoId:null, v.title||'Tap to play') : `<div class="video-placeholder">${v.url?'Video link not recognised.':'No video linked yet.'}</div>`;
     return `<div class="card"><h3>${esc(v.title||'Additional video')}</h3><div class="video-frame">${inner}</div></div>`;
   }).join('');
 }
@@ -4320,13 +4654,21 @@ function cleanupPlayer(){
 }
 function initVideoTab(day){
   const url = videosCache[day.id]||'';
-  const m = url.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([\w-]+)/);
+  const m = url.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/|youtube\.com\/shorts\/|youtube\.com\/live\/)([\w-]+)/);
   if(!m) return;
+  const dp0 = currentUserProgress[day.id];
+  if(dp0 && dp0.videoDone) return; // completed - rendered as a plain lazy embed, no tracking player
+  if(!videoPlayerTapped['legacy_'+day.id]) return; // not tapped yet - stays a lightweight thumbnail
   const videoId = m[1];
   const elId = 'yt-player-'+day.id;
   const fail = (reason)=>{
+    // Never locks the course - shows Retry and leaves everything else usable.
+    if(ytPollTimer){ clearInterval(ytPollTimer); ytPollTimer = null; }
+    ytPlayer = null;
     const c = document.getElementById(elId);
-    if(c) c.innerHTML = `<div class="video-placeholder">${reason}<br><span style="font-size:11.5px;">This can't be skipped — if the video won't load, ask your trainer to unlock it for you.</span></div>`;
+    if(c) c.innerHTML = `<div class="video-placeholder">${reason}<br>
+      <button class="btn amber small" style="margin-top:10px;" onclick="retryLegacyVideo(${day.id})">Retry Video</button>
+      <br><span style="font-size:11.5px;">If it still won't load, ask your trainer to confirm this video for you — the rest of the course stays available.</span></div>`;
   };
   const ytErrorMessage = (code)=>{
     if(code===2) return 'This video link looks invalid.';
@@ -4335,44 +4677,41 @@ function initVideoTab(day){
     if(code===101 || code===150) return 'The video owner has disabled playback on other websites for this video.';
     return 'This video link could not be played.';
   };
-  let attempts=0;
-  const tryInit = ()=>{
-    attempts++;
+  ensureYtApi().then(()=>{
     if(!document.getElementById(elId)) return;
-    if((ytApiReady || (window.YT && window.YT.Player))){
-      ytPlayer = new YT.Player(elId, {
-        width:'100%', height:'100%',
-        videoId,
-        events:{
-          onReady:(e)=>{
-            const dp = currentUserProgress[day.id];
-            const savedRanges = dp && dp.videoRanges;
-            if(savedRanges && savedRanges.length>0 && !(dp && dp.videoDone)){
-              const lastRange = savedRanges[savedRanges.length-1];
-              const resumeTime = lastRange ? lastRange[1] : 0;
-              if(resumeTime > 3){
-                try{ e.target.seekTo(resumeTime, true); }catch(err){}
-              }
+    if(ytPlayer) return; // guard against double-init from overlapping renders
+    ytPlayer = new YT.Player(elId, {
+      width:'100%', height:'100%',
+      videoId,
+      events:{
+        onReady:(e)=>{
+          const dp = currentUserProgress[day.id];
+          const savedRanges = dp && dp.videoRanges;
+          if(savedRanges && savedRanges.length>0 && !(dp && dp.videoDone)){
+            const lastRange = savedRanges[savedRanges.length-1];
+            const resumeTime = lastRange ? lastRange[1] : 0;
+            if(resumeTime > 3){
+              try{ e.target.seekTo(resumeTime, true); }catch(err){}
             }
-          },
-          onError:(e)=>{ fail(ytErrorMessage(e && e.data)); },
-          onStateChange:(e)=>{
-            if(e.data===YT.PlayerState.PLAYING){
-              if(ytPollTimer) clearInterval(ytPollTimer);
-              ytPollTimer = setInterval(()=>pollYT(day.id), 2000);
-            } else if(ytPollTimer){
-              clearInterval(ytPollTimer); ytPollTimer=null;
+          }
+        },
+        onError:(e)=>{ fail(ytErrorMessage(e && e.data)); },
+        onStateChange:(e)=>{
+          if(e.data===YT.PlayerState.PLAYING){
+            if(ytPollTimer) clearInterval(ytPollTimer);
+            ytPollTimer = setInterval(()=>pollYT(day.id), 2000);
+          } else {
+            if(ytPollTimer){ clearInterval(ytPollTimer); ytPollTimer=null; }
+            if((e.data===YT.PlayerState.PAUSED || e.data===YT.PlayerState.ENDED) && currentUser){
+              setProgress(currentUser.id, currentUserProgress, {fast:true});
             }
           }
         }
-      });
-    } else if(attempts<25){
-      setTimeout(tryInit, 400);
-    } else {
-      fail('Video player unavailable — check your internet connection and try refreshing.');
-    }
-  };
-  tryInit();
+      }
+    });
+  }).catch(()=>{
+    fail('Video player unavailable — check your internet connection.');
+  });
 }
 function showManualFallback(dayId){
   const wrap = document.querySelector('.video-progress-wrap');
@@ -4605,7 +4944,14 @@ async function pollYT(dayId){
       const label = document.querySelector('.video-progress-label');
       if(track) track.style.width = pct+'%';
       if(label) label.innerHTML = pct+'% watched '+(dp.videoDone?'&middot; <span style="color:var(--success);">Unlocked next steps</span>':'&middot; needs 90% to continue');
-      if(pct % 6 === 0 || dp.videoDone) await setProgress(currentUser.id, currentUserProgress);
+      const nowMs = Date.now();
+      if(dp.videoDone){
+        lastProgressAutosaveAt = nowMs;
+        await setProgress(currentUser.id, currentUserProgress); // completion: full merge-protected save
+      } else if(nowMs - lastProgressAutosaveAt > 8000){
+        lastProgressAutosaveAt = nowMs;
+        await setProgress(currentUser.id, currentUserProgress, {fast:true});
+      }
       if(dp.videoDone) renderSidebar();
     }
   }catch(e){}
@@ -7125,7 +7471,7 @@ function promptOverrideAction(partnerId, dayId, activity, previousStatus, confir
       updatedStatus = 'unlocked';
     }
     if(activity!=='Assessment Unlock' && activity!=='Day Unlock'){
-      await setProgress(partnerId, prog);
+      await setProgress(partnerId, prog, {allowDowngrade:true}); // authorized Trainer/Admin override
     }
     await logProgressOverride(partnerId, r?r.name:partnerId, dayId, activity, previousStatus, updatedStatus, reason);
     showToast(`${activity} updated for ${r?r.name:partnerId}. They'll see it next time they refresh.`, 'success');
@@ -7162,7 +7508,7 @@ async function promptLockPageAction(partnerId, dayId, pageIdx, confirmMsg){
     ensureDayInProgObj(prog, dayId);
     if(!prog[dayId].pageManualLock) prog[dayId].pageManualLock = {};
     prog[dayId].pageManualLock[pageIdx] = { by: trainerIdentity.name, reason, at: new Date().toISOString() };
-    await setProgress(partnerId, prog);
+    await setProgress(partnerId, prog, {allowDowngrade:true}); // authorized Trainer/Admin manual lock
     await logProgressOverride(partnerId, r?r.name:partnerId, dayId, `Page ${pageIdx+1} Lock`, 'unlocked', 'locked', reason);
     showToast(`Page ${pageIdx+1} locked for ${r?r.name:partnerId}.`, 'success');
     renderAdminMain();
@@ -7175,7 +7521,7 @@ async function promptUnlockPageAction(partnerId, dayId, pageIdx, confirmMsg){
     const prog = await getProgress(partnerId);
     ensureDayInProgObj(prog, dayId);
     if(prog[dayId].pageManualLock) delete prog[dayId].pageManualLock[pageIdx];
-    await setProgress(partnerId, prog);
+    await setProgress(partnerId, prog, {allowDowngrade:true}); // authorized Trainer/Admin manual unlock
     await logProgressOverride(partnerId, r?r.name:partnerId, dayId, `Page ${pageIdx+1} Unlock`, 'locked', 'unlocked', reason);
     showToast(`Page ${pageIdx+1} unlocked for ${r?r.name:partnerId}.`, 'success');
     renderAdminMain();
@@ -7195,7 +7541,8 @@ function promptResetComponent(partnerId, dayId, component, confirmMsg){
     } else if(component==='assignment'){
       dp.tasksChecked = []; dp.taskTimers = {}; dp.taskPhotos = {}; dp.taskNotes = {};
     }
-    await setProgress(partnerId, prog);
+    prog._resetAt = new Date().toISOString(); // marks device backups older than this as superseded
+    await setProgress(partnerId, prog, {allowDowngrade:true}); // authorized Trainer/Admin reset
     await logProgressOverride(partnerId, r?r.name:partnerId, dayId, `Reset: ${component}`, 'had progress', 'reset', reason);
     showToast(`${component==='quickAssessment'?'Quick Assessment':component.charAt(0).toUpperCase()+component.slice(1)} reset for ${r?r.name:partnerId} on Day ${dayId}.`, 'success');
     renderAdminMain();
@@ -8834,7 +9181,7 @@ async function confirmVideoUnlock(partnerId, dayId, idx){
   const prog = await getProgress(partnerId);
   if(!prog[dayId] || !prog[dayId].videoItemProgress || !prog[dayId].videoItemProgress[idx]){ showToast("Couldn't find that video's progress record.", 'error'); return; }
   prog[dayId].videoItemProgress[idx] = { ...prog[dayId].videoItemProgress[idx], done:true, readyForUnlock:false };
-  await setProgress(partnerId, prog);
+  await setProgress(partnerId, prog, {allowDowngrade:true}); // authorized Trainer/Admin confirm
   const name = adminRoster[partnerId]?.name || partnerId;
   await logHistory('video_unlock_confirmed', `Video on Day ${dayId} manually confirmed and unlocked for ${name} by ${trainerIdentity.name}`, {partnerId, dayId, idx});
   showToast('Confirmed — the partner can continue.', 'success');
@@ -8930,7 +9277,8 @@ async function deletePartnerRow(id){
 async function resetPartnerProgress(id){
   const name = adminRoster[id]?.name||id;
   showConfirmModal(`Reset ALL course progress for ${name}? This clears their theory/video completion, assignment checkmarks, and assessment scores for every day — they'll start the course again from Day 1. Their trainer, batch, and city stay the same. This cannot be undone.`, async ()=>{
-    await setProgress(id, {});
+    await setProgress(id, { _resetAt: new Date().toISOString() }, {allowDowngrade:true}); // authorized Admin full reset
+    try{ localStorage.removeItem(progressBackupKey(id)); }catch(e){} // also clear this device's backup so it can't resurrect the old progress
     await logHistory('partner_progress_reset', `Course progress reset for ${name} by ${trainerIdentity.name}`, {partnerId:id});
     showToast(`${name}'s progress has been reset.`, 'success');
     renderAdminMain();
@@ -9038,7 +9386,7 @@ async function resetPartnerCredential(oldId){
     if(!ok){ showToast("Couldn't create the new ID — check your connection and try again.", 'error'); return; }
 
     const progress = await getProgress(oldId);
-    if(progress && Object.keys(progress).length>0) await setProgress(newId, progress);
+    if(progress && Object.keys(progress).length>0) await setProgress(newId, progress, {allowDowngrade:true}); // ID migration copy
 
     const checkinKeys = await kvList('checkin:'+oldId+'__');
     await Promise.all(checkinKeys.map(async k=>{
