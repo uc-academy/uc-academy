@@ -5743,7 +5743,7 @@ function renderTrainersTab(){
       ${entries.length===0?`<div class="empty-state">No trainers match these filters.</div>`:`
       <table class="data-table">
         <tr><th>Photo</th><th>Name</th><th>Phone</th><th>Category</th><th>City</th><th>Assigned courses</th><th>Password</th><th>Status</th><th>Created</th><th></th></tr>
-        ${entries.map(([id,t])=>`<tr><td>${t.profilePhotoUrl?`<img src="${esc(t.profilePhotoUrl)}" style="width:30px;height:30px;border-radius:50%;object-fit:cover;cursor:zoom-in;" onclick="previewStaffPhotoFullscreen('${esc(t.profilePhotoUrl)}','${esc(t.name)}')">`:`<span style="width:30px;height:30px;border-radius:50%;background:var(--brand-light);color:var(--brand);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;">${esc((t.name||'?')[0].toUpperCase())}</span>`}</td><td>${esc(t.name)}</td><td>${esc(t.phone)}</td><td>${esc(t.category)}</td><td>${esc(t.city)}</td><td style="max-width:200px;white-space:normal;">${(t.assignedCourses||[]).map(cid=>esc(adminCourses[cid]?.name||'')).filter(Boolean).join(', ') || '<span style="color:var(--ink-soft);">— none —</span>'}</td><td class="mono">${esc(t.password)}</td><td><span class="pill ${t.active!==false?'open':'closed'}">${t.active!==false?'Active':'Deactivated'}</span></td><td>${fmtDateTime(t.createdAt)}</td><td style="display:flex;gap:6px;flex-wrap:wrap;"><button class="btn small secondary" onclick="uploadPhotoForStaff('trainer','${id}','${esc(t.name)}')">${t.profilePhotoUrl?'Replace Photo':'Upload Photo'}</button>${t.profilePhotoUrl?`<button class="btn small secondary" onclick="removePhotoForStaff('trainer','${id}','${esc(t.name)}')">Remove Photo</button><button class="btn small secondary" onclick="resetStaffPhoto('trainer','${id}','${esc(t.name)}')">Reset (let them re-upload)</button>`:''}<button class="btn small secondary" onclick="toggleTrainerActive('${id}')">${t.active!==false?'Deactivate':'Reactivate'}</button><button class="btn small danger" onclick="removeTrainer('${id}')">Remove</button></td></tr>`).join('')}
+        ${entries.map(([id,t])=>`<tr><td>${t.profilePhotoUrl?`<img src="${esc(t.profilePhotoUrl)}" style="width:30px;height:30px;border-radius:50%;object-fit:cover;cursor:zoom-in;" onclick="previewStaffPhotoFullscreen('${esc(t.profilePhotoUrl)}','${esc(t.name)}')">`:`<span style="width:30px;height:30px;border-radius:50%;background:var(--brand-light);color:var(--brand);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;">${esc((t.name||'?')[0].toUpperCase())}</span>`}</td><td>${esc(t.name)}</td><td>${esc(t.phone)}</td><td>${esc(t.category)}</td><td>${esc(t.city)}</td><td style="max-width:200px;white-space:normal;">${(t.assignedCourses||[]).map(cid=>esc(adminCourses[cid]?.name||'')).filter(Boolean).join(', ') || '<span style="color:var(--ink-soft);">— none —</span>'}</td><td class="mono">${esc(t.password)}</td><td><span class="pill ${t.active!==false?'open':'closed'}">${t.active!==false?'Active':'Deactivated'}</span></td><td>${fmtDateTime(t.createdAt)}</td><td style="display:flex;gap:6px;flex-wrap:wrap;"><button class="btn small secondary" onclick="openEditTrainerModal('${id}')">Edit</button><button class="btn small secondary" onclick="uploadPhotoForStaff('trainer','${id}','${esc(t.name)}')">${t.profilePhotoUrl?'Replace Photo':'Upload Photo'}</button>${t.profilePhotoUrl?`<button class="btn small secondary" onclick="removePhotoForStaff('trainer','${id}','${esc(t.name)}')">Remove Photo</button><button class="btn small secondary" onclick="resetStaffPhoto('trainer','${id}','${esc(t.name)}')">Reset (let them re-upload)</button>`:''}<button class="btn small secondary" onclick="toggleTrainerActive('${id}')">${t.active!==false?'Deactivate':'Reactivate'}</button><button class="btn small danger" onclick="removeTrainer('${id}')">Remove</button></td></tr>`).join('')}
       </table>`}
     </div>
   `;
@@ -5755,6 +5755,65 @@ async function toggleTrainerActive(trainerId){
   await kvSet('trainer:'+trainerId, { ...t, active:newActive });
   await logHistory(newActive?'trainer_reactivated':'trainer_deactivated', `Trainer ${t.name} ${newActive?'reactivated':'deactivated'} by ${trainerIdentity.name}`, {trainerId});
   showToast(newActive?'Reactivated.':'Deactivated — this account can no longer log in.', 'success');
+  adminTrainers = await listTrainers();
+  renderAdminMain();
+}
+function openEditTrainerModal(id){
+  const t = adminTrainers[id];
+  if(!t){ showToast('Could not find that trainer.', 'error'); return; }
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.id = 'edit-trainer-overlay';
+  overlay.innerHTML = `<div class="confirm-box" style="text-align:left;max-width:480px;max-height:85vh;overflow-y:auto;">
+    <h3 style="margin-top:0;">Edit Trainer — ${esc(t.name)}</h3>
+    <span class="field-label">Name</span>
+    <input class="field-input" id="et-name" value="${esc(t.name)}">
+    <span class="field-label">Phone number</span>
+    <input class="field-input" id="et-phone" type="tel" value="${esc(t.phone)}">
+    <span class="field-label">Category</span>
+    <select class="field-input" id="et-category">
+      ${CATEGORIES.map(c=>`<option ${t.category===c?'selected':''}>${c}</option>`).join('')}
+    </select>
+    <span class="field-label">City</span>
+    <select class="field-input" id="et-city">
+      ${CITIES.map(c=>`<option ${t.city===c?'selected':''}>${c}</option>`).join('')}
+    </select>
+    <span class="field-label">Assigned courses</span>
+    <div style="margin-bottom:10px;">
+      ${Object.entries(adminCategories).map(([catId,cat])=>{
+        const courses = Object.entries(adminCourses).filter(([,c])=>c.categoryId===catId);
+        if(courses.length===0) return '';
+        return `<div style="margin-bottom:6px;"><b style="font-size:12px;">${esc(cat.name)}:</b> ${courses.map(([courseId,course])=>`<label style="display:inline-flex;gap:4px;align-items:center;margin-right:12px;cursor:pointer;"><input type="checkbox" class="et-course" value="${courseId}" ${(t.assignedCourses||[]).includes(courseId)?'checked':''} style="accent-color:var(--brand);">${esc(course.name)}</label>`).join('')}</div>`;
+      }).join('') || '<span style="color:var(--ink-soft);font-size:12.5px;">No courses yet.</span>'}
+    </div>
+    <div class="confirm-actions">
+      <button class="btn secondary" onclick="closeEditTrainerModal()">Cancel</button>
+      <button class="btn amber" onclick="saveTrainerEdit('${id}')">Save changes</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+}
+function closeEditTrainerModal(){
+  const el = document.getElementById('edit-trainer-overlay');
+  if(el && el.parentNode) el.parentNode.removeChild(el);
+}
+async function saveTrainerEdit(id){
+  const t = adminTrainers[id];
+  if(!t){ showToast('Could not find that trainer.', 'error'); return; }
+  const name = document.getElementById('et-name').value.trim();
+  const phone = document.getElementById('et-phone').value.trim();
+  const category = document.getElementById('et-category').value;
+  const city = document.getElementById('et-city').value;
+  const assignedCourses = Array.from(document.querySelectorAll('.et-course:checked')).map(el=>el.value);
+  if(!name || !phone || !category || !city){ showToast('Fill in name, phone, category, and city.', 'error'); return; }
+  if(!/^\d{7,15}$/.test(phone.replace(/\D/g,''))){ showToast('Enter a valid phone number.', 'error'); return; }
+  const previous = { name:t.name, phone:t.phone, category:t.category, city:t.city, assignedCourses:t.assignedCourses||[] };
+  const updated = { ...t, name, phone, category, city, assignedCourses };
+  const ok = await kvSet('trainer:'+id, updated);
+  if(!ok){ showToast("Couldn't save — check your connection.", 'error'); return; }
+  await logHistory('trainer_edited', `Trainer profile updated for ${name} by ${trainerIdentity.name}`, {trainerId:id, previous, updated:{name,phone,category,city,assignedCourses}});
+  closeEditTrainerModal();
+  showToast('Trainer profile updated.', 'success');
   adminTrainers = await listTrainers();
   renderAdminMain();
 }
