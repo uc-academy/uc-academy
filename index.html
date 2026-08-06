@@ -10840,17 +10840,65 @@ async function runAiSuggestGeneration(){
   s.step = 'review';
   renderAiSuggestOverlay();
 }
+function getAiSuggestDisplayedQuestions(s){
+  if(s.source!=='theoryImport') return s.questions;
+  return s.questions.filter(q=>{
+    if(s.filterDayId && String(q.sourceDayId)!==String(s.filterDayId)) return false;
+    if(s.filterDifficulty && q.difficulty!==s.filterDifficulty) return false;
+    if(s.filterType && q.type!==s.filterType) return false;
+    if(s.filterTopic && !(q.relatedTopic||'').toLowerCase().includes(s.filterTopic.toLowerCase())) return false;
+    return true;
+  });
+}
+function updateAiSuggestFilter(field, value){
+  aiSuggestState[field] = value;
+  renderAiSuggestOverlay();
+}
+function toggleAiSuggestSelectAllFiltered(checked){
+  getAiSuggestDisplayedQuestions(aiSuggestState).forEach(q=>{ aiSuggestState.selected[q.id] = checked; });
+  renderAiSuggestOverlay();
+}
 function renderAiSuggestReviewStep(s){
-  const allSelected = s.questions.length>0 && s.questions.every(q=>s.selected[q.id]);
+  const displayed = getAiSuggestDisplayedQuestions(s);
+  const allSelected = displayed.length>0 && displayed.every(q=>s.selected[q.id]);
+  const dayIds = s.source==='theoryImport' ? [...new Set(s.questions.map(q=>q.sourceDayId))].sort((a,b)=>a-b) : [];
+  const topics = s.source==='theoryImport' ? [...new Set(s.questions.map(q=>q.relatedTopic).filter(Boolean))] : [];
   return `
     <div class="confirm-box" style="max-width:640px;width:94%;text-align:left;max-height:88vh;overflow-y:auto;">
-      <h3 style="margin-top:0;">Review suggested questions</h3>
+      <h3 style="margin-top:0;">Review ${s.source==='theoryImport'?'imported':'suggested'} questions</h3>
       <p style="font-size:12.5px;color:var(--ink-soft);margin-top:-6px;">Nothing is added to the assessment yet — pick which ones to keep, edit anything, then Add to Assessment.</p>
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-        <label style="display:flex;gap:6px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="checkbox" ${allSelected?'checked':''} onchange="toggleAiSuggestSelectAll(this.checked)"> Select all</label>
-        <button class="btn small secondary" onclick="aiSuggestState.step='config'; renderAiSuggestOverlay();">&larr; Back to options</button>
+      ${s.source==='theoryImport' ? `
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
+        <select class="field-input" style="margin-bottom:0;" onchange="updateAiSuggestFilter('filterDayId', this.value)">
+          <option value="">All Days</option>
+          ${dayIds.map(d=>`<option value="${d}" ${String(s.filterDayId)===String(d)?'selected':''}>Day ${d}</option>`).join('')}
+        </select>
+        <select class="field-input" style="margin-bottom:0;" onchange="updateAiSuggestFilter('filterDifficulty', this.value)">
+          <option value="">All Difficulties</option>
+          <option value="easy" ${s.filterDifficulty==='easy'?'selected':''}>Easy</option>
+          <option value="medium" ${s.filterDifficulty==='medium'?'selected':''}>Medium</option>
+          <option value="hard" ${s.filterDifficulty==='hard'?'selected':''}>Hard</option>
+        </select>
+        <select class="field-input" style="margin-bottom:0;" onchange="updateAiSuggestFilter('filterType', this.value)">
+          <option value="">All Question Types</option>
+          <option value="mcq" ${s.filterType==='mcq'?'selected':''}>MCQ</option>
+          <option value="multiple" ${s.filterType==='multiple'?'selected':''}>Multiple-select</option>
+          <option value="checkbox" ${s.filterType==='checkbox'?'selected':''}>Checkbox</option>
+          <option value="truefalse" ${s.filterType==='truefalse'?'selected':''}>True/False</option>
+          <option value="short" ${s.filterType==='short'?'selected':''}>Short answer</option>
+        </select>
+        <select class="field-input" style="margin-bottom:0;" onchange="updateAiSuggestFilter('filterTopic', this.value)">
+          <option value="">All Topics</option>
+          ${topics.map(t=>`<option value="${esc(t)}" ${s.filterTopic===t?'selected':''}>${esc(t)}</option>`).join('')}
+        </select>
       </div>
-      ${s.questions.length===0 ? '<p style="color:var(--ink-soft);">No questions left — regenerate or go back.</p>' : s.questions.map((q,qi)=>renderAiSuggestQuestionCard(q,qi,s)).join('')}
+      <p style="font-size:11.5px;color:var(--ink-soft);margin-top:-8px;margin-bottom:10px;">Showing ${displayed.length} of ${s.questions.length} question(s)</p>
+      ` : ''}
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <label style="display:flex;gap:6px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="checkbox" ${allSelected?'checked':''} onchange="toggleAiSuggestSelectAllFiltered(this.checked)"> Select all ${s.source==='theoryImport'?'(shown)':''}</label>
+        ${s.source!=='theoryImport' ? `<button class="btn small secondary" onclick="aiSuggestState.step='config'; renderAiSuggestOverlay();">&larr; Back to options</button>` : ''}
+      </div>
+      ${displayed.length===0 ? '<p style="color:var(--ink-soft);">No questions match this filter.</p>' : displayed.map((q,qi)=>renderAiSuggestQuestionCard(q,qi,s)).join('')}
       <div class="confirm-actions" style="flex-wrap:wrap;">
         <button class="btn secondary" onclick="closeAiSuggestModal()">Cancel</button>
         <button class="btn amber" onclick="addSelectedAiSuggestQuestions()">Add selected to Assessment</button>
@@ -10859,6 +10907,7 @@ function renderAiSuggestReviewStep(s){
 }
 function renderAiSuggestQuestionCard(q, qi, s){
   const isEditing = s.editingId===q.id;
+  const realIdx = s.questions.findIndex(x=>x.id===q.id);
   return `<div class="card" style="background:var(--porcelain);margin-bottom:8px;">
     <div style="display:flex;gap:8px;align-items:flex-start;">
       <input type="checkbox" style="margin-top:4px;" ${s.selected[q.id]?'checked':''} onchange="toggleAiSuggestSelect('${q.id}',this.checked)">
@@ -10873,8 +10922,8 @@ function renderAiSuggestQuestionCard(q, qi, s){
             ? `<button class="btn small amber" onclick="saveAiSuggestEdit('${q.id}')">Save</button><button class="btn small secondary" onclick="aiSuggestState.editingId=null; renderAiSuggestOverlay();">Cancel</button>`
             : `<button class="btn small secondary" onclick="aiSuggestState.editingId='${q.id}'; renderAiSuggestOverlay();">Edit</button>`}
           <button class="btn small secondary" onclick="duplicateAiSuggestQuestion('${q.id}')">Duplicate</button>
-          <button class="btn small secondary" onclick="moveAiSuggestQuestion('${q.id}',-1)" ${qi===0?'disabled':''}>&uarr;</button>
-          <button class="btn small secondary" onclick="moveAiSuggestQuestion('${q.id}',1)" ${qi===s.questions.length-1?'disabled':''}>&darr;</button>
+          <button class="btn small secondary" onclick="moveAiSuggestQuestion('${q.id}',-1)" ${realIdx===0?'disabled':''}>&uarr;</button>
+          <button class="btn small secondary" onclick="moveAiSuggestQuestion('${q.id}',1)" ${realIdx===s.questions.length-1?'disabled':''}>&darr;</button>
           ${s.source!=='theoryImport' ? `<button class="btn small secondary" onclick="regenerateAiSuggestQuestion('${q.id}')">Regenerate</button>` : ''}
           <button class="btn small danger" onclick="deleteAiSuggestQuestion('${q.id}')">Delete</button>
         </div>
