@@ -1320,7 +1320,12 @@ async function callAiProxy({ model, max_tokens, messages, system }){
   });
   if(!resp.ok){
     const errBody = await resp.json().catch(()=>({}));
-    throw new Error(errBody.error || ('AI proxy returned status '+resp.status));
+    const errMsg = typeof errBody.error === 'string' ? errBody.error
+      : (errBody.error && errBody.error.message) ? errBody.error.message
+      : (errBody.message) ? errBody.message
+      : Object.keys(errBody).length ? JSON.stringify(errBody).slice(0,300)
+      : ('AI proxy returned status '+resp.status);
+    throw new Error(errMsg);
   }
   return await resp.json();
 }
