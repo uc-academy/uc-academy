@@ -10412,6 +10412,33 @@ function syncModuleDraftFromDOM(){
       if(g('c-heading-'+i)) item.heading = g('c-heading-'+i).value;
       const bodyVal = rteGetValue('c-body-'+i);
       if(bodyVal!==undefined) item.body = bodyVal;
+      if(item.questions){
+        item.questions.forEach((q,qi)=>{
+          const textEl = g(`theory-q-text-${i}-${qi}`);
+          if(!textEl) return;
+          q.text = textEl.value;
+          const typeEl = g(`theory-q-type-${i}-${qi}`);
+          if(typeEl) q.type = typeEl.value;
+          const diffEl = g(`theory-q-difficulty-${i}-${qi}`);
+          if(diffEl) q.difficulty = diffEl.value;
+          const marksEl = g(`theory-q-marks-${i}-${qi}`);
+          if(marksEl) q.marks = Math.max(0, parseInt(marksEl.value)||0);
+          const explainEl = g(`theory-q-explain-${i}-${qi}`);
+          if(explainEl) q.explanation = explainEl.value;
+          q.important = !!(g(`theory-q-important-${i}-${qi}`)||{}).checked;
+          q.includeInFinal = !!(g(`theory-q-includefinal-${i}-${qi}`)||{}).checked;
+          const newOptions = [];
+          const newCorrect = [];
+          (q.options||[]).forEach((o,oi)=>{
+            const optEl = g(`theory-q-opt-${i}-${qi}-${oi}`);
+            if(!optEl) return;
+            newOptions.push(optEl.value);
+            if((g(`theory-q-correct-${i}-${qi}-${oi}`)||{}).checked) newCorrect.push(newOptions.length-1);
+          });
+          q.options = newOptions;
+          q.correctIndices = newCorrect;
+        });
+      }
     } else if(item.type==='video'){
       if(g('c-title-'+i)) item.title = g('c-title-'+i).value;
       if(g('c-url-'+i)) item.url = g('c-url-'+i).value;
@@ -10676,6 +10703,36 @@ Field requirements:
   }
 }
 let aiSuggestState = null;
+async function openImportImportantQuestionsModal(){
+  syncModuleDraftFromDOM();
+  const alreadyImportedIds = new Set((moduleDraft.quiz||[]).map(q=>q.sourceQuestionId).filter(Boolean));
+  const dayIds = await getDayRegistry(editingCourseId);
+  const found = [];
+  for(const dayId of dayIds){
+    const ov = dayId===editingDayId ? moduleDraft : ((await getContentOverride(dayId, editingCourseId, editingLanguage)) || (await getContentOverride(dayId, editingCourseId, DEFAULT_LANGUAGE)));
+    if(!ov) continue;
+    (ov.content||[]).forEach(item=>{
+      if(item.type!=='theory' || !item.questions) return;
+      item.questions.forEach(q=>{
+        if(!q.important || !q.includeInFinal) return;
+        if(alreadyImportedIds.has(q.id)) return;
+        found.push({
+          id: uid(), sourceQuestionId: q.id, question: q.text||'Untitled question', type: q.type||'mcq',
+          options: q.options||[], correctIndices: q.correctIndices||[], explanation: q.explanation||'',
+          relatedTopic: item.heading||'', difficulty: q.difficulty||'medium', marks: q.marks??1, keyLearningPoint:'',
+          sourceReference: `Day ${dayId} — ${item.heading||'Theory'}`, sourceDayId: dayId,
+        });
+      });
+    });
+  }
+  aiSuggestState = {
+    step:'review', target:'legacyQuiz', source:'theoryImport', blockIdx:null,
+    questions: found, selected:{}, editingId:null, error:'',
+  };
+  found.forEach(q=>{ aiSuggestState.selected[q.id] = true; });
+  if(found.length===0){ showToast('No Important questions flagged for Final Assessment were found in this course.', 'error'); return; }
+  renderAiSuggestOverlay();
+}
 function openAiSuggestModal(blockIdx, target){
   aiSuggestState = {
     step:'config', blockIdx, target: target||'quickAssessment', count:10, questionType:'mcq', difficulty:'medium',
@@ -10818,7 +10875,7 @@ function renderAiSuggestQuestionCard(q, qi, s){
           <button class="btn small secondary" onclick="duplicateAiSuggestQuestion('${q.id}')">Duplicate</button>
           <button class="btn small secondary" onclick="moveAiSuggestQuestion('${q.id}',-1)" ${qi===0?'disabled':''}>&uarr;</button>
           <button class="btn small secondary" onclick="moveAiSuggestQuestion('${q.id}',1)" ${qi===s.questions.length-1?'disabled':''}>&darr;</button>
-          <button class="btn small secondary" onclick="regenerateAiSuggestQuestion('${q.id}')">Regenerate</button>
+          ${s.source!=='theoryImport' ? `<button class="btn small secondary" onclick="regenerateAiSuggestQuestion('${q.id}')">Regenerate</button>` : ''}
           <button class="btn small danger" onclick="deleteAiSuggestQuestion('${q.id}')">Delete</button>
         </div>
       </div>
@@ -10883,7 +10940,7 @@ function addSelectedAiSuggestQuestions(){
       let options = q.options.length ? [...q.options] : ['Option A','Option B','Option C','Option D'];
       while(options.length<2) options.push('');
       const correct = q.correctIndices.length ? q.correctIndices[0] : 0;
-      moduleDraft.quiz.push({ question: q.question, options, correct });
+      moduleDraft.quiz.push({ question: q.question, options, correct, sourceQuestionId: q.sourceQuestionId||null });
     });
     showToast(`${toAdd.length} question(s) added — still in Draft until you Save & Publish.`, 'success');
     closeAiSuggestModal();
@@ -11250,6 +11307,23 @@ function renderInVideoQuizEditor(contentIdx, item){
     </div>
   `;
 }
+function addTheoryQuestion(blockIdx){
+  syncModuleDraftFromDOM();
+  const item = moduleDraft.content[blockIdx];
+  if(!item.questions) item.questions = [];
+  item.questions.push({ id: uid(), text:'', type:'mcq', options:['',''], correctIndices:[], explanation:'', marks:1, difficulty:'medium', important:false, includeInFinal:false });
+  refreshModuleEditor();
+}
+function removeTheoryQuestion(blockIdx, qIdx){
+  syncModuleDraftFromDOM();
+  moduleDraft.content[blockIdx].questions.splice(qIdx,1);
+  refreshModuleEditor();
+}
+function addTheoryQuestionOption(blockIdx, qIdx){
+  syncModuleDraftFromDOM();
+  moduleDraft.content[blockIdx].questions[qIdx].options.push('');
+  refreshModuleEditor();
+}
 function addQuizQuestion(){ syncModuleDraftFromDOM(); moduleDraft.quiz.push({question:'New question', options:['Option A','Option B','Option C','Option D'], correct:0}); refreshModuleEditor(); }
 function removeQuizQuestion(i){ syncModuleDraftFromDOM(); moduleDraft.quiz.splice(i,1); refreshModuleEditor(); }
 function moveQuizQuestion(i,dir){ syncModuleDraftFromDOM(); const j=i+dir; if(j<0||j>=moduleDraft.quiz.length) return; [moduleDraft.quiz[i],moduleDraft.quiz[j]]=[moduleDraft.quiz[j],moduleDraft.quiz[i]]; refreshModuleEditor(); }
@@ -11342,9 +11416,58 @@ function renderAddRow(afterIndex){
 function renderContentItemCard(item, i, total){
   let fields = '';
   if(item.type==='theory'){
+    const theoryQuestions = item.questions || [];
     fields = `
       <input class="field-input" id="c-heading-${i}" value="${esc(item.heading)}" placeholder="Heading">
       ${rteMount('c-body-'+i, item.body, 'Edit every single word here', rteCurrentContext())}
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line);">
+        <span class="field-label" style="margin:0 0 8px;">Questions from this Theory (optional)</span>
+        ${theoryQuestions.map((q,qi)=>`
+          <div class="card" style="background:var(--porcelain);margin-bottom:8px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+              <span style="font-weight:600;font-size:13px;">Question ${qi+1}</span>
+              <button class="btn small danger" type="button" onclick="removeTheoryQuestion(${i},${qi})">Delete</button>
+            </div>
+            <textarea class="field-input reflect" id="theory-q-text-${i}-${qi}" style="min-height:44px;" placeholder="Question text">${esc(q.text||'')}</textarea>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+              <div>
+                <span class="field-label" style="margin:0;">Question type</span>
+                <select class="field-input" id="theory-q-type-${i}-${qi}">
+                  <option value="mcq" ${q.type==='mcq'?'selected':''}>MCQ (single choice)</option>
+                  <option value="multiple" ${q.type==='multiple'?'selected':''}>Multiple-select</option>
+                  <option value="checkbox" ${q.type==='checkbox'?'selected':''}>Checkbox</option>
+                  <option value="truefalse" ${q.type==='truefalse'?'selected':''}>True/False</option>
+                  <option value="short" ${q.type==='short'?'selected':''}>Short answer</option>
+                </select>
+              </div>
+              <div>
+                <span class="field-label" style="margin:0;">Difficulty</span>
+                <select class="field-input" id="theory-q-difficulty-${i}-${qi}">
+                  <option value="easy" ${q.difficulty==='easy'?'selected':''}>Easy</option>
+                  <option value="medium" ${(q.difficulty||'medium')==='medium'?'selected':''}>Medium</option>
+                  <option value="hard" ${q.difficulty==='hard'?'selected':''}>Hard</option>
+                </select>
+              </div>
+            </div>
+            ${(q.options&&q.options.length ? q.options : ['','']).map((o,oi)=>`
+              <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
+                <input type="checkbox" id="theory-q-correct-${i}-${qi}-${oi}" ${(q.correctIndices||[]).includes(oi)?'checked':''}>
+                <input class="field-input" style="margin-bottom:0;flex:1;" id="theory-q-opt-${i}-${qi}-${oi}" value="${esc(o)}" placeholder="Option ${oi+1}">
+              </div>
+            `).join('')}
+            <button class="btn small secondary" type="button" onclick="addTheoryQuestionOption(${i},${qi})">+ Add option</button>
+            <span class="field-label">Explanation</span>
+            <textarea class="field-input reflect" id="theory-q-explain-${i}-${qi}" style="min-height:40px;" placeholder="Why this answer is correct">${esc(q.explanation||'')}</textarea>
+            <span class="field-label">Marks</span>
+            <input class="field-input" id="theory-q-marks-${i}-${qi}" type="number" min="0" style="width:80px;" value="${q.marks??1}">
+            <div style="display:flex;gap:16px;margin-top:8px;">
+              <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="checkbox" id="theory-q-important-${i}-${qi}" ${q.important?'checked':''}> Mark as Important Question</label>
+              <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;cursor:pointer;"><input type="checkbox" id="theory-q-includefinal-${i}-${qi}" ${q.includeInFinal?'checked':''}> Include in Final Assessment</label>
+            </div>
+          </div>
+        `).join('')}
+        <button class="btn small secondary" type="button" onclick="addTheoryQuestion(${i})">+ Add Question to this Theory</button>
+      </div>
     `;
   } else if(item.type==='video'){
     const ws = item.watchSettings || {};
@@ -11714,6 +11837,7 @@ function renderModuleEditorTab(){
     `).join('')}
     <button class="btn secondary" onclick="addQuizQuestion()" ${ccCan('canCreate')?'':'disabled'}>+ Add question</button>
     <button class="btn amber" onclick="openAiSuggestModal(null,'legacyQuiz')" ${ccCan('canCreate')?'':'disabled'}>🤖 Suggest Questions &amp; Answers</button>
+    <button class="btn secondary" onclick="openImportImportantQuestionsModal()" ${ccCan('canCreate')?'':'disabled'}>📥 Import Important Questions from Theory</button>
     </fieldset>
     `}
 
