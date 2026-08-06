@@ -601,7 +601,7 @@ function renderAudioEmbed(url, onPlayJs){
 function normalizeUrl(url, kind){
   if(!url) return { embedUrl:'', kind:'none' };
   const yt = url.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([\w-]+)/);
-  if(yt) return { embedUrl:`https://www.youtube.com/embed/${yt[1]}`, kind:'youtube' };
+  if(yt) return { embedUrl:`https://www.youtube.com/embed/${yt[1]}`, kind:'youtube', videoId: yt[1] };
   const vm = url.match(/vimeo\.com\/(\d+)/);
   if(vm) return { embedUrl:`https://player.vimeo.com/video/${vm[1]}`, kind:'vimeo' };
   const drive = url.match(/drive\.google\.com\/file\/d\/([\w-]+)/) || url.match(/[?&]id=([\w-]+)/);
@@ -1683,6 +1683,7 @@ function totalWatchedSeconds(ranges){
 let ytPlayer = null;
 let ytPollTimer = null;
 let ytPlayers = {};
+let videoPlayerTapped = {};
 let ytPollTimers = {};
 let ytApiReady = false;
 window.onYouTubeIframeAPIReady = function(){ ytApiReady = true; };
@@ -2366,16 +2367,23 @@ async function loginAsPartner(id, opts){
   await loadAndApplyDayRegistry(r.courseId||null);
   for(const d of DAYS) ensureDay(d.id);
   videosCache = {}; audiosCache = {}; contentOverrides = {}; extraVideosCache = {}; extraAudiosCache = {};
-  await Promise.all(DAYS.map(async d=>{
-    videosCache[d.id]=await getVideoUrl(d.id);
-    audiosCache[d.id]=await getAudioUrl(d.id);
-    extraVideosCache[d.id]=await getExtraVideos(d.id);
-    extraAudiosCache[d.id]=await getExtraAudios(d.id);
-    const result = await getContentOverrideWithFallback(d.id, currentUser.courseId, currentUser.preferredLanguage);
-    if(result.data) contentOverrides[d.id] = migrateOldOverrideToUnified(result.data);
-  }));
+  const fetchOneDayContent = async (dayId)=>{
+    videosCache[dayId]=await getVideoUrl(dayId);
+    audiosCache[dayId]=await getAudioUrl(dayId);
+    extraVideosCache[dayId]=await getExtraVideos(dayId);
+    extraAudiosCache[dayId]=await getExtraAudios(dayId);
+    const result = await getContentOverrideWithFallback(dayId, currentUser.courseId, currentUser.preferredLanguage);
+    if(result.data) contentOverrides[dayId] = migrateOldOverrideToUnified(result.data);
+  };
+  // Only the landing day is awaited here, so the module can open immediately - every other day's
+  // content, video, and audio data loads in the background afterward and never blocks the first render.
+  await fetchOneDayContent(s.day);
   const homeResult = await getContentOverrideWithFallback('home', currentUser.courseId, currentUser.preferredLanguage);
   if(homeResult.data) contentOverrides['home'] = migrateOldOverrideToUnified(homeResult.data);
+  const remainingDays = DAYS.filter(d=>d.id!==s.day);
+  Promise.all(remainingDays.map(d=>fetchOneDayContent(d.id))).then(()=>{
+    if(currentUser && currentUser.id===id) renderSidebar();
+  }).catch(()=>{});
   await logCheckin(s);
   let sessionToken = opts.sessionToken;
   if(!opts.silent){
@@ -2890,6 +2898,10 @@ async function tryRestoreSession(){
         currentDay = currentUserUnlockedDays.length ? Math.max(...currentUserUnlockedDays) : 0;
         currentTab='theory';
       }
+      // The day being restored to may not be the same as today's scheduled session day (which is all
+      // that's pre-fetched during login) - make sure THIS specific day's content is actually loaded
+      // before rendering, without re-fetching if it's already cached.
+      if(currentDay>0 && currentDay<98 && !contentOverrides[currentDay]) await refreshDayContent(currentDay);
       loadMyMedia(currentDay===0 ? 'home' : currentDay);
       renderApp();
       startSessionWatch();
@@ -4013,6 +4025,11 @@ async function handleActivityUpload(event){
   await loadMyMedia(dayId);
   renderMainOnly();
 }
+function startVideoPlayback(dayId, idx){
+  const key = `${dayId}_${idx}`;
+  videoPlayerTapped[key] = true;
+  renderMainOnly();
+}
 function renderOverrideVideoItem(dayId, item, idx, dp){
   const n = normalizeUrl(item.url);
   const itemProgress = dp.videoItemProgress[idx] || {pct:0, done:false};
@@ -4029,12 +4046,24 @@ function renderOverrideVideoItem(dayId, item, idx, dp){
   if(itemProgress.done && n.embedUrl){
     inner = `<iframe src="${esc(n.embedUrl)}" allowfullscreen></iframe>`;
   } else if(n.kind==='youtube'){
-    inner = `<div id="yt-player-${dayId}-${idx}" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#fff;">
-      <div style="text-align:center;">
-        <div style="width:32px;height:32px;border:3px solid rgba(255,255,255,0.3);border-top-color:#fff;border-radius:50%;animation:ucaSpin 0.8s linear infinite;margin:0 auto 8px;"></div>
-        <span style="font-size:12px;">Loading video&hellip;</span>
-      </div>
-    </div>`;
+    const key = `${dayId}_${idx}`;
+    if(!videoPlayerTapped[key]){
+      inner = `<div style="width:100%;height:100%;position:relative;cursor:pointer;background:#000;" onclick="startVideoPlayback(${dayId},${idx})">
+        <img src="https://img.youtube.com/vi/${n.videoId}/hqdefault.jpg" style="width:100%;height:100%;object-fit:cover;opacity:0.7;">
+        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">
+          <div style="width:56px;height:56px;border-radius:50%;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;">
+            <div style="width:0;height:0;border-top:12px solid transparent;border-bottom:12px solid transparent;border-left:20px solid #fff;margin-left:4px;"></div>
+          </div>
+        </div>
+      </div>`;
+    } else {
+      inner = `<div id="yt-player-${dayId}-${idx}" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#fff;">
+        <div style="text-align:center;">
+          <div style="width:32px;height:32px;border:3px solid rgba(255,255,255,0.3);border-top-color:#fff;border-radius:50%;animation:ucaSpin 0.8s linear infinite;margin:0 auto 8px;"></div>
+          <span style="font-size:12px;">Loading video&hellip;</span>
+        </div>
+      </div>`;
+    }
   } else if(n.embedUrl){
     inner = `<iframe src="${esc(n.embedUrl)}" allowfullscreen></iframe>`;
   } else if(item.url){
@@ -4085,6 +4114,7 @@ function initOverrideVideoPlayers(day){
     if(ytPlayers[key]) return;
     const alreadyDone = !!dp.videoItemProgress[idx]?.done;
     if(alreadyDone) return; // already completed - rendered as a plain embed instead, no tracking player needed
+    if(!videoPlayerTapped[key]) return; // not tapped yet - stays a lightweight thumbnail, no player, no API calls
     const fail = (reason)=>{
       const c = document.getElementById(elId);
       if(c) c.innerHTML = `<div class="video-placeholder">${reason}<br><span style="font-size:11.5px;">This can't be skipped — if the video won't load, ask your trainer to unlock it for you.</span></div>`;
