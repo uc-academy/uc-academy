@@ -1194,7 +1194,19 @@ async function listCheckinsForPartner(pid){
   return out.sort((a,b)=>(b.date).localeCompare(a.date));
 }
 async function getProgress(pid){ const v = await kvGet('progress:'+pid); return v || {}; }
-async function setProgress(pid, data){ return await kvSet('progress:'+pid, data); }
+const progressWriteQueues = {};
+async function setProgress(pid, data){
+  // Serialize writes per-partner: on a real mobile network, multiple saves can be in flight at once
+  // (a video-progress poll, then immediately after, a page-unlock save) with unpredictable, variable
+  // latency. Without this queue, an older save could complete AFTER a newer one and silently overwrite
+  // it with stale data - including erasing a permanent page unlock that was just set. Chaining every
+  // write behind the previous one guarantees they always land in the order they were requested, not
+  // the order their network round-trips happened to finish in.
+  const prior = progressWriteQueues[pid] || Promise.resolve();
+  const thisWrite = prior.then(()=> kvSet('progress:'+pid, data)).catch(()=>false);
+  progressWriteQueues[pid] = thisWrite;
+  return await thisWrite;
+}
 async function getVideoUrl(dayId){ const v = await kvGet('video:'+dayId); return v ? v.url : ''; }
 async function setVideoUrl(dayId, url){ return await kvSet('video:'+dayId, {url}); }
 async function getAudioUrl(dayId){ const v = await kvGet('audio:'+dayId); return v ? v.url : ''; }
@@ -1759,8 +1771,11 @@ async function savePartnerProfilePhoto(file){
   }
   const check = rteValidateImageFile(file);
   if(!check.ok){ return { ok:false, error:check.reason }; }
+  let processed;
+  try{ processed = await rteCompressImage(file, 1200); }
+  catch(e){ return { ok:false, error:`"${file.name}" appears to be damaged or unreadable. Try a different photo.` }; }
   const path = `profile-photos/${currentUser.id}/${Date.now()}_${file.name}`;
-  const uploadResult = await uploadFile(path, file);
+  const uploadResult = await uploadFile(path, processed);
   if(!uploadResult.ok){ return { ok:false, error:`Upload failed — try again. (${uploadResult.error})` }; }
   const existing = await getRosterEntry(currentUser.id);
   if(!existing){ return { ok:false, error:"Couldn't find your partner record." }; }
@@ -2781,9 +2796,12 @@ async function handleStaffPhotoUpload(event){
   const check = rteValidateImageFile(file);
   if(!check.ok){ showToast(check.reason, 'error'); event.target.value=''; return; }
   showToast('Uploading photo...', 'info');
+  let processed;
+  try{ processed = await rteCompressImage(file, 1200); }
+  catch(e){ showToast(`"${file.name}" appears to be damaged or unreadable. Try a different photo.`, 'error'); event.target.value=''; return; }
   const roleKey = isAdminRole()?'admin':isCCRole()?'cc':isZTRole()?'zt':'trainer';
   const path = `staff-photos/${roleKey}-${trainerIdentity.trainerId||trainerIdentity.ccId||trainerIdentity.ztId||'main'}/${Date.now()}_${file.name}`;
-  const uploadResult = await uploadFile(path, file);
+  const uploadResult = await uploadFile(path, processed);
   event.target.value = '';
   if(!uploadResult.ok){ showToast(`Upload failed — try again. (${uploadResult.error})`, 'error'); return; }
   let saved = false;
