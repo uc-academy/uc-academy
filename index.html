@@ -2426,7 +2426,7 @@ async function checkOutNow(){
 async function loginAsTrainer(trainerId, opts){
   opts = opts || {};
   const t = await kvGet('trainer:'+trainerId);
-  if(!t) return { ok:false };
+  if(!t || t.active===false) return { ok:false };
   if(isAccountLocked(t)) return { ok:false, reason:'locked' };
   if(opts.silent){
     if(opts.sessionToken){
@@ -2770,9 +2770,9 @@ async function renderMyProfilePage(){
         <div style="flex:1;min-width:180px;">
           <p style="font-weight:700;font-size:18px;margin:0 0 2px;">${esc(t.name)}</p>
           <p style="font-size:12.5px;color:var(--ink-soft);margin:0;">${esc(roleLabel)}</p>
-          ${t.profilePhotoUrl
+          ${(t.profilePhotoUrl && !isAdminRole())
             ? `<p style="font-size:11.5px;color:var(--ink-soft);margin-top:8px;">Photo locked — ask Admin to reset it.</p>`
-            : `<label class="btn secondary small" style="cursor:pointer;margin-top:8px;display:inline-block;">Add photo<input type="file" accept="image/*" style="display:none;" onchange="handleStaffPhotoUpload(event)"></label>`}
+            : `<label class="btn secondary small" style="cursor:pointer;margin-top:8px;display:inline-block;">${t.profilePhotoUrl?'Change photo':'Add photo'}<input type="file" accept="image/*" style="display:none;" onchange="handleStaffPhotoUpload(event)"></label>`}
         </div>
       </div>
       <div class="form-grid" style="font-size:13px;">
@@ -2789,7 +2789,7 @@ async function renderMyProfilePage(){
 async function handleStaffPhotoUpload(event){
   const file = event.target.files[0];
   if(!file) return;
-  if(trainerIdentity.profilePhotoUrl){
+  if(trainerIdentity.profilePhotoUrl && !isAdminRole()){
     showToast('Your profile photo is locked. Ask an Admin to reset it first.', 'error');
     event.target.value=''; return;
   }
@@ -5346,6 +5346,10 @@ async function renderAdmin(){
   renderAdminMain();
 }
 let editingAdminName = false;
+let trainerFilterCity = '';
+let trainerFilterCategory = '';
+let trainerFilterCourse = '';
+let trainerFilterStatus = '';
 let viewingMyProfile = false;
 function openMyProfile(){ viewingMyProfile = true; renderAdminMain(); }
 function closeMyProfile(){ viewingMyProfile = false; renderAdminMain(); }
@@ -5363,10 +5367,10 @@ function renderAdminSidebar(){
         ${trainerIdentity.profilePhotoUrl
           ? `<img src="${esc(trainerIdentity.profilePhotoUrl)}" style="width:38px;height:38px;border-radius:50%;object-fit:cover;flex-shrink:0;">`
           : `<span style="width:38px;height:38px;border-radius:50%;background:rgba(255,255,255,0.15);color:#fff;font-size:14px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;">${esc((trainerIdentity.name||'?')[0].toUpperCase())}</span>`}
-        ${trainerIdentity.profilePhotoUrl
+        ${(trainerIdentity.profilePhotoUrl && !isAdminRole())
           ? `<span style="font-size:10.5px;color:rgba(255,255,255,0.55);">Photo locked — ask Admin to reset it.</span>`
           : `<label style="cursor:pointer;font-size:11px;color:rgba(255,255,255,0.7);text-decoration:underline;">
-              Add photo
+              ${trainerIdentity.profilePhotoUrl?'Change photo':'Add photo'}
               <input type="file" accept="image/*" style="display:none;" onchange="handleStaffPhotoUpload(event)">
             </label>`}
       </div>
@@ -5651,7 +5655,11 @@ async function renderOverviewTabAsync(){
 
 /* ---- TRAINERS (admin only) ---- */
 function renderTrainersTab(){
-  const entries = Object.entries(adminTrainers);
+  let entries = Object.entries(adminTrainers);
+  if(trainerFilterCity) entries = entries.filter(([,t])=>t.city===trainerFilterCity);
+  if(trainerFilterCategory) entries = entries.filter(([,t])=>t.category===trainerFilterCategory);
+  if(trainerFilterCourse) entries = entries.filter(([,t])=>(t.assignedCourses||[]).includes(trainerFilterCourse));
+  if(trainerFilterStatus) entries = entries.filter(([,t])=>(trainerFilterStatus==='active' ? t.active!==false : t.active===false));
   const passMsg = lastTrainerCredential ? encodeURIComponent(`Hi ${lastTrainerCredential.name}, your Urban Company Academy trainer password is: ${lastTrainerCredential.password}`) : '';
   return `
     <div class="crumb">Admin dashboard</div>
@@ -5683,13 +5691,42 @@ function renderTrainersTab(){
     </div>
     <div class="card">
       <h3>All trainers &middot; ${entries.length}</h3>
-      ${entries.length===0?`<div class="empty-state">No trainers created yet. Add your first trainer above.</div>`:`
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:14px;">
+        <select class="field-input" style="margin-bottom:0;" onchange="trainerFilterCity=this.value;renderAdminMain();">
+          <option value="">All Cities</option>
+          ${CITIES.map(c=>`<option value="${c}" ${trainerFilterCity===c?'selected':''}>${c}</option>`).join('')}
+        </select>
+        <select class="field-input" style="margin-bottom:0;" onchange="trainerFilterCategory=this.value;renderAdminMain();">
+          <option value="">All Categories</option>
+          ${CATEGORIES.map(c=>`<option value="${c}" ${trainerFilterCategory===c?'selected':''}>${c}</option>`).join('')}
+        </select>
+        <select class="field-input" style="margin-bottom:0;" onchange="trainerFilterCourse=this.value;renderAdminMain();">
+          <option value="">All Courses</option>
+          ${Object.entries(adminCourses).map(([id,c])=>`<option value="${id}" ${trainerFilterCourse===id?'selected':''}>${esc(c.name)}</option>`).join('')}
+        </select>
+        <select class="field-input" style="margin-bottom:0;" onchange="trainerFilterStatus=this.value;renderAdminMain();">
+          <option value="">All Status</option>
+          <option value="active" ${trainerFilterStatus==='active'?'selected':''}>Active</option>
+          <option value="inactive" ${trainerFilterStatus==='inactive'?'selected':''}>Deactivated</option>
+        </select>
+      </div>
+      ${entries.length===0?`<div class="empty-state">No trainers match these filters.</div>`:`
       <table class="data-table">
-        <tr><th>Photo</th><th>Name</th><th>Phone</th><th>Category</th><th>City</th><th>Assigned courses</th><th>Password</th><th>Created</th><th></th></tr>
-        ${entries.map(([id,t])=>`<tr><td>${t.profilePhotoUrl?`<img src="${esc(t.profilePhotoUrl)}" style="width:30px;height:30px;border-radius:50%;object-fit:cover;">`:`<span style="width:30px;height:30px;border-radius:50%;background:var(--brand-light);color:var(--brand);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;">${esc((t.name||'?')[0].toUpperCase())}</span>`}</td><td>${esc(t.name)}</td><td>${esc(t.phone)}</td><td>${esc(t.category)}</td><td>${esc(t.city)}</td><td style="max-width:200px;white-space:normal;">${(t.assignedCourses||[]).map(cid=>esc(adminCourses[cid]?.name||'')).filter(Boolean).join(', ') || '<span style="color:var(--ink-soft);">— none —</span>'}</td><td class="mono">${esc(t.password)}</td><td>${fmtDateTime(t.createdAt)}</td><td style="display:flex;gap:6px;flex-wrap:wrap;">${t.profilePhotoUrl?`<button class="btn small secondary" onclick="resetStaffPhoto('trainer','${id}','${esc(t.name)}')">Reset Photo</button>`:''}<button class="btn small danger" onclick="removeTrainer('${id}')">Remove</button></td></tr>`).join('')}
+        <tr><th>Photo</th><th>Name</th><th>Phone</th><th>Category</th><th>City</th><th>Assigned courses</th><th>Password</th><th>Status</th><th>Created</th><th></th></tr>
+        ${entries.map(([id,t])=>`<tr><td>${t.profilePhotoUrl?`<img src="${esc(t.profilePhotoUrl)}" style="width:30px;height:30px;border-radius:50%;object-fit:cover;cursor:zoom-in;" onclick="previewStaffPhotoFullscreen('${esc(t.profilePhotoUrl)}','${esc(t.name)}')">`:`<span style="width:30px;height:30px;border-radius:50%;background:var(--brand-light);color:var(--brand);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;">${esc((t.name||'?')[0].toUpperCase())}</span>`}</td><td>${esc(t.name)}</td><td>${esc(t.phone)}</td><td>${esc(t.category)}</td><td>${esc(t.city)}</td><td style="max-width:200px;white-space:normal;">${(t.assignedCourses||[]).map(cid=>esc(adminCourses[cid]?.name||'')).filter(Boolean).join(', ') || '<span style="color:var(--ink-soft);">— none —</span>'}</td><td class="mono">${esc(t.password)}</td><td><span class="pill ${t.active!==false?'open':'closed'}">${t.active!==false?'Active':'Deactivated'}</span></td><td>${fmtDateTime(t.createdAt)}</td><td style="display:flex;gap:6px;flex-wrap:wrap;"><button class="btn small secondary" onclick="uploadPhotoForStaff('trainer','${id}','${esc(t.name)}')">${t.profilePhotoUrl?'Replace Photo':'Upload Photo'}</button>${t.profilePhotoUrl?`<button class="btn small secondary" onclick="removePhotoForStaff('trainer','${id}','${esc(t.name)}')">Remove Photo</button><button class="btn small secondary" onclick="resetStaffPhoto('trainer','${id}','${esc(t.name)}')">Reset (let them re-upload)</button>`:''}<button class="btn small secondary" onclick="toggleTrainerActive('${id}')">${t.active!==false?'Deactivate':'Reactivate'}</button><button class="btn small danger" onclick="removeTrainer('${id}')">Remove</button></td></tr>`).join('')}
       </table>`}
     </div>
   `;
+}
+async function toggleTrainerActive(trainerId){
+  const t = adminTrainers[trainerId];
+  if(!t) return;
+  const newActive = t.active===false;
+  await kvSet('trainer:'+trainerId, { ...t, active:newActive });
+  await logHistory(newActive?'trainer_reactivated':'trainer_deactivated', `Trainer ${t.name} ${newActive?'reactivated':'deactivated'} by ${trainerIdentity.name}`, {trainerId});
+  showToast(newActive?'Reactivated.':'Deactivated — this account can no longer log in.', 'success');
+  adminTrainers = await listTrainers();
+  renderAdminMain();
 }
 async function createTrainer(){
   const name = document.getElementById('t-name').value.trim();
@@ -8809,6 +8846,67 @@ async function resetPartnerProgress(id){
     showToast(`${name}'s progress has been reset.`, 'success');
     renderAdminMain();
   });
+}
+async function getStaffRecord(role, id){
+  if(role==='admin') return await getAdminProfile();
+  return await kvGet(role+':'+id);
+}
+async function setStaffRecord(role, id, data){
+  if(role==='admin') return await setAdminProfile(data);
+  return await kvSet(role+':'+id, data);
+}
+function uploadPhotoForStaff(role, id, name){
+  if(!isAdminRole()){ showToast('Only Admin can upload a photo for another user.', 'error'); return; }
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = 'image/*'; input.style.display = 'none';
+  input.onchange = async (event)=>{
+    const file = event.target.files[0];
+    if(!file) return;
+    const check = rteValidateImageFile(file);
+    if(!check.ok){ showToast(check.reason, 'error'); return; }
+    promptForResetReason(`Upload a new photo for ${name}? This replaces their current photo.`, async (reason)=>{
+      let processed;
+      try{ processed = await rteCompressImage(file, 1200); }
+      catch(e){ showToast(`"${file.name}" appears to be damaged or unreadable.`, 'error'); return; }
+      const path = `staff-photos/${role}-${id}/${Date.now()}_${file.name}`;
+      const uploadResult = await uploadFile(path, processed);
+      if(!uploadResult.ok){ showToast(`Upload failed — try again. (${uploadResult.error})`, 'error'); return; }
+      const existing = await getStaffRecord(role, id);
+      const previousPhoto = (existing && existing.profilePhotoUrl) || '';
+      const saved = await setStaffRecord(role, id, { ...(existing||{}), profilePhotoUrl: uploadResult.url });
+      if(!saved){ showToast("Couldn't save the photo — check your connection.", 'error'); return; }
+      const isCurrentSession = role==='admin' ? isAdminRole() : (trainerIdentity[role+'Id'] === id);
+      if(isCurrentSession) trainerIdentity.profilePhotoUrl = uploadResult.url;
+      await logHistory('staff_photo_changed', `Profile photo updated for ${name} (${role}) by ${trainerIdentity.name}`, {role, id, previousPhoto, updatedPhoto: uploadResult.url, reason, changedBy: trainerIdentity.name, at: new Date().toISOString()});
+      showToast(`Photo updated for ${name}.`, 'success');
+      renderAdminMain();
+    });
+  };
+  document.body.appendChild(input);
+  input.click();
+  setTimeout(()=>{ if(input.parentNode) input.parentNode.removeChild(input); }, 10000);
+}
+function removePhotoForStaff(role, id, name){
+  if(!isAdminRole()){ showToast('Only Admin can remove a staff profile photo.', 'error'); return; }
+  promptForResetReason(`Remove ${name}'s profile photo? They will need a new one uploaded before it shows again.`, async (reason)=>{
+    const existing = await getStaffRecord(role, id);
+    const previousPhoto = (existing && existing.profilePhotoUrl) || '';
+    await setStaffRecord(role, id, { ...(existing||{}), profilePhotoUrl:'' });
+    await logHistory('staff_photo_removed', `Profile photo removed for ${name} (${role}) by ${trainerIdentity.name}`, {role, id, previousPhoto, updatedPhoto:'', reason, changedBy: trainerIdentity.name, at: new Date().toISOString()});
+    showToast(`${name}'s profile photo has been removed.`, 'success');
+    renderAdminMain();
+  });
+}
+function previewStaffPhotoFullscreen(url, name){
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.style.cursor = 'zoom-out';
+  overlay.innerHTML = `<div style="max-width:90vw;max-height:90vh;text-align:center;">
+    <img src="${esc(url)}" style="max-width:100%;max-height:80vh;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,0.4);">
+    <p style="color:#fff;margin-top:12px;font-size:14px;">${esc(name)}</p>
+  </div>`;
+  overlay.onclick = ()=>{ if(overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+  document.body.appendChild(overlay);
 }
 async function resetStaffPhoto(role, id, name){
   if(!isAdminRole()){ showToast('Only Admin can reset a staff profile photo.', 'error'); return; }
